@@ -148,18 +148,24 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 });
             }
 
-            // Legacy bulk blob (for clients that haven't upgraded to incremental
-            // restore). It duplicates every entry above, so it is rewritten only
-            // when the queue actually changed rather than on every tick.
-            let queue_changed = retired_any || crdt.has_unpersisted_deltas();
-            if queue_changed {
-                let deltas_bulk = crdt
-                    .serialize_pending_deltas()
-                    .map_err(NodeDbError::storage)?;
-                ops.push(WriteOp::Put {
+            // The legacy bulk blob duplicated every entry above in a single
+            // value, and restore prefers the per-entry keys whenever they
+            // exist — which is always, since this loop writes them. Keeping it
+            // current therefore cost a full rewrite of the whole queue on any
+            // flush that changed it, and the pages superseded by each rewrite
+            // are not immediately reusable. Where deltas are never acknowledged
+            // the queue only grows, so that rewrite is O(queue) per tick with no
+            // upper bound, and the file grows without the data doing so.
+            //
+            // It is deleted rather than left stale: a blob that no longer
+            // matches the queue is worse than no blob. Restore falls back to it
+            // only when the per-entry scan comes back empty, which now means
+            // those entries are damaged or missing — and resurrecting a stale
+            // queue is the wrong answer to that.
+            if retired_any || !written_deltas.is_empty() {
+                ops.push(WriteOp::Delete {
                     ns: Namespace::Crdt,
                     key: META_CRDT_DELTAS.to_vec(),
-                    value: deltas_bulk,
                 });
             }
 
