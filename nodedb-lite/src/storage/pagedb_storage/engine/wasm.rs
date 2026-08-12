@@ -138,13 +138,16 @@ impl<V: Vfs + Clone + 'static> StorageEngine for PagedbStorage<V> {
         let start_key = prefix_key(ns, start);
         let end_key = ns_end(ns);
         let txn = self.db.begin_read().await.map_err(LiteError::from)?;
+        // See the native engine's `scan_range`: `scan` materialises to the end
+        // of the namespace regardless of `limit`, so paging through a large
+        // namespace was quadratic. `scan_from` bounds the walk itself.
         let raw = txn
-            .scan(&start_key, &end_key)
+            .scan_from(&start_key, limit)
             .await
             .map_err(LiteError::from)?;
         Ok(raw
             .into_iter()
-            .take(limit)
+            .take_while(|(k, _)| k.as_ref() < end_key.as_slice())
             .map(|(k, v)| (strip_prefix(&k).to_vec(), v.to_vec()))
             .collect())
     }
