@@ -35,6 +35,100 @@ impl<S: StorageEngine> NodeDbLite<S> {
         self.crdt.lock_or_recover().pending_delta_write_count()
     }
 
+    /// Number of unsent CRDT deltas held only under their `delta:` keys.
+    ///
+    /// The queue itself is reported by `pending_count`; this is the part of it
+    /// that costs a mutation id rather than a payload.
+    pub fn crdt_spilled_delta_count(&self) -> usize {
+        self.crdt.lock_or_recover().spilled_pending_count()
+    }
+
+    /// Mutation ids of every queue entry currently stored under a `delta:` key.
+    ///
+    /// Read in bounded chunks so a queue that nothing acknowledges does not
+    /// have to fit in memory to be swept. A key that does not carry a mutation
+    /// id is skipped rather than deleted: it cannot be matched against the
+    /// queue, and deleting a stored entry on the strength of a name we cannot
+    /// read is how an unacknowledged local write disappears.
+    async fn persisted_delta_ids(&self) -> NodeDbResult<Vec<u64>> {
+        const CHUNK: usize = 4_096;
+        let mut ids = Vec::new();
+        let mut start = b"delta:".to_vec();
+        loop {
+            let chunk = self.storage.scan_range(Namespace::Crdt, &start, CHUNK).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            let scanned = chunk.len();
+            let mut next_start = chunk[scanned - 1].0.clone();
+            next_start.push(0);
+
+            let mut ended = scanned < CHUNK;
+            for (key, _) in chunk {
+                if !key.starts_with(b"delta:") {
+                    ended = true;
+                    break;
+                }
+                match CrdtEngine::mutation_id_from_delta_key(&key) {
+                    Some(id) => ids.push(id),
+                    None => tracing::warn!(
+                        "stored CRDT delta key is not `delta:<mutation_id>` — leaving it in place"
+                    ),
+                }
+            }
+            if ended {
+                break;
+            }
+            start = next_start;
+        }
+        Ok(ids)
+    }
+
+    /// Bring the resident delta window back up to size from the `delta:` keys.
+    ///
+    /// Called after each flush: entries are paged out only once they are
+    /// durable, so the window refills at flush granularity — which is also the
+    /// granularity at which an Origin acknowledgement can empty it.
+    async fn hydrate_crdt_delta_window(&self) -> NodeDbResult<usize> {
+        let wanted = {
+            let crdt = self.crdt.lock_or_recover();
+            crdt.spilled_pending_ids(crdt.pending_delta_window())
+        };
+        let Some(&lowest) = wanted.first() else {
+            return Ok(0);
+        };
+
+        // One ordered scan from the oldest missing entry rather than a read per
+        // id. Anything returned that is not actually spilled is discarded by
+        // `hydrate_pending_deltas`.
+        let entries = self
+            .storage
+            .scan_range(
+                Namespace::Crdt,
+                &CrdtEngine::delta_storage_key(lowest),
+                wanted.len(),
+            )
+            .await?;
+
+        let mut deltas = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            if !key.starts_with(b"delta:") {
+                break;
+            }
+            match CrdtEngine::deserialize_delta(&value) {
+                Ok(delta) => deltas.push(delta),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "queued CRDT delta failed to decode while paging it back in — \
+                     leaving it in storage"
+                ),
+            }
+        }
+
+        let mut crdt = self.crdt.lock_or_recover();
+        Ok(crdt.hydrate_pending_deltas(deltas))
+    }
+
     /// Persist all in-memory state to storage (call before shutdown).
     pub async fn flush(&self) -> NodeDbResult<()> {
         // One flush at a time: the CRDT update sequence is allocated under the
@@ -54,13 +148,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // or replaced by a peer-id rotation that re-authored the row — would
         // come back on the next open and be pushed again. They are deleted in
         // the same batch that writes the current set.
-        let persisted_delta_keys: Vec<Vec<u8>> = self
-            .storage
-            .scan_prefix(Namespace::Crdt, b"delta:")
-            .await?
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
+        //
+        // Read in chunks, keeping the mutation ids rather than the entries: an
+        // outbox with no Origin to drain it holds every mutation ever made, and
+        // reading it whole to look at its keys materialises every payload in it
+        // once per flush tick.
+        let persisted_delta_ids = self.persisted_delta_ids().await?;
 
         // ── Persist one CRDT snapshot per collection (CRC32C wrapped) ──
         // Each collection owns its own Loro document, so each gets its own
@@ -115,22 +208,22 @@ impl<S: StorageEngine> NodeDbLite<S> {
             // already there — and a replica with no Origin to acknowledge its
             // deltas accumulates them without bound, which made that rewrite
             // the whole outbox, once per `auto_flush_ms`.
-            let pending = crdt.pending_deltas();
-            let max_mid = pending.iter().map(|d| d.mutation_id).max().unwrap_or(0);
+            // The watermark covers the whole queue, not the resident window:
+            // taking it from memory alone would make it regress as soon as the
+            // newest entries were paged out, and the next open reads a
+            // regressed watermark as a flush that tore.
+            let max_mid = crdt.max_pending_mutation_id();
 
-            let live_keys: std::collections::HashSet<Vec<u8>> = pending
-                .iter()
-                .map(|d| CrdtEngine::delta_storage_key(d.mutation_id))
-                .collect();
-            let mut retired_any = false;
-            for key in persisted_delta_keys {
-                if !live_keys.contains(&key) {
-                    retired_any = true;
-                    ops.push(WriteOp::Delete {
-                        ns: Namespace::Crdt,
-                        key,
-                    });
-                }
+            // A paged-out entry is still queued, and its stored key is the only
+            // copy of it that exists — `pending_delta_is_live` answers for the
+            // whole queue so the sweep below cannot delete it.
+            let retired = crdt.retired_delta_ids(persisted_delta_ids);
+            let retired_any = !retired.is_empty();
+            for mutation_id in retired {
+                ops.push(WriteOp::Delete {
+                    ns: Namespace::Crdt,
+                    key: CrdtEngine::delta_storage_key(mutation_id),
+                });
             }
 
             // The revision each entry was written at travels with it: the
@@ -359,10 +452,31 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // checkpoint accounting. Doing this only after the write means a failed
         // batch leaves every collection outstanding and the next flush retries
         // it.
-        {
+        let evicted = {
             let mut crdt = self.crdt.lock_or_recover();
             crdt.mark_persisted(persisted);
             crdt.mark_pending_deltas_persisted(written_deltas);
+            // Only now are the entries written above safe to page out: an entry
+            // that exists only in memory is the sole copy of a local mutation.
+            crdt.evict_pending_overflow()
+        };
+        if evicted > 0 {
+            tracing::debug!(
+                evicted,
+                "paged unsent CRDT deltas out of the resident window; they stay queued \
+                 under their `delta:` keys"
+            );
+        }
+
+        // Refill the window from storage when acknowledgements have drained it.
+        // A failure here costs a slower backlog drain, not correctness: the
+        // entries are on disk and the next flush tries again.
+        if let Err(e) = self.hydrate_crdt_delta_window().await {
+            tracing::warn!(
+                error = %e,
+                "paging queued CRDT deltas back into the resident window failed; \
+                 the backlog stays on disk and the next flush retries"
+            );
         }
 
         // ── Write HNSW vector segments to pagedb (native PagedbStorage only) ──
@@ -484,5 +598,165 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_client::NodeDb;
+    use nodedb_types::document::Document;
+
+    use crate::PagedbStorageMem;
+    use crate::config::LiteConfig;
+
+    use super::*;
+
+    const WINDOW: usize = 8;
+    const WRITES: usize = 40;
+
+    /// A store whose delta window is far smaller than what it is about to
+    /// queue, with no Origin to acknowledge any of it.
+    async fn db_with_small_window() -> std::sync::Arc<NodeDbLite<PagedbStorageMem>> {
+        let storage = PagedbStorageMem::open_in_memory().await.expect("storage");
+        let config = LiteConfig {
+            crdt_pending_delta_window: WINDOW,
+            // Flushing is what enforces the window; do it explicitly rather
+            // than racing a timer.
+            auto_flush_ms: 0,
+            sync_enabled: false,
+            ..LiteConfig::default()
+        };
+        NodeDbLite::open_with_config(storage, config)
+            .await
+            .expect("open")
+    }
+
+    async fn write_documents(db: &NodeDbLite<PagedbStorageMem>) {
+        for i in 0..WRITES {
+            db.document_put("docs", Document::new(format!("d{i}")))
+                .await
+                .expect("document_put");
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_bounds_the_resident_delta_window_without_losing_the_queue() {
+        let db = db_with_small_window().await;
+        write_documents(&db).await;
+
+        db.flush().await.expect("flush");
+
+        let (resident, total) = {
+            let crdt = db.crdt.lock_or_recover();
+            (crdt.resident_pending_count(), crdt.pending_count())
+        };
+        assert!(
+            resident <= WINDOW,
+            "resident window is {resident}, must not exceed {WINDOW}"
+        );
+        assert_eq!(
+            total, WRITES,
+            "no Origin acknowledged anything, so the queue must still hold every mutation"
+        );
+        assert_eq!(db.crdt_spilled_delta_count(), WRITES - resident);
+        assert_eq!(
+            db.health().engines.pending_deltas,
+            WRITES,
+            "health reports the queue, not the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_retirement_sweep_keeps_every_paged_out_entry_on_disk() {
+        let db = db_with_small_window().await;
+        write_documents(&db).await;
+
+        // Twice: the first flush pages entries out, the second sweeps the
+        // stored keys with those entries nowhere in memory. Deleting them there
+        // is exactly how the backlog would be lost.
+        db.flush().await.expect("first flush");
+        db.flush().await.expect("second flush");
+
+        let stored = db.persisted_delta_ids().await.expect("scan");
+        assert_eq!(
+            stored.len(),
+            WRITES,
+            "every queued mutation must still have its stored entry"
+        );
+        assert_eq!(
+            db.crdt.lock_or_recover().pending_count(),
+            WRITES,
+            "the queue survives a sweep that cannot see most of it"
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledging_a_paged_out_entry_deletes_its_stored_entry() {
+        let db = db_with_small_window().await;
+        write_documents(&db).await;
+        db.flush().await.expect("flush");
+
+        let acked = {
+            let crdt = db.crdt.lock_or_recover();
+            let resident: std::collections::HashSet<u64> = crdt
+                .pending_deltas()
+                .iter()
+                .map(|d| d.mutation_id)
+                .collect();
+            (1..=WRITES as u64)
+                .find(|id| !resident.contains(id))
+                .expect("some entry was paged out")
+        };
+
+        db.acknowledge_deltas(acked).expect("acknowledge");
+        db.flush().await.expect("flush");
+
+        let stored = db.persisted_delta_ids().await.expect("scan");
+        assert!(
+            !stored.contains(&acked),
+            "the acknowledged entry's stored form must be deleted even though it was \
+             never paged back in"
+        );
+        assert_eq!(stored.len(), WRITES - 1);
+        assert_eq!(db.crdt.lock_or_recover().pending_count(), WRITES - 1);
+    }
+
+    #[tokio::test]
+    async fn draining_the_window_pages_the_backlog_back_in_oldest_first() {
+        let db = db_with_small_window().await;
+        write_documents(&db).await;
+        db.flush().await.expect("flush");
+
+        let head: Vec<u64> = db
+            .crdt
+            .lock_or_recover()
+            .pending_deltas()
+            .iter()
+            .map(|d| d.mutation_id)
+            .collect();
+        for id in &head {
+            db.acknowledge_deltas(*id).expect("acknowledge");
+        }
+        assert_eq!(db.crdt.lock_or_recover().resident_pending_count(), 0);
+
+        db.flush().await.expect("flush");
+
+        let crdt = db.crdt.lock_or_recover();
+        let resident: Vec<u64> = crdt.pending_deltas().iter().map(|d| d.mutation_id).collect();
+        assert_eq!(
+            resident.len(),
+            WINDOW,
+            "the window refills from storage once acknowledgements drain it"
+        );
+        assert_eq!(
+            resident.first().copied(),
+            Some(head.len() as u64 + 1),
+            "the oldest unacknowledged entry is paged in first, so replay stays in order"
+        );
+        assert!(
+            crdt.pending_deltas().iter().all(|d| !d.delta_bytes.is_empty()),
+            "a paged-in entry carries the payload that will be pushed"
+        );
+        assert_eq!(crdt.pending_count(), WRITES - head.len());
     }
 }
