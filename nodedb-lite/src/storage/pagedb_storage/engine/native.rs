@@ -146,13 +146,22 @@ where
         let start_key = prefix_key(ns, start);
         let end_key = ns_end(ns);
         let txn = self.db.begin_read().await.map_err(LiteError::from)?;
+        // `scan` is materialising: it decodes every record from `start` to the
+        // end of the namespace before the caller sees any of them, so taking
+        // `limit` afterwards read the whole tree anyway. That turned paging —
+        // the caller asking for successive bounded chunks — into quadratic
+        // work: a 1.08M-record `delta:` namespace took over 20 minutes to page
+        // through at open, against ~90 s for a single unbounded scan.
+        // `scan_from` pushes the bound into the B+ tree walk, which is what it
+        // exists for. It has no end key, so the namespace boundary is enforced
+        // here.
         let raw = txn
-            .scan(&start_key, &end_key)
+            .scan_from(&start_key, limit)
             .await
             .map_err(LiteError::from)?;
         Ok(raw
             .into_iter()
-            .take(limit)
+            .take_while(|(k, _)| k.as_ref() < end_key.as_slice())
             .map(|(k, v)| (strip_prefix(&k).to_vec(), v.to_vec()))
             .collect())
     }

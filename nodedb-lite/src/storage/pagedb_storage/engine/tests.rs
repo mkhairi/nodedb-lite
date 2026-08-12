@@ -339,3 +339,41 @@ async fn scan_range_bounded_namespace_isolation() {
     );
     assert!(graph_results.iter().all(|(_, v)| v == b"graph"));
 }
+
+/// `scan_range` must page: successive bounded calls walk the namespace in
+/// order, return at most `limit`, and stop at the namespace boundary.
+///
+/// The boundary half is the risk in bounding the walk. The underlying pagedb
+/// `scan_from` takes a count and no end key, so without an explicit stop a
+/// page near the end of one namespace would spill into the next one's records.
+#[tokio::test]
+async fn scan_range_pages_in_order_and_stops_at_the_namespace_boundary() {
+    let s = make_storage().await;
+    for i in 0..10u32 {
+        s.put(Namespace::Crdt, format!("delta:{i:04}").as_bytes(), b"x")
+            .await
+            .unwrap();
+    }
+    // A record in the *next* namespace: a page that ran past the end would
+    // return this one.
+    s.put(Namespace::Meta, b"aaaa", b"other").await.unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut start = b"delta:".to_vec();
+    loop {
+        let chunk = s.scan_range(Namespace::Crdt, &start, 4).await.unwrap();
+        assert!(chunk.len() <= 4, "scan_range returned more than the limit");
+        if chunk.is_empty() {
+            break;
+        }
+        let last = chunk[chunk.len() - 1].0.clone();
+        for (k, _) in chunk {
+            seen.push(String::from_utf8(k).unwrap());
+        }
+        start = last;
+        start.push(0);
+    }
+
+    let expected: Vec<String> = (0..10u32).map(|i| format!("delta:{i:04}")).collect();
+    assert_eq!(seen, expected, "paging must yield every record once, in order");
+}
