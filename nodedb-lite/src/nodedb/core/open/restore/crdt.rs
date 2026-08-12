@@ -25,6 +25,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
     pub(in crate::nodedb::core::open) async fn restore_identity_and_crdt(
         storage: &Arc<S>,
         policy: crate::storage::corruption::CorruptionPolicy,
+        pending_delta_window: usize,
     ) -> NodeDbResult<(CrdtEngine, crate::identity::LiteIdentity)> {
         // ── Load or create Lite identity (lite_id + epoch + peer id) ──
         //
@@ -53,8 +54,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // set is recovered with a single prefix scan. A collection whose
         // snapshot fails its CRC32C check is dropped individually — the other
         // collections stay intact instead of the whole engine resetting.
-        let mut crdt = CrdtEngine::new(lite_identity.peer_id)
-            .map_err(|e| NodeDbError::storage(format!("CRDT init failed: {e}")))?;
+        let mut crdt = CrdtEngine::new_with_pending_window(
+            lite_identity.peer_id,
+            pending_delta_window,
+        )
+        .map_err(|e| NodeDbError::storage(format!("CRDT init failed: {e}")))?;
         let snapshot_entries = storage
             .scan_prefix(Namespace::LoroState, CrdtEngine::snapshot_key_prefix())
             .await?;
@@ -246,14 +250,57 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         // Restore pending deltas — prefer incremental entries over legacy bulk blob.
-        let incremental_entries = storage.scan_prefix(Namespace::Crdt, b"delta:").await?;
+        //
+        // Scanned in chunks rather than in one `scan_prefix`: the queue is
+        // retired only by an Origin acknowledgement, so on a replica with no
+        // Origin it holds every mutation ever made, and reading it whole
+        // materialises every one of those payloads at open just to hand all but
+        // the resident window straight back. The engine keeps the first window
+        // of each ordered chunk and records the rest by id alone, so peak
+        // occupancy is the window plus one chunk.
+        const DELTA_RESTORE_CHUNK: usize = 4_096;
+        let mut restored_any = false;
+        let mut start = b"delta:".to_vec();
+        loop {
+            let chunk = storage
+                .scan_range(Namespace::Crdt, &start, DELTA_RESTORE_CHUNK)
+                .await?;
+            if chunk.is_empty() {
+                break;
+            }
+            let scanned = chunk.len();
+            let next_start = chunk
+                .last()
+                .map(|(key, _)| {
+                    // The successor of the last key read: `scan_range` is
+                    // inclusive of `start`, so resuming at it would re-read it.
+                    let mut next = key.clone();
+                    next.push(0);
+                    next
+                })
+                .unwrap_or_default();
 
-        if !incremental_entries.is_empty() {
-            // Use incremental entries (append-only format).
-            crdt.restore_pending_deltas_incremental(&incremental_entries, policy.may_discard())
-                .map_err(|e| NodeDbError::segment_corrupted(e.to_string()))?;
-        } else if let Some(delta_bytes) = storage.get(Namespace::Crdt, META_CRDT_DELTAS).await? {
-            // Fall back to legacy bulk blob.
+            let in_prefix: Vec<(Vec<u8>, Vec<u8>)> = chunk
+                .into_iter()
+                .take_while(|(key, _)| key.starts_with(b"delta:"))
+                .collect();
+            let ended = in_prefix.len() < scanned || scanned < DELTA_RESTORE_CHUNK;
+
+            if !in_prefix.is_empty() {
+                restored_any = true;
+                crdt.absorb_restored_delta_chunk(&in_prefix, policy.may_discard())
+                    .map_err(|e| NodeDbError::segment_corrupted(e.to_string()))?;
+            }
+            if ended {
+                break;
+            }
+            start = next_start;
+        }
+
+        // Fall back to the legacy bulk blob only when no per-entry key exists.
+        if !restored_any
+            && let Some(delta_bytes) = storage.get(Namespace::Crdt, META_CRDT_DELTAS).await?
+        {
             crdt.restore_pending_deltas(&delta_bytes);
         }
 
@@ -264,12 +311,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             && last_flushed_bytes.len() == 8
         {
             let last_flushed = u64::from_le_bytes(last_flushed_bytes.try_into().unwrap_or([0; 8]));
-            let max_pending = crdt
-                .pending_deltas()
-                .iter()
-                .map(|d| d.mutation_id)
-                .max()
-                .unwrap_or(0);
+            let max_pending = crdt.max_pending_mutation_id();
 
             if max_pending > 0 && last_flushed > 0 && max_pending != last_flushed {
                 // Clearing the queue throws away mutations that may not be in

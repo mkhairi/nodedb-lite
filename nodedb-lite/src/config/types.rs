@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use super::defaults::{
     default_argon2_m_cost, default_argon2_p_cost, default_argon2_t_cost, default_auto_compact_ms,
-    default_auto_flush_ms, default_kv_cache_capacity, default_outbound_queue_cap,
-    default_sync_enabled,
+    default_auto_flush_ms, default_crdt_pending_delta_window, default_kv_cache_capacity,
+    default_outbound_queue_cap, default_sync_enabled,
 };
 use crate::storage::corruption::CorruptionPolicy;
 
@@ -88,6 +88,26 @@ pub struct LiteConfig {
     #[serde(default = "default_outbound_queue_cap")]
     pub outbound_queue_cap: usize,
 
+    /// Maximum number of unsent CRDT deltas held in memory. Default: 10_000.
+    ///
+    /// The CRDT outbox is retired only by an Origin acknowledgement, so a store
+    /// running with `sync_enabled: false` keeps every mutation it has ever
+    /// made. Every entry is persisted under its own `delta:` key, so beyond
+    /// this window they are held as mutation ids alone and paged back in, oldest
+    /// first, as the window drains. Raising it costs roughly the average delta
+    /// size per entry; lowering it costs a storage read per entry paged back in
+    /// while a sync session is draining the backlog.
+    ///
+    /// Unlike `outbound_queue_cap` this is not a cap: nothing is refused and
+    /// nothing is dropped when the window is full. It bounds only how much of
+    /// the queue is resident.
+    ///
+    /// A value of 0 is rejected at open time; use 1 as the effective minimum.
+    /// Can also be set via the `NODEDB_LITE_CRDT_DELTA_WINDOW` environment
+    /// variable.
+    #[serde(default = "default_crdt_pending_delta_window")]
+    pub crdt_pending_delta_window: usize,
+
     /// Interval between automatic background flushes, in milliseconds.
     /// Default: 1000 (1 second).
     ///
@@ -144,6 +164,7 @@ impl Default for LiteConfig {
             query_percent: 15,
             sync_enabled: true,
             outbound_queue_cap: default_outbound_queue_cap(),
+            crdt_pending_delta_window: default_crdt_pending_delta_window(),
             argon2_m_cost: default_argon2_m_cost(),
             argon2_t_cost: default_argon2_t_cost(),
             argon2_p_cost: default_argon2_p_cost(),
@@ -173,6 +194,7 @@ mod tests {
         assert_eq!(cfg.auto_flush_ms, 1_000);
         // Auto-compaction is opt-in: disabled by default.
         assert_eq!(cfg.auto_compact_ms, 0);
+        assert_eq!(cfg.crdt_pending_delta_window, 10_000);
     }
 
     #[test]

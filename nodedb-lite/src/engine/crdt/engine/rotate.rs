@@ -88,7 +88,12 @@ impl CrdtEngine {
         // Nothing above mutated `self`, so a failure returned before this point
         // leaves the engine exactly as it was.
         self.states = rotated;
+        // Every row is re-authored under the new identity and re-queued above,
+        // so the entries that were paged out describe a document that no longer
+        // exists. Dropping them from the index retires their stored keys on the
+        // next flush.
         self.pending_deltas = pending;
+        self.spill.clear();
         self.acked_versions.clear();
         self.next_mutation_id
             .store(next_mutation_id, Ordering::Relaxed);
