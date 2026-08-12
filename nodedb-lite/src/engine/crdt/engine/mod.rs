@@ -21,6 +21,7 @@ mod pending;
 mod persist;
 mod read;
 mod rotate;
+mod spill;
 pub mod types;
 
 #[cfg(test)]
@@ -29,4 +30,6 @@ mod flush_ack_tests;
 mod tests;
 
 pub use checkpoint::{CrdtPersisted, CrdtWrite, CrdtWriteKind};
-pub use types::{CrdtBatchOp, CrdtEngine, CrdtField, PendingDelta};
+pub use types::{
+    CrdtBatchOp, CrdtEngine, CrdtField, DEFAULT_PENDING_DELTA_WINDOW, PendingDelta,
+};

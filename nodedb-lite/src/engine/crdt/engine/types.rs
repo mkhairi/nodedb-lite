@@ -39,6 +39,16 @@ pub(super) const VCLOCK_KEY: &[u8] = b"vector_clock";
 /// Restore replays every update written since the base, so this also bounds
 /// the replay: open costs the base plus at most this fraction again.
 pub(super) const DELTA_CHECKPOINT_RATIO: usize = 4;
+/// Number of queue entries kept in memory when nothing configures otherwise.
+///
+/// The queue is drained only by an Origin acknowledgement, so a replica with no
+/// Origin holds every mutation it has ever made. Each entry carries its Loro
+/// delta bytes plus two owned strings, so the resident cost is hundreds of bytes
+/// per entry — an outbox that reaches a million entries is a hundreds-of-MB
+/// resident structure whose entries are all already on disk under their own
+/// `delta:` keys.
+pub const DEFAULT_PENDING_DELTA_WINDOW: usize = 10_000;
+
 /// Never rewrite the base for less than this many accumulated update bytes.
 ///
 /// A fraction of a small document is a few hundred bytes, which would restore
@@ -69,9 +79,29 @@ pub struct CrdtEngine {
     pub(in crate::engine::crdt) states: std::collections::BTreeMap<String, CrdtState>,
     /// Monotonically increasing mutation ID. Used as delta ordering key.
     pub(super) next_mutation_id: AtomicU64,
-    /// Unsent deltas accumulated since last sync ACK.
-    /// Each entry: `(mutation_id, collection, doc_id, delta_bytes)`.
+    /// The resident window of the unsent-delta queue: the entries held in
+    /// memory, ascending by mutation id.
+    ///
+    /// This is a *window*, not the queue. Entries evicted from it are still
+    /// queued — they live under their own `delta:` key and are counted by
+    /// [`CrdtEngine::pending_count`] — and are paged back in from the oldest
+    /// end as the window drains. See `spill`.
     pub(in crate::engine::crdt) pending_deltas: Vec<PendingDelta>,
+    /// Queue entries that exist only under their `delta:` key.
+    ///
+    /// The queue is retired only by an Origin acknowledgement, so on a replica
+    /// with no Origin it grows for the life of the store. Every entry is
+    /// already persisted individually, so beyond the resident window the
+    /// in-memory representation can be the mutation id alone — run-compressed,
+    /// which for consecutively issued ids is one run for the whole backlog.
+    pub(in crate::engine::crdt) spill: super::spill::SpillIndex,
+    /// Maximum number of queue entries to hold in `pending_deltas`.
+    ///
+    /// Enforced by [`CrdtEngine::evict_pending_overflow`] after a flush has
+    /// made the entries durable — an entry that exists only in memory is never
+    /// evicted, so the resident set can exceed this between a write and the
+    /// flush that persists it.
+    pub(in crate::engine::crdt) pending_window: usize,
     /// Per-collection version: highest mutation_id that's been ACK'd by Origin.
     pub(super) acked_versions: HashMap<String, u64>,
     /// Conflict resolution policies per collection.

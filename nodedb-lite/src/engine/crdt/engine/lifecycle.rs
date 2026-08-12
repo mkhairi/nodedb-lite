@@ -36,12 +36,35 @@ fn warn_if_fully_trimmed(collection: &str, kind: &str, admission: &ImportAdmissi
 
 impl CrdtEngine {
     /// Create a new empty CRDT engine with the given peer ID.
+    ///
+    /// The pending-delta window takes its default; use
+    /// [`Self::new_with_pending_window`] to size it from configuration.
     pub fn new(peer_id: u64) -> Result<Self, LiteError> {
+        Self::new_with_pending_window(peer_id, super::types::DEFAULT_PENDING_DELTA_WINDOW)
+    }
+
+    /// Create a new empty CRDT engine holding at most `pending_window` unsent
+    /// deltas in memory.
+    ///
+    /// A window of 0 is rejected: the queue would have nowhere to hold an entry
+    /// between the mutation that produced it and the flush that persists it,
+    /// and the entry cannot be evicted before it is durable.
+    pub fn new_with_pending_window(
+        peer_id: u64,
+        pending_window: usize,
+    ) -> Result<Self, LiteError> {
+        if pending_window == 0 {
+            return Err(LiteError::Storage {
+                detail: "pending-delta window must be at least 1".to_string(),
+            });
+        }
         Ok(Self {
             peer_id,
             states: BTreeMap::new(),
             next_mutation_id: AtomicU64::new(1),
             pending_deltas: Vec::new(),
+            spill: super::spill::SpillIndex::default(),
+            pending_window,
             acked_versions: HashMap::new(),
             policies: nodedb_crdt::PolicyRegistry::new(),
             registered_collections: std::collections::HashSet::new(),
