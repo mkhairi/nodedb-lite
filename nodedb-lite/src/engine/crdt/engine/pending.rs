@@ -147,7 +147,9 @@ impl CrdtEngine {
         if self.spill.is_empty() {
             return Vec::new();
         }
-        let room = self.pending_window.saturating_sub(self.pending_deltas.len());
+        let room = self
+            .pending_window
+            .saturating_sub(self.pending_deltas.len());
         self.spill.lowest(room.min(limit))
     }
 
@@ -367,11 +369,7 @@ mod tests {
         let mut engine = CrdtEngine::new_with_pending_window(1, window).expect("engine");
         for i in 0..count {
             engine
-                .upsert(
-                    "docs",
-                    &format!("d{i}"),
-                    &[("n", LoroValue::I64(i as i64))],
-                )
+                .upsert("docs", &format!("d{i}"), &[("n", LoroValue::I64(i as i64))])
                 .expect("upsert");
         }
         engine
@@ -395,7 +393,11 @@ mod tests {
         let evicted = engine.evict_pending_overflow();
 
         assert_eq!(evicted, 42);
-        assert_eq!(engine.resident_pending_count(), 8, "window must be honoured");
+        assert_eq!(
+            engine.resident_pending_count(),
+            8,
+            "window must be honoured"
+        );
         assert_eq!(engine.spilled_pending_count(), 42);
         assert_eq!(
             engine.pending_count(),
@@ -516,7 +518,10 @@ mod tests {
             .find(|d| d.mutation_id == 30)
             .expect("mutation 30 is resident again");
         assert_eq!(back.document_id, "d29");
-        assert!(!back.delta_bytes.is_empty(), "the payload survived the round trip");
+        assert!(
+            !back.delta_bytes.is_empty(),
+            "the payload survived the round trip"
+        );
         assert_eq!(engine.pending_count(), 42, "paging in changes no total");
         assert_eq!(engine.spilled_pending_count(), 41);
     }
@@ -566,5 +571,46 @@ mod tests {
             CrdtEngine::new_with_pending_window(1, 0).is_err(),
             "a queue with nowhere to hold a fresh entry cannot persist one"
         );
+    }
+
+    /// With sync off, a mutation must still be applied but must not be staged.
+    ///
+    /// The queue exists to be drained by an Origin. Without one it is a leak
+    /// paid for in RAM, in `delta:` keys, and in flush work — for every write,
+    /// forever. What must NOT change is the local document: the mutation is
+    /// applied, readable, and still mints a mutation id for the caller.
+    #[test]
+    fn sync_disabled_applies_the_mutation_without_staging_a_delta() {
+        let mut engine = CrdtEngine::new_with_options(1, 10, false).expect("engine");
+        let mutation_id = engine
+            .upsert("docs", "d1", &[("n", LoroValue::I64(7))])
+            .expect("upsert");
+
+        assert_eq!(engine.pending_count(), 0, "no delta may be staged");
+        assert!(!engine.has_unpersisted_deltas(), "nothing to write out");
+        assert!(mutation_id > 0, "the caller still gets a mutation id");
+
+        // The write itself landed: this is the half that must not regress.
+        assert!(
+            engine.exists("docs", "d1"),
+            "the row must exist locally even though no delta was staged"
+        );
+        assert_eq!(
+            engine.read_field("docs", "d1", "n"),
+            Some(LoroValue::I64(7)),
+            "the value must be readable"
+        );
+    }
+
+    /// The same engine with sync on still stages — the flag is what decides,
+    /// not some unrelated change in the write path.
+    #[test]
+    fn sync_enabled_still_stages_a_delta() {
+        let mut engine = CrdtEngine::new_with_options(1, 10, true).expect("engine");
+        engine
+            .upsert("docs", "d1", &[("n", LoroValue::I64(7))])
+            .expect("upsert");
+        assert_eq!(engine.pending_count(), 1, "sync on must stage");
+        assert!(engine.has_unpersisted_deltas());
     }
 }

@@ -176,14 +176,18 @@ impl CrdtEngine {
             }
 
             let mutation_id = self.next_mutation_id.fetch_add(1, Ordering::Relaxed);
-            self.pending_deltas.push(PendingDelta {
-                mutation_id,
-                collection: op.collection,
-                document_id: op.document_id,
-                delta_bytes,
-                seq: 0,
-            });
-            self.mark_delta_unpersisted(mutation_id);
+            // No Origin, no outbound queue: the document above is already
+            // updated, and a delta nobody will ever read is a permanent cost.
+            if self.sync_enabled {
+                self.pending_deltas.push(PendingDelta {
+                    mutation_id,
+                    collection: op.collection,
+                    document_id: op.document_id,
+                    delta_bytes,
+                    seq: 0,
+                });
+                self.mark_delta_unpersisted(mutation_id);
+            }
         }
 
         Ok(count)
@@ -249,14 +253,19 @@ impl CrdtEngine {
         }
 
         let mutation_id = self.next_mutation_id.fetch_add(1, Ordering::Relaxed);
-        self.pending_deltas.push(PendingDelta {
-            mutation_id,
-            collection: collection.to_string(),
-            document_id: document_id.to_string(),
-            delta_bytes,
-            seq: 0,
-        });
-        self.mark_delta_unpersisted(mutation_id);
+        // See the batch path: staging is what sync costs, so it is what sync
+        // being off saves. The mutation id is still minted and returned —
+        // callers use it to identify the write, not only to sync it.
+        if self.sync_enabled {
+            self.pending_deltas.push(PendingDelta {
+                mutation_id,
+                collection: collection.to_string(),
+                document_id: document_id.to_string(),
+                delta_bytes,
+                seq: 0,
+            });
+            self.mark_delta_unpersisted(mutation_id);
+        }
         Ok((value, mutation_id))
     }
 }

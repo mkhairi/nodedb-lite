@@ -375,5 +375,8 @@ async fn scan_range_pages_in_order_and_stops_at_the_namespace_boundary() {
     }
 
     let expected: Vec<String> = (0..10u32).map(|i| format!("delta:{i:04}")).collect();
-    assert_eq!(seen, expected, "paging must yield every record once, in order");
+    assert_eq!(
+        seen, expected,
+        "paging must yield every record once, in order"
+    );
 }
