@@ -12,6 +12,29 @@ use crate::nodedb::lock_ext::LockExt;
 use crate::storage::engine::StorageEngine;
 
 impl<S: StorageEngine> NodeDbLite<S> {
+    /// Compact every collection's Loro oplog to a shallow snapshot.
+    ///
+    /// Loro retains the full operation history of a document for as long as it
+    /// is open, and nothing in the normal write path ever trims it. On a
+    /// long-lived embedded store that history dominates resident memory: it
+    /// grows with every mutation, while the state it describes does not.
+    ///
+    /// This replaces each document with a shallow snapshot at its current
+    /// frontier. **Current state is preserved exactly**; what is discarded is
+    /// the ability to reconstruct or diff against versions before that
+    /// frontier, and thus to merge a remote delta whose causal predecessors
+    /// were compacted away. Do not call it on a store that syncs with an
+    /// Origin it may still need to reconcile old history with.
+    ///
+    /// The same operation is reachable as the `TemporalPurgeCrdt` meta-op; this
+    /// is the direct entry point for an embedding application that has no SQL
+    /// surface.
+    pub fn compact_crdt_history(&self) -> NodeDbResult<()> {
+        let mut crdt = self.crdt.lock_or_recover();
+        crdt.compact_history()?;
+        Ok(())
+    }
+
     /// Install a per-document [`SyncGate`]. Documents the gate rejects are kept
     /// local-only (excluded from CRDT delta, FTS, and vector sync channels).
     pub fn set_sync_gate(&self, gate: Arc<dyn SyncGate>) {
