@@ -95,6 +95,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             &storage,
             config.corruption_policy,
             config.crdt_pending_delta_window,
+            sync_enabled,
         )
         .await?;
 

@@ -124,7 +124,10 @@ impl CrdtEngine {
         entries: &[(Vec<u8>, Vec<u8>)],
         allow_discard: bool,
     ) -> Result<(), crate::error::LiteError> {
-        let mut max_id = self.next_mutation_id.load(Ordering::Relaxed).saturating_sub(1);
+        let mut max_id = self
+            .next_mutation_id
+            .load(Ordering::Relaxed)
+            .saturating_sub(1);
         for (key, value) in entries {
             let key_id = Self::mutation_id_from_delta_key(key);
             if self.pending_deltas.len() < self.pending_window {
@@ -248,11 +251,7 @@ mod tests {
         let mut engine = CrdtEngine::new(1).expect("engine");
         for i in 0..count {
             engine
-                .upsert(
-                    "docs",
-                    &format!("d{i}"),
-                    &[("n", LoroValue::I64(i as i64))],
-                )
+                .upsert("docs", &format!("d{i}"), &[("n", LoroValue::I64(i as i64))])
                 .expect("upsert");
         }
         engine
@@ -353,7 +352,10 @@ mod tests {
             let key = CrdtEngine::delta_storage_key(id);
             assert_eq!(CrdtEngine::mutation_id_from_delta_key(&key), Some(id));
         }
-        assert_eq!(CrdtEngine::mutation_id_from_delta_key(b"loro_delta:x"), None);
+        assert_eq!(
+            CrdtEngine::mutation_id_from_delta_key(b"loro_delta:x"),
+            None
+        );
         assert_eq!(CrdtEngine::mutation_id_from_delta_key(b"delta:zz"), None);
     }
 }
