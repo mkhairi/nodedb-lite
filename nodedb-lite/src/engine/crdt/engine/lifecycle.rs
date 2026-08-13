@@ -49,9 +49,17 @@ impl CrdtEngine {
     /// A window of 0 is rejected: the queue would have nowhere to hold an entry
     /// between the mutation that produced it and the flush that persists it,
     /// and the entry cannot be evicted before it is durable.
-    pub fn new_with_pending_window(
+    pub fn new_with_pending_window(peer_id: u64, pending_window: usize) -> Result<Self, LiteError> {
+        Self::new_with_options(peer_id, pending_window, true)
+    }
+
+    /// As [`new_with_pending_window`](Self::new_with_pending_window), with
+    /// `sync_enabled` deciding whether mutations stage outbound deltas. See
+    /// [`CrdtEngine::sync_enabled`] for what turning it off forfeits.
+    pub fn new_with_options(
         peer_id: u64,
         pending_window: usize,
+        sync_enabled: bool,
     ) -> Result<Self, LiteError> {
         if pending_window == 0 {
             return Err(LiteError::Storage {
@@ -65,6 +73,7 @@ impl CrdtEngine {
             pending_deltas: Vec::new(),
             spill: super::spill::SpillIndex::default(),
             pending_window,
+            sync_enabled,
             acked_versions: HashMap::new(),
             policies: nodedb_crdt::PolicyRegistry::new(),
             registered_collections: std::collections::HashSet::new(),

@@ -102,6 +102,20 @@ pub struct CrdtEngine {
     /// evicted, so the resident set can exceed this between a write and the
     /// flush that persists it.
     pub(in crate::engine::crdt) pending_window: usize,
+    /// Whether this store replicates to an Origin (`LiteConfig::sync_enabled`).
+    ///
+    /// When false, a mutation is still applied to the Loro document — local
+    /// state and its merge semantics are unchanged — but no [`PendingDelta`] is
+    /// staged for it, because a delta only exists to be sent somewhere and
+    /// there is nowhere to send it. Staging them anyway made the queue a pure
+    /// leak: it grows with every write, is never acknowledged, and is paid for
+    /// in RAM, in disk (`delta:` keys), and in flush work forever.
+    ///
+    /// **Enabling sync on a store that ran with it off cannot replay the
+    /// history it never staged.** The first replication has to bootstrap the
+    /// Origin from a snapshot rather than from the delta log, which is the
+    /// normal shape of an initial sync in any case.
+    pub(in crate::engine::crdt) sync_enabled: bool,
     /// Per-collection version: highest mutation_id that's been ACK'd by Origin.
     pub(super) acked_versions: HashMap<String, u64>,
     /// Conflict resolution policies per collection.
