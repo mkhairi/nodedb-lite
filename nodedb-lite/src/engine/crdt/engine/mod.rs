@@ -30,6 +30,4 @@ mod flush_ack_tests;
 mod tests;
 
 pub use checkpoint::{CrdtPersisted, CrdtWrite, CrdtWriteKind};
-pub use types::{
-    CrdtBatchOp, CrdtEngine, CrdtField, DEFAULT_PENDING_DELTA_WINDOW, PendingDelta,
-};
+pub use types::{CrdtBatchOp, CrdtEngine, CrdtField, DEFAULT_PENDING_DELTA_WINDOW, PendingDelta};

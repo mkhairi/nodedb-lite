@@ -55,7 +55,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
         let mut ids = Vec::new();
         let mut start = b"delta:".to_vec();
         loop {
-            let chunk = self.storage.scan_range(Namespace::Crdt, &start, CHUNK).await?;
+            let chunk = self
+                .storage
+                .scan_range(Namespace::Crdt, &start, CHUNK)
+                .await?;
             if chunk.is_empty() {
                 break;
             }
@@ -153,7 +156,18 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // outbox with no Origin to drain it holds every mutation ever made, and
         // reading it whole to look at its keys materialises every payload in it
         // once per flush tick.
-        let persisted_delta_ids = self.persisted_delta_ids().await?;
+        //
+        // With sync off nothing stages deltas, so the queue is empty and every
+        // stored `delta:` key would look retired — the sweep below would delete
+        // the whole backlog left over from a period when sync was on. Skipping
+        // the scan keeps that residue on disk, so re-enabling sync is a
+        // decision an operator makes, not one a flush tick makes for them. It
+        // also removes the scan from the tick entirely in the common case.
+        let persisted_delta_ids = if self.sync_enabled {
+            self.persisted_delta_ids().await?
+        } else {
+            Vec::new()
+        };
 
         // ── Persist one CRDT snapshot per collection (CRC32C wrapped) ──
         // Each collection owns its own Loro document, so each gets its own
@@ -217,7 +231,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
             // A paged-out entry is still queued, and its stored key is the only
             // copy of it that exists — `pending_delta_is_live` answers for the
             // whole queue so the sweep below cannot delete it.
-            let retired = crdt.retired_delta_ids(persisted_delta_ids);
+            let retired = if self.sync_enabled {
+                crdt.retired_delta_ids(persisted_delta_ids)
+            } else {
+                Vec::new()
+            };
             let retired_any = !retired.is_empty();
             for mutation_id in retired {
                 ops.push(WriteOp::Delete {
@@ -623,7 +641,9 @@ mod tests {
             // Flushing is what enforces the window; do it explicitly rather
             // than racing a timer.
             auto_flush_ms: 0,
-            sync_enabled: false,
+            // These tests are about the outbound queue, which only exists when
+            // this store replicates: with sync off nothing is staged at all.
+            sync_enabled: true,
             ..LiteConfig::default()
         };
         NodeDbLite::open_with_config(storage, config)
@@ -742,7 +762,11 @@ mod tests {
         db.flush().await.expect("flush");
 
         let crdt = db.crdt.lock_or_recover();
-        let resident: Vec<u64> = crdt.pending_deltas().iter().map(|d| d.mutation_id).collect();
+        let resident: Vec<u64> = crdt
+            .pending_deltas()
+            .iter()
+            .map(|d| d.mutation_id)
+            .collect();
         assert_eq!(
             resident.len(),
             WINDOW,
@@ -754,7 +778,9 @@ mod tests {
             "the oldest unacknowledged entry is paged in first, so replay stays in order"
         );
         assert!(
-            crdt.pending_deltas().iter().all(|d| !d.delta_bytes.is_empty()),
+            crdt.pending_deltas()
+                .iter()
+                .all(|d| !d.delta_bytes.is_empty()),
             "a paged-in entry carries the payload that will be pushed"
         );
         assert_eq!(crdt.pending_count(), WRITES - head.len());
