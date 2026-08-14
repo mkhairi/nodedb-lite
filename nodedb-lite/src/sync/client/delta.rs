@@ -10,8 +10,18 @@ impl SyncClient {
     /// Build DeltaPush messages from pending deltas.
     ///
     /// Respects the flow control window: returns at most `next_batch_size()`
-    /// deltas. Each message includes a CRC32C checksum of the delta payload
-    /// for integrity verification at Origin.
+    /// deltas, and never a delta that is already in flight. Each message
+    /// includes a CRC32C checksum of the delta payload for integrity
+    /// verification at Origin.
+    ///
+    /// Skipping the in-flight entries is what makes the window a window. The
+    /// pending queue is ordered and only retires on an ack, so taking its head
+    /// unconditionally re-sends the same batch on every 100 ms tick — and
+    /// because `in_flight` is keyed by mutation id, re-pushing those same ids
+    /// leaves its length unchanged, so the remaining window never closes. The
+    /// Origin then spends its apply path on hundreds of redundant copies of the
+    /// same deltas, and the queue drains at a trickle instead of converging
+    /// (NDB-AQL-30).
     ///
     /// `peer_id` is passed in rather than held on the client: it changes when
     /// a collision refusal rotates this replica's identity, and a delta pushed
@@ -21,11 +31,20 @@ impl SyncClient {
         pending: &[PendingDelta],
         peer_id: u64,
     ) -> Vec<DeltaPushMsg> {
-        let flow = self.flow.lock().await;
-        let batch_limit = flow.next_batch_size();
-        drop(flow);
+        let selected: Vec<&PendingDelta> = {
+            let flow = self.flow.lock().await;
+            let batch_limit = flow.next_batch_size();
+            if batch_limit == 0 {
+                return Vec::new();
+            }
+            pending
+                .iter()
+                .filter(|delta| !flow.is_in_flight(delta.mutation_id))
+                .take(batch_limit)
+                .collect()
+        };
 
-        if batch_limit == 0 {
+        if selected.is_empty() {
             return Vec::new();
         }
 
@@ -38,7 +57,7 @@ impl SyncClient {
         // prompt for the write that failed.
         {
             let mut targets = self.delta_targets.lock().await;
-            for delta in pending.iter().take(batch_limit) {
+            for delta in &selected {
                 targets.insert(
                     delta.mutation_id,
                     (delta.collection.clone(), delta.document_id.clone()),
@@ -46,9 +65,8 @@ impl SyncClient {
             }
         }
 
-        pending
-            .iter()
-            .take(batch_limit)
+        selected
+            .into_iter()
             .map(|delta| DeltaPushMsg {
                 collection: delta.collection.clone(),
                 document_id: delta.document_id.clone(),
@@ -200,6 +218,104 @@ mod tests {
         assert_eq!(msgs[1].collection, "users");
         assert!(msgs[0].device_valid_time_ms.is_some());
         assert!(msgs[0].device_valid_time_ms.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_delta_is_not_pushed_again() {
+        // The queue only retires on an ack, so between the push and the ack the
+        // same entry is still at the head of `pending`. Sending it again buys
+        // nothing (Origin dedups it) and costs the Origin a full apply round —
+        // and because `in_flight` is keyed by mutation id, the re-push does not
+        // consume window either, so nothing ever stops it (NDB-AQL-30).
+        let client = SyncClient::new(make_config());
+        let pending = vec![
+            PendingDelta {
+                mutation_id: 1,
+                collection: "orders".into(),
+                document_id: "o1".into(),
+                delta_bytes: vec![1, 2, 3],
+                seq: 0,
+            },
+            PendingDelta {
+                mutation_id: 2,
+                collection: "users".into(),
+                document_id: "u1".into(),
+                delta_bytes: vec![4, 5, 6],
+                seq: 0,
+            },
+        ];
+
+        let first = client.build_delta_pushes(&pending, 42).await;
+        assert_eq!(first.len(), 2);
+        client.record_push(&[1, 2]).await;
+
+        // Same queue, nothing acked yet: both are in flight, so there is
+        // nothing to send.
+        assert!(client.build_delta_pushes(&pending, 42).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_terminal_ack_releases_its_delta_for_the_next_batch() {
+        // The other half of the contract: an entry only stops being in flight
+        // when Origin speaks terminally about it, and then the window reopens
+        // for exactly that entry.
+        let client = SyncClient::new(make_config());
+        let pending = vec![PendingDelta {
+            mutation_id: 7,
+            collection: "orders".into(),
+            document_id: "o1".into(),
+            delta_bytes: vec![1, 2, 3],
+            seq: 0,
+        }];
+
+        assert_eq!(client.build_delta_pushes(&pending, 42).await.len(), 1);
+        client.record_push(&[7]).await;
+        assert!(client.build_delta_pushes(&pending, 42).await.is_empty());
+
+        client
+            .handle_delta_ack(&DeltaAckMsg {
+                mutation_id: 7,
+                lsn: 1,
+                clock_skew_warning_ms: None,
+                applied_seq: 1,
+                status: nodedb_types::sync::wire::AckStatus::Applied,
+            })
+            .await;
+
+        // In a live client `delegate.acknowledge` retires the entry from the
+        // queue as well; here the queue is a fixture, so the observable effect
+        // is that the mutation is eligible to be sent again.
+        assert_eq!(client.build_delta_pushes(&pending, 42).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retryable_gap_ack_also_releases_the_delta_for_re_send() {
+        // `Gap` means nothing applied and the client must re-push at the same
+        // seq. That only works if the ack clears the in-flight mark.
+        let client = SyncClient::new(make_config());
+        let pending = vec![PendingDelta {
+            mutation_id: 9,
+            collection: "orders".into(),
+            document_id: "o1".into(),
+            delta_bytes: vec![1, 2, 3],
+            seq: 4,
+        }];
+
+        assert_eq!(client.build_delta_pushes(&pending, 42).await.len(), 1);
+        client.record_push(&[9]).await;
+        assert!(client.build_delta_pushes(&pending, 42).await.is_empty());
+
+        client
+            .handle_delta_ack(&DeltaAckMsg {
+                mutation_id: 9,
+                lsn: 0,
+                clock_skew_warning_ms: None,
+                applied_seq: 3,
+                status: nodedb_types::sync::wire::AckStatus::Gap { expected: 4 },
+            })
+            .await;
+
+        assert_eq!(client.build_delta_pushes(&pending, 42).await.len(), 1);
     }
 
     #[tokio::test]
