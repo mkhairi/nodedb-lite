@@ -191,6 +191,22 @@ pub struct CrdtEngine {
     /// Exposed through [`CrdtEngine::snapshot_export_count`] so callers can
     /// assert on export volume directly instead of inferring it from timings.
     pub(in crate::engine::crdt) snapshot_exports: AtomicU64,
+    /// Queue entries Origin has refused for a reason that is not about the row
+    /// — a missing grant, a collection it has not materialized yet, a refusal
+    /// this version does not recognise.
+    ///
+    /// They are still queued and still counted by [`CrdtEngine::pending_count`];
+    /// this set is what distinguishes "waiting to be sent" from "sent and
+    /// refused", so a stalled queue cannot be read as a busy one. Reported
+    /// through [`CrdtEngine::blocked_delta_count`].
+    pub(in crate::engine::crdt) blocked_deltas: std::collections::HashSet<u64>,
+    /// Writes retired without ever having applied anywhere.
+    ///
+    /// Monotonic for the life of the engine. Any non-zero value is data this
+    /// replica no longer holds and Origin never took — the one number that must
+    /// not be inferred from a drained queue, because a queue drains identically
+    /// whether its entries applied or were thrown away.
+    pub(in crate::engine::crdt) dropped_writes: u64,
 }
 
 /// One deferred write awaiting `flush_deltas`, with the exact counter range
