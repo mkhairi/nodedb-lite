@@ -113,6 +113,12 @@ pub(super) async fn connect_and_run(
         });
     }
 
+    // A delta refused for a reason that was not about the row stays queued and
+    // stops being pushed for the rest of that session. A new session is the
+    // point at which the reason may have changed — a grant added at the Origin,
+    // a collection materialized — and nothing else tells this replica it did.
+    delegate.clear_blocked_deltas();
+
     // Origin holds a history under this `lite_id` that this instance's local
     // state diverged from — a restored backup, a rolled-back device, a cloned
     // store. Resuming the producer stream would push operations Origin cannot

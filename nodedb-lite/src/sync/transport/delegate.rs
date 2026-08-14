@@ -65,6 +65,20 @@ pub trait SyncDelegate: Send + Sync + 'static {
         mutation_id: u64,
         hint: &nodedb_types::sync::compensation::CompensationHint,
     );
+
+    /// Record that an outbound write was retired without ever applying.
+    ///
+    /// Called from every ack path that retires an entry on a terminal refusal.
+    /// Retiring is what a successful apply also does, so at the queue level the
+    /// two are indistinguishable — a drained queue reads as "everything landed"
+    /// whether it did or not. This counter is the difference, and it is
+    /// reported through health so an operator watching a queue length can see
+    /// the losses behind it.
+    fn record_dropped_write(&self);
+
+    /// Forget which queued deltas Origin refused, so a new session re-attempts
+    /// them. Called once per accepted handshake.
+    fn clear_blocked_deltas(&self);
     /// Import remote deltas from Origin into `collection`'s local CRDT state.
     ///
     /// The collection travels with the update because each collection has its

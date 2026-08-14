@@ -99,6 +99,20 @@ pub struct EnginesHealth {
     pub text_index_count: usize,
     /// Total pending CRDT deltas awaiting sync.
     pub pending_deltas: usize,
+    /// Of `pending_deltas`, the ones Origin has already refused for a reason
+    /// re-sending cannot fix on its own — most often a grant this replica's
+    /// principal has not been given.
+    ///
+    /// Non-zero means replication is stalled, not busy. Without it a stalled
+    /// queue and a backlogged one look identical from the outside.
+    pub blocked_deltas: usize,
+    /// Writes retired without ever applying, since this process started.
+    ///
+    /// The counter that makes `pending_deltas: 0` readable: a queue drains the
+    /// same way whether its entries landed on Origin or were thrown away, so
+    /// zero pending with a non-zero count here is total replication failure
+    /// wearing the shape of success.
+    pub dropped_writes: u64,
 }
 
 fn pressure_str(p: PressureLevel) -> &'static str {
@@ -174,9 +188,14 @@ impl<S: StorageEngine> NodeDbLite<S> {
             (nodes, edges)
         };
 
-        let (crdt_collections, pending_deltas) = {
+        let (crdt_collections, pending_deltas, blocked_deltas, dropped_writes) = {
             let crdt = self.crdt.lock_or_recover();
-            (crdt.collection_names().len(), crdt.pending_count())
+            (
+                crdt.collection_names().len(),
+                crdt.pending_count(),
+                crdt.blocked_delta_count(),
+                crdt.dropped_write_count(),
+            )
         };
 
         let text_count = {
@@ -192,6 +211,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
             crdt_collection_count: crdt_collections,
             text_index_count: text_count,
             pending_deltas,
+            blocked_deltas,
+            dropped_writes,
         };
 
         // Determine overall status.

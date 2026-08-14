@@ -49,7 +49,11 @@ impl<S: StorageEngine> crate::sync::SyncDelegate for NodeDbLite<S> {
     }
 
     fn pending_deltas(&self) -> Vec<crate::engine::crdt::engine::PendingDelta> {
-        self.pending_crdt_deltas().unwrap_or_default()
+        use crate::nodedb::lock_ext::LockExt;
+        // Not `pending_crdt_deltas`: that is the queue, and this is what may go
+        // out now. A collection stalled behind a refusal Origin has not lifted
+        // is held back rather than re-pushed every tick.
+        self.crdt.lock_or_recover().pushable_pending_deltas()
     }
 
     async fn set_pending_delta_seq(&self, mutation_id: u64, seq: u64) {
@@ -81,6 +85,16 @@ impl<S: StorageEngine> crate::sync::SyncDelegate for NodeDbLite<S> {
         hint: &nodedb_types::sync::compensation::CompensationHint,
     ) {
         super::reject::handle_reject_with_policy_impl(self, mutation_id, hint);
+    }
+
+    fn record_dropped_write(&self) {
+        use crate::nodedb::lock_ext::LockExt;
+        self.crdt.lock_or_recover().record_dropped_write();
+    }
+
+    fn clear_blocked_deltas(&self) {
+        use crate::nodedb::lock_ext::LockExt;
+        self.crdt.lock_or_recover().clear_blocked_deltas();
     }
 
     fn import_remote(&self, collection: &str, data: &[u8]) {
