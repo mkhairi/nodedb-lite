@@ -121,6 +121,7 @@ pub(super) async fn dispatch_frame(
                             "DeltaAck: Origin permanently rejected this delta; \
                              dropping it — the write is LOST and will not retry"
                         );
+                        delegate.record_dropped_write();
                         delegate.acknowledge(ack.mutation_id);
                     }
                 }

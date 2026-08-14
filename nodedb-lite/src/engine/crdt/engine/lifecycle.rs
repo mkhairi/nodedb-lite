@@ -87,6 +87,8 @@ impl CrdtEngine {
             state_epochs: HashMap::new(),
             delta_writes: 0,
             snapshot_exports: AtomicU64::new(0),
+            blocked_deltas: std::collections::HashSet::new(),
+            dropped_writes: 0,
         })
     }
 
