@@ -24,6 +24,7 @@ use crate::storage::engine::StorageEngine;
 
 use super::catalog::LiteCatalog;
 use super::meta_ops::CancellationRegistry;
+use super::visitor::scan_post::RowSink;
 
 /// Lite-side query engine.
 pub struct LiteQueryEngine<S: StorageEngine> {
@@ -177,11 +178,18 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         })
     }
 
-    pub(super) async fn execute_scan(
+    /// Run a physical scan of `collection`, pushing every row it produces into
+    /// `sink`.
+    ///
+    /// The sink owns the WHERE and the row budget, so rows the query rejects are
+    /// never accumulated and a satisfied budget ends the scan. The caller reads
+    /// the result off the sink.
+    pub(super) async fn execute_scan_into(
         &self,
         collection: &str,
         engine: &EngineType,
-    ) -> Result<QueryResult, LiteError> {
+        sink: &mut RowSink,
+    ) -> Result<(), LiteError> {
         match engine {
             EngineType::DocumentSchemaless => {
                 // For bitemporal collections the Loro snapshot may lag storage
@@ -194,21 +202,20 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 .await
                 .unwrap_or(false);
 
+                sink.set_columns(vec!["id".into(), "document".into()]);
+
                 if is_bt {
-                    let live_docs = crate::engine::document::history::ops::scan_live_documents(
-                        &*self.storage,
-                        collection,
-                    )
-                    .await
-                    .map_err(|e| LiteError::Query(e.to_string()))?;
-                    let mut rows = Vec::with_capacity(live_docs.len());
-                    for (id, body) in &live_docs {
+                    // A sink error is the statement's own error (a failing
+                    // predicate), so it is carried out rather than folded into
+                    // the storage error the scan wrapper reports.
+                    let mut sink_err: Option<LiteError> = None;
+                    let mut on_doc = |id: &str, body: Vec<u8>| -> Result<bool, LiteError> {
                         // Decode the msgpack body to a JSON string for the
-                        // document column so post-scan filters can match fields.
+                        // document column so filters can match fields.
                         let doc_str = if body.is_empty() {
                             "{}".to_owned()
                         } else {
-                            match nodedb_types::json_msgpack::value_from_msgpack(body) {
+                            match nodedb_types::json_msgpack::value_from_msgpack(&body) {
                                 Ok(nodedb_types::value::Value::Object(fields)) => {
                                     let json_map: serde_json::Map<String, serde_json::Value> =
                                         fields
@@ -221,30 +228,40 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                                 _ => "{}".to_owned(),
                             }
                         };
-                        rows.push(vec![Value::String(id.clone()), Value::String(doc_str)]);
+                        match sink.push(vec![Value::String(id.to_owned()), Value::String(doc_str)])
+                        {
+                            Ok(more) => Ok(more),
+                            Err(e) => {
+                                sink_err = Some(e);
+                                Ok(false)
+                            }
+                        }
+                    };
+                    crate::engine::document::history::ops::for_each_live_document(
+                        &*self.storage,
+                        collection,
+                        &mut on_doc,
+                    )
+                    .await
+                    .map_err(|e| LiteError::Query(e.to_string()))?;
+                    if let Some(e) = sink_err {
+                        return Err(e);
                     }
-                    return Ok(QueryResult {
-                        columns: vec!["id".into(), "document".into()],
-                        rows,
-                        rows_affected: 0,
-                    });
+                    return Ok(());
                 }
 
                 let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
                 let ids = crdt.list_ids(collection);
-                let mut rows = Vec::with_capacity(ids.len());
                 for id in &ids {
                     if let Some(val) = crdt.read(collection, id) {
                         let json = loro_value_to_json(&val);
                         let doc_str = sonic_rs::to_string(&json).unwrap_or_default();
-                        rows.push(vec![Value::String(id.clone()), Value::String(doc_str)]);
+                        if !sink.push(vec![Value::String(id.clone()), Value::String(doc_str)])? {
+                            break;
+                        }
                     }
                 }
-                Ok(QueryResult {
-                    columns: vec!["id".into(), "document".into()],
-                    rows,
-                    rows_affected: 0,
-                })
+                Ok(())
             }
             EngineType::DocumentStrict => {
                 let schema =
@@ -253,13 +270,13 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                         .ok_or_else(|| LiteError::BadRequest {
                             detail: format!("strict collection '{collection}' does not exist"),
                         })?;
-                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let rows = self.strict.list_rows(collection).await?;
-                Ok(QueryResult {
-                    columns,
-                    rows,
-                    rows_affected: 0,
-                })
+                sink.set_columns(schema.columns.iter().map(|c| c.name.clone()).collect());
+                for row in self.strict.list_rows(collection).await? {
+                    if !sink.push(row)? {
+                        break;
+                    }
+                }
+                Ok(())
             }
             EngineType::Columnar => {
                 let schema =
@@ -268,15 +285,15 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                         .ok_or_else(|| LiteError::BadRequest {
                             detail: format!("columnar collection '{collection}' does not exist"),
                         })?;
-                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let rows = self.columnar.list_rows(collection).await?;
-                Ok(QueryResult {
-                    columns,
-                    rows,
-                    rows_affected: 0,
-                })
+                sink.set_columns(schema.columns.iter().map(|c| c.name.clone()).collect());
+                for row in self.columnar.list_rows(collection).await? {
+                    if !sink.push(row)? {
+                        break;
+                    }
+                }
+                Ok(())
             }
-            _ => Ok(QueryResult::empty()),
+            _ => Ok(()),
         }
     }
 
