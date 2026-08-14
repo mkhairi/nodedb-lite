@@ -232,6 +232,18 @@ impl FlowController {
         self.current_batch_size.min(window_remaining)
     }
 
+    /// Whether this mutation has been pushed and not yet acked, rejected, or
+    /// timed out.
+    ///
+    /// The push loop consults this before selecting a batch: `in_flight` is
+    /// keyed by mutation id, so re-pushing an entry already in it does not grow
+    /// the set and therefore does not consume any of the window. Without this
+    /// check the window can never close and the head of the queue is re-sent on
+    /// every tick.
+    pub fn is_in_flight(&self, mutation_id: u64) -> bool {
+        self.in_flight.contains_key(&mutation_id)
+    }
+
     /// Record that deltas were pushed (track in-flight).
     pub fn record_push(&mut self, mutation_ids: &[u64]) {
         let now = Instant::now();
