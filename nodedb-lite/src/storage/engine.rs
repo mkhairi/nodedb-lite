@@ -18,6 +18,11 @@ use nodedb_types::Namespace;
 /// `StorageEngine` trait's scan interface.
 pub type KvPair = (Vec<u8>, Vec<u8>);
 
+/// Entries read per page by [`StorageEngine::scan_prefix_streaming`]. Bounds the
+/// resident set of a streaming scan; large enough that the per-page tree descent
+/// is amortised.
+pub const SCAN_PAGE: usize = 1024;
+
 /// Summary of what a [`StorageEngine::compact`] call reclaimed.
 ///
 /// Lite-owned (not a pagedb type) so the trait doesn't force pagedb types on
@@ -86,6 +91,51 @@ pub trait StorageEngine: Send + Sync + 'static {
     ///
     /// If `prefix` is empty, returns all entries in the namespace.
     async fn scan_prefix(&self, ns: Namespace, prefix: &[u8]) -> Result<Vec<KvPair>, LiteError>;
+
+    /// Stream every entry with `prefix`, in key order, without ever holding the
+    /// whole range in memory.
+    ///
+    /// `on_entry` is called once per `(key, value)` in ascending key order and
+    /// returns `false` to end the walk early. Peak memory is one page, not the
+    /// matched range, which is the difference between a scan that costs what it
+    /// reads and one that costs what the collection holds.
+    ///
+    /// The default implementation pages with [`scan_range`](Self::scan_range),
+    /// which opens a fresh read snapshot per page. Engines that can hold a
+    /// single snapshot across the whole walk override this so the stream stays
+    /// as consistent as the materialising [`scan_prefix`](Self::scan_prefix) it
+    /// replaces.
+    async fn scan_prefix_streaming(
+        &self,
+        ns: Namespace,
+        prefix: &[u8],
+        on_entry: &mut (dyn FnMut(KvPair) -> Result<bool, LiteError> + Send),
+    ) -> Result<(), LiteError> {
+        let mut cursor = prefix.to_vec();
+        loop {
+            let page = self.scan_range(ns, &cursor, SCAN_PAGE).await?;
+            let exhausted = page.len() < SCAN_PAGE;
+            // The immediate successor of the last key returned: resuming there
+            // never skips a record and never returns one twice.
+            let next_cursor = page.last().map(|(k, _)| {
+                let mut c = k.clone();
+                c.push(0);
+                c
+            });
+            for (key, value) in page {
+                if !key.starts_with(prefix) {
+                    return Ok(());
+                }
+                if !on_entry((key, value))? {
+                    return Ok(());
+                }
+            }
+            match next_cursor {
+                Some(c) if !exhausted => cursor = c,
+                _ => return Ok(()),
+            }
+        }
+    }
 
     /// Atomically apply a batch of writes.
     ///

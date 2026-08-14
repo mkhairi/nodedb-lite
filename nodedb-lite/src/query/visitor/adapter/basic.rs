@@ -15,7 +15,7 @@ use nodedb_sql::types_expr::SqlExpr;
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::physical_visitor::LiteDataPlaneVisitor;
-use crate::query::visitor::scan_post::apply_scan_post_processing;
+use crate::query::visitor::scan_post::{RowSink, apply_scan_post_processing};
 use crate::storage::engine::StorageEngine;
 
 use super::visitor::LiteFut;
@@ -50,10 +50,24 @@ pub(super) fn lower_scan<'a, S: StorageEngine + 'a>(
     let sort_keys = sort_keys.to_vec();
     let window_functions = window_functions.to_vec();
     Ok(Box::pin(async move {
-        let raw = engine.execute_scan(&collection, &engine_type).await?;
+        // The scan may stop as soon as it holds every row the statement can
+        // return — but only when nothing downstream can still change which rows
+        // survive. ORDER BY picks its rows from the whole input, DISTINCT and
+        // window functions likewise, so those keep the scan unbounded.
+        let budget = if sort_keys.is_empty() && !distinct && window_functions.is_empty() {
+            limit.map(|n| n.saturating_add(offset))
+        } else {
+            None
+        };
+        let mut sink = RowSink::new(&filters, budget)?;
+        engine
+            .execute_scan_into(&collection, &engine_type, &mut sink)
+            .await?;
+        // WHERE was applied per row as the scan produced it, so the post
+        // stages see no filters.
         apply_scan_post_processing(
-            raw,
-            &filters,
+            sink.into_result(),
+            &[],
             &sort_keys,
             &window_functions,
             limit,

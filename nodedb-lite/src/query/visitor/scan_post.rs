@@ -97,26 +97,101 @@ pub(crate) fn filter_rows(result: &mut QueryResult, filters: &[Filter]) -> Resul
     let columns = result.columns.clone();
     let mut keep = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
-        let json_doc = row_to_json(&columns, row);
-        let meta_pass = lf
-            .meta
-            .as_ref()
-            .map(|f| matches_metadata_filter(&json_doc, f))
-            .unwrap_or(true);
-        if !meta_pass {
-            keep.push(false);
-            continue;
-        }
-        if lf.exprs.is_empty() {
-            keep.push(true);
-        } else {
-            let typed_doc = row_to_typed_value(&columns, row);
-            keep.push(lf.eval_exprs(&typed_doc)?);
-        }
+        keep.push(row_passes(&lf, &columns, row)?);
     }
     let mut iter = keep.into_iter();
     result.rows.retain(|_| iter.next().unwrap_or(true));
     Ok(())
+}
+
+/// Whether one row satisfies `lf` — the primitive `MetadataFilter` stage first,
+/// then the `QExpr` predicates, which are only worth building a typed row for
+/// once the primitive stage has passed.
+fn row_passes(lf: &LiteFilter, columns: &[String], row: &[Value]) -> Result<bool, LiteError> {
+    if let Some(meta) = lf.meta.as_ref() {
+        let json_doc = row_to_json(columns, row);
+        if !matches_metadata_filter(&json_doc, meta) {
+            return Ok(false);
+        }
+    }
+    if lf.exprs.is_empty() {
+        return Ok(true);
+    }
+    let typed_doc = row_to_typed_value(columns, row);
+    lf.eval_exprs(&typed_doc)
+}
+
+/// Collector a physical scan pushes rows into, applying the WHERE predicate and
+/// the row budget as each row is produced.
+///
+/// The point is what never happens: a row the WHERE rejects is dropped where it
+/// is built rather than accumulated and filtered afterwards, and a scan whose
+/// budget is met stops the walk. Peak allocation for a scan therefore tracks the
+/// rows it returns, not the rows the collection holds.
+pub(crate) struct RowSink {
+    /// Lowered WHERE, or `None` when there is nothing to filter.
+    filter: Option<LiteFilter>,
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    /// Maximum rows to retain, or `None` for unbounded. Only set when no later
+    /// stage can change which rows survive (see [`RowSink::new`] callers).
+    budget: Option<usize>,
+}
+
+impl RowSink {
+    /// A sink applying `filters` and retaining at most `budget` rows.
+    ///
+    /// `budget` must be `None` whenever a post-scan stage can still change which
+    /// rows survive — ORDER BY, DISTINCT, or a window function — because
+    /// stopping the scan early would then drop rows that belong in the answer.
+    pub(crate) fn new(filters: &[Filter], budget: Option<usize>) -> Result<Self, LiteError> {
+        let filter = if filters.is_empty() {
+            None
+        } else {
+            let lf = sql_filters_to_metadata(filters, &[])?;
+            if lf.is_empty() { None } else { Some(lf) }
+        };
+        Ok(Self {
+            filter,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            budget,
+        })
+    }
+
+    /// Name the columns of the rows about to be pushed. Must precede `push`:
+    /// the WHERE is evaluated against named columns.
+    pub(crate) fn set_columns(&mut self, columns: Vec<String>) {
+        self.columns = columns;
+    }
+
+    /// Offer one row. Returns `false` when the sink wants no more rows, which a
+    /// scan should treat as "stop walking".
+    pub(crate) fn push(&mut self, row: Vec<Value>) -> Result<bool, LiteError> {
+        if self.is_full() {
+            return Ok(false);
+        }
+        let keep = match &self.filter {
+            Some(lf) => row_passes(lf, &self.columns, &row)?,
+            None => true,
+        };
+        if keep {
+            self.rows.push(row);
+        }
+        Ok(!self.is_full())
+    }
+
+    fn is_full(&self) -> bool {
+        matches!(self.budget, Some(n) if self.rows.len() >= n)
+    }
+
+    pub(crate) fn into_result(self) -> QueryResult {
+        QueryResult {
+            columns: self.columns,
+            rows: self.rows,
+            rows_affected: 0,
+        }
+    }
 }
 
 /// Deduplicate rows on the *would-be projected* shape, so SQL `DISTINCT`
@@ -415,5 +490,104 @@ fn json_value_to_value(v: &serde_json::Value) -> Value {
             }
             Value::Object(m)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_sql::types::filter::{CompareOp, FilterExpr};
+    use nodedb_sql::types_expr::SqlValue;
+
+    use super::*;
+
+    fn tier_is(value: &str) -> Filter {
+        Filter {
+            expr: FilterExpr::Comparison {
+                field: "tier".to_owned(),
+                op: CompareOp::Eq,
+                value: SqlValue::String(value.to_owned()),
+            },
+        }
+    }
+
+    /// A schemaless document row: an id plus the body as a JSON string, the
+    /// shape the document scan produces.
+    fn doc_row(id: &str, tier: &str) -> Vec<Value> {
+        vec![
+            Value::String(id.to_owned()),
+            Value::String(format!("{{\"tier\":\"{tier}\"}}")),
+        ]
+    }
+
+    fn doc_sink(filters: &[Filter], budget: Option<usize>) -> RowSink {
+        let mut sink = RowSink::new(filters, budget).expect("filters lower");
+        sink.set_columns(vec!["id".to_owned(), "document".to_owned()]);
+        sink
+    }
+
+    /// A row the WHERE rejects is never accumulated: after a thousand rows of
+    /// which one matches, the sink holds exactly that one.
+    #[test]
+    fn rejected_rows_are_never_accumulated() {
+        let filters = vec![tier_is("gold")];
+        let mut sink = doc_sink(&filters, None);
+        for i in 0..1000 {
+            let tier = if i == 617 { "gold" } else { "bronze" };
+            assert!(
+                sink.push(doc_row(&format!("d{i}"), tier)).expect("push"),
+                "an unbounded sink always wants more rows"
+            );
+        }
+        let result = sink.into_result();
+        assert_eq!(result.rows, vec![doc_row("d617", "gold")]);
+    }
+
+    /// A met budget tells the scan to stop, and the rows kept are the first
+    /// ones offered.
+    #[test]
+    fn met_budget_stops_the_scan() {
+        let mut sink = doc_sink(&[], Some(2));
+        assert!(sink.push(doc_row("a", "gold")).expect("push"));
+        assert!(
+            !sink.push(doc_row("b", "gold")).expect("push"),
+            "budget of 2 is met by the second row"
+        );
+        assert!(
+            !sink.push(doc_row("c", "gold")).expect("push"),
+            "a full sink keeps refusing"
+        );
+        let result = sink.into_result();
+        assert_eq!(
+            result.rows,
+            vec![doc_row("a", "gold"), doc_row("b", "gold")]
+        );
+    }
+
+    /// The budget counts rows that passed the WHERE, so `LIMIT` lands after
+    /// filtering rather than truncating the input to it.
+    #[test]
+    fn budget_counts_matching_rows_only() {
+        let filters = vec![tier_is("gold")];
+        let mut sink = doc_sink(&filters, Some(2));
+        assert!(sink.push(doc_row("a", "bronze")).expect("push"));
+        assert!(sink.push(doc_row("b", "gold")).expect("push"));
+        assert!(sink.push(doc_row("c", "bronze")).expect("push"));
+        assert!(
+            !sink.push(doc_row("d", "gold")).expect("push"),
+            "the second match fills the budget"
+        );
+        let result = sink.into_result();
+        assert_eq!(
+            result.rows,
+            vec![doc_row("b", "gold"), doc_row("d", "gold")]
+        );
+    }
+
+    /// A zero budget (`LIMIT 0`) ends the scan before the first row.
+    #[test]
+    fn zero_budget_takes_nothing() {
+        let mut sink = doc_sink(&[], Some(0));
+        assert!(!sink.push(doc_row("a", "gold")).expect("push"));
+        assert!(sink.into_result().rows.is_empty());
     }
 }

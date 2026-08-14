@@ -17,5 +17,7 @@ pub mod write;
 
 pub use backfill::backfill_latest_version;
 pub use flags::{is_bitemporal, set_bitemporal};
-pub use read::{scan_live_documents, versioned_get_as_of, versioned_get_current};
+pub use read::{
+    for_each_live_document, scan_live_documents, versioned_get_as_of, versioned_get_current,
+};
 pub use write::{versioned_put, versioned_tombstone};
