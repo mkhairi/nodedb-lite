@@ -31,6 +31,78 @@ impl CrdtEngine {
         self.pending_deltas.len()
     }
 
+    /// Number of queued deltas Origin has refused for a reason re-sending them
+    /// cannot fix on its own.
+    ///
+    /// A subset of [`Self::pending_count`]: a blocked entry is still queued and
+    /// still holds its row. Non-zero means replication is stalled on something
+    /// outside this replica — most often a grant the Origin has not been given.
+    pub fn blocked_delta_count(&self) -> usize {
+        self.blocked_deltas.len()
+    }
+
+    /// Writes retired without applying — see [`CrdtEngine::dropped_writes`].
+    pub fn dropped_write_count(&self) -> u64 {
+        self.dropped_writes
+    }
+
+    /// Record that a write was retired without ever applying.
+    ///
+    /// Called from the ack paths that retire an entry on a terminal refusal,
+    /// which is the only way a queued write leaves without landing.
+    pub fn record_dropped_write(&mut self) {
+        self.dropped_writes = self.dropped_writes.saturating_add(1);
+    }
+
+    /// Mark a queued delta as refused by Origin for a reason that is not about
+    /// the row it carries.
+    ///
+    /// The entry stays queued and its row stays in local state: the refusal
+    /// says nothing is wrong with the write, only that Origin will not take it
+    /// as this session stands. Marking it is what keeps a stalled queue
+    /// distinguishable from a draining one.
+    pub fn mark_delta_blocked(&mut self, mutation_id: u64) {
+        if self.pending_delta_is_live(mutation_id) {
+            self.blocked_deltas.insert(mutation_id);
+        }
+    }
+
+    /// The resident window with every blocked collection held back — what the
+    /// push loop may send right now.
+    ///
+    /// A blocked entry is not skipped: Origin sequences each collection's
+    /// stream, so sending the entries behind a refused one opens a gap it
+    /// refuses in turn, and Loro deltas are causally chained, so those entries
+    /// depend on the refused one in any case. The collection stalls at the
+    /// refusal — which is what a refusal that is not about the row means — and
+    /// the rest keep flowing. Without this the refused entry is re-pushed on
+    /// every 100 ms tick for as long as the condition lasts.
+    pub fn pushable_pending_deltas(&self) -> Vec<PendingDelta> {
+        if self.blocked_deltas.is_empty() {
+            return self.pending_deltas.clone();
+        }
+        let stalled: std::collections::HashSet<&str> = self
+            .pending_deltas
+            .iter()
+            .filter(|d| self.blocked_deltas.contains(&d.mutation_id))
+            .map(|d| d.collection.as_str())
+            .collect();
+        self.pending_deltas
+            .iter()
+            .filter(|d| !stalled.contains(d.collection.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Forget every blocked mark, so a fresh session re-attempts them.
+    ///
+    /// Called when a handshake completes: a grant added at the Origin between
+    /// sessions is exactly what unblocks these, and nothing else tells the
+    /// replica it happened.
+    pub fn clear_blocked_deltas(&mut self) {
+        self.blocked_deltas.clear();
+    }
+
     /// Number of unsent deltas held only under their `delta:` keys.
     pub fn spilled_pending_count(&self) -> usize {
         self.spill.len()
@@ -92,6 +164,7 @@ impl CrdtEngine {
         self.pending_deltas.clear();
         self.unpersisted_deltas.clear();
         self.spill.clear();
+        self.blocked_deltas.clear();
     }
 
     // ─── Sync: Resident Window ───────────────────────────────────────
@@ -247,6 +320,7 @@ impl CrdtEngine {
         self.pending_deltas.retain(|d| d.mutation_id != mutation_id);
         self.unpersisted_deltas.remove(&mutation_id);
         self.spill.remove(mutation_id);
+        self.blocked_deltas.remove(&mutation_id);
     }
 
     /// Assign a stable stream seq to a pending delta the first time it is sent.
@@ -290,6 +364,7 @@ impl CrdtEngine {
         self.pending_deltas.retain(|d| d.mutation_id != acked_id);
         self.unpersisted_deltas.remove(&acked_id);
         self.spill.remove(acked_id);
+        self.blocked_deltas.remove(&acked_id);
     }
 
     /// Roll back a specific pending delta (after DeltaReject with CompensationHint).
@@ -312,6 +387,10 @@ impl CrdtEngine {
         {
             let delta = self.pending_deltas.remove(pos);
             self.unpersisted_deltas.remove(&mutation_id);
+            self.blocked_deltas.remove(&mutation_id);
+            // The row is deleted below and the delta leaves the queue: this
+            // write applied nowhere, and nothing else records that.
+            self.dropped_writes = self.dropped_writes.saturating_add(1);
             // Best-effort rollback: delete the affected document from its own
             // collection's document. The application should handle the
             // CompensationHint and re-create with corrected values.
