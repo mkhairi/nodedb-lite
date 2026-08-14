@@ -15,7 +15,7 @@ use crate::index::IndexEngine;
 use crate::query::document_ops::index_reads::index_range_fetch;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::visitor::index_range::index_range;
-use crate::query::visitor::scan_post::{ScanPostArgs, apply_scan_post_processing};
+use crate::query::visitor::scan_post::{RowSink, ScanPostArgs, apply_scan_post_processing};
 use crate::storage::engine::StorageEngine;
 
 use super::visitor::LiteFut;
@@ -54,22 +54,45 @@ pub(super) fn lower_scan<'a, S: StorageEngine + 'a>(
     let range =
         index_engine.and_then(|kind| index_range(&engine.indexes, &collection, kind, &filters));
     Ok(Box::pin(async move {
+        // The scan may stop as soon as it holds every row the statement can
+        // return — but only when nothing downstream can still change which rows
+        // survive. ORDER BY picks its rows from the whole input, DISTINCT and
+        // window functions likewise, so those keep the scan unbounded.
+        let budget = if sort_keys.is_empty() && !distinct && window_functions.is_empty() {
+            limit.map(|n| n.saturating_add(offset))
+        } else {
+            None
+        };
+        let mut sink = RowSink::new(&filters, budget)?;
         // A bounded indexed field lets the index list the candidate rows;
-        // every filter below still applies to them.
+        // the sink still applies every filter to them.
         let indexed = match &range {
             Some(r) => {
                 index_range_fetch(engine, &r.def, r.lower.as_ref(), r.upper.as_ref()).await?
             }
             None => None,
         };
-        let raw = match indexed {
-            Some(raw) => raw,
-            None => engine.execute_scan(&collection, &engine_type).await?,
-        };
+        match indexed {
+            Some(raw) => {
+                sink.set_columns(raw.columns);
+                for row in raw.rows {
+                    if !sink.push(row)? {
+                        break;
+                    }
+                }
+            }
+            None => {
+                engine
+                    .execute_scan_into(&collection, &engine_type, &mut sink)
+                    .await?
+            }
+        }
+        // WHERE was applied per row as the scan produced it, so the post
+        // stages see no filters.
         apply_scan_post_processing(
-            raw,
+            sink.into_result(),
             ScanPostArgs {
-                filters: &filters,
+                filters: &[],
                 sort_keys: &sort_keys,
                 window_specs: &window_functions,
                 projection: &projection,
