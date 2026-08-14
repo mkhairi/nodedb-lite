@@ -15,15 +15,36 @@ use nodedb_types::value::Value;
 use super::document_rows;
 use super::engine::{LiteQueryEngine, sql_value_to_string, sql_value_to_value};
 use super::kv_ops::sql_read::{kv_key_bytes, kv_select_all, kv_select_key};
+use super::visitor::scan_post::RowSink;
 use crate::error::LiteError;
 use crate::storage::engine::StorageEngine;
 
 impl<S: StorageEngine> LiteQueryEngine<S> {
+    /// Run a physical scan of `collection` into a result, with no WHERE and
+    /// no row budget.
     pub(in crate::query) async fn execute_scan(
         &self,
         collection: &str,
         engine: &EngineType,
     ) -> Result<QueryResult, LiteError> {
+        let mut sink = RowSink::new(&[], None)?;
+        self.execute_scan_into(collection, engine, &mut sink)
+            .await?;
+        Ok(sink.into_result())
+    }
+
+    /// Run a physical scan of `collection`, pushing every row it produces into
+    /// `sink`.
+    ///
+    /// The sink owns the WHERE and the row budget, so rows the query rejects are
+    /// never accumulated and a satisfied budget ends the scan. The caller reads
+    /// the result off the sink.
+    pub(in crate::query) async fn execute_scan_into(
+        &self,
+        collection: &str,
+        engine: &EngineType,
+        sink: &mut RowSink,
+    ) -> Result<(), LiteError> {
         match engine {
             EngineType::DocumentSchemaless => {
                 // For bitemporal collections the Loro snapshot may lag storage
@@ -36,54 +57,57 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 .await
                 .unwrap_or(false);
 
+                sink.set_columns(document_rows::columns());
+
                 if is_bt {
-                    let live_docs = crate::engine::document::history::ops::scan_live_documents(
+                    // A sink error is the statement's own error (a failing
+                    // predicate), so it is carried out rather than folded into
+                    // the storage error the scan wrapper reports.
+                    let mut sink_err: Option<LiteError> = None;
+                    let mut on_doc = |id: &str, body: Vec<u8>| -> Result<bool, LiteError> {
+                        match sink.push(document_rows::body_row(id, &body)) {
+                            Ok(more) => Ok(more),
+                            Err(e) => {
+                                sink_err = Some(e);
+                                Ok(false)
+                            }
+                        }
+                    };
+                    crate::engine::document::history::ops::for_each_live_document(
                         &*self.storage,
                         collection,
+                        &mut on_doc,
                     )
                     .await
                     .map_err(|e| LiteError::Query(e.to_string()))?;
-                    let rows = live_docs
-                        .iter()
-                        .map(|(id, body)| document_rows::body_row(id, body))
-                        .collect();
-                    return Ok(QueryResult {
-                        columns: document_rows::columns(),
-                        rows,
-                        rows_affected: 0,
-                        command: None,
-                    });
+                    if let Some(e) = sink_err {
+                        return Err(e);
+                    }
+                    return Ok(());
                 }
 
                 let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-                let ids = crdt.list_ids(collection);
-                let rows = ids
-                    .iter()
-                    .filter_map(|id| {
-                        let val = crdt.read(collection, id)?;
-                        Some(document_rows::crdt_row(id, &val))
-                    })
-                    .collect();
-                Ok(QueryResult {
-                    columns: document_rows::columns(),
-                    rows,
-                    rows_affected: 0,
-                    command: None,
-                })
+                for id in &crdt.list_ids(collection) {
+                    if let Some(val) = crdt.read(collection, id)
+                        && !sink.push(document_rows::crdt_row(id, &val))?
+                    {
+                        break;
+                    }
+                }
+                Ok(())
             }
             EngineType::DocumentStrict => {
                 let schema = self
                     .strict
                     .schema(collection)
                     .ok_or_else(|| LiteError::collection_not_found("strict", collection))?;
-                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let rows = self.strict.list_rows(collection).await?;
-                Ok(QueryResult {
-                    columns,
-                    rows,
-                    rows_affected: 0,
-                    command: None,
-                })
+                sink.set_columns(schema.columns.iter().map(|c| c.name.clone()).collect());
+                for row in self.strict.list_rows(collection).await? {
+                    if !sink.push(row)? {
+                        break;
+                    }
+                }
+                Ok(())
             }
             // Every columnar-family profile keeps its rows in the columnar
             // engine, which applies the timeseries or spatial profile itself.
@@ -92,16 +116,24 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                     .columnar
                     .schema(collection)
                     .ok_or_else(|| LiteError::collection_not_found("columnar", collection))?;
-                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let rows = self.columnar.list_rows(collection).await?;
-                Ok(QueryResult {
-                    columns,
-                    rows,
-                    rows_affected: 0,
-                    command: None,
-                })
+                sink.set_columns(schema.columns.iter().map(|c| c.name.clone()).collect());
+                for row in self.columnar.list_rows(collection).await? {
+                    if !sink.push(row)? {
+                        break;
+                    }
+                }
+                Ok(())
             }
-            EngineType::KeyValue => kv_select_all(self, collection).await,
+            EngineType::KeyValue => {
+                let all = kv_select_all(self, collection).await?;
+                sink.set_columns(all.columns);
+                for row in all.rows {
+                    if !sink.push(row)? {
+                        break;
+                    }
+                }
+                Ok(())
+            }
             EngineType::Array => Err(array_refusal("scan")),
         }
     }
