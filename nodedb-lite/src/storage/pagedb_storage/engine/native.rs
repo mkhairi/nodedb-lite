@@ -9,7 +9,7 @@ use pagedb::vfs::Vfs;
 use nodedb_types::Namespace;
 
 use crate::error::LiteError;
-use crate::storage::engine::{CompactionOutcome, KvPair, StorageEngine, WriteOp};
+use crate::storage::engine::{CompactionOutcome, KvPair, SCAN_PAGE, StorageEngine, WriteOp};
 use crate::storage::pagedb_storage::keys::{KeyBuf, ns_end, prefix_key, strip_prefix};
 use crate::storage::pagedb_storage::types::PagedbStorage;
 
@@ -52,6 +52,41 @@ where
             .into_iter()
             .map(|(k, v)| (strip_prefix(&k).to_vec(), v.to_vec()))
             .collect())
+    }
+
+    async fn scan_prefix_streaming(
+        &self,
+        ns: Namespace,
+        prefix: &[u8],
+        on_entry: &mut (dyn FnMut(KvPair) -> Result<bool, LiteError> + Send),
+    ) -> Result<(), LiteError> {
+        let full_prefix = prefix_key(ns, prefix);
+        // One read snapshot for the whole walk, so streaming the range in pages
+        // is exactly as consistent as the single materialising `scan_prefix`
+        // this replaces.
+        let txn = self.db.begin_read().await.map_err(LiteError::from)?;
+        let mut cursor = full_prefix.clone();
+        loop {
+            let page = txn
+                .scan_prefix_from(&full_prefix, &cursor, SCAN_PAGE)
+                .await
+                .map_err(LiteError::from)?;
+            let exhausted = page.len() < SCAN_PAGE;
+            let next_cursor = page.last().map(|(k, _)| {
+                let mut c = k.to_vec();
+                c.push(0);
+                c
+            });
+            for (k, v) in page {
+                if !on_entry((strip_prefix(&k).to_vec(), v.to_vec()))? {
+                    return Ok(());
+                }
+            }
+            match next_cursor {
+                Some(c) if !exhausted => cursor = c,
+                _ => return Ok(()),
+            }
+        }
     }
 
     async fn batch_write(&self, ops: &[WriteOp]) -> Result<(), LiteError> {
