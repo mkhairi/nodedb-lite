@@ -120,7 +120,10 @@ mod tests {
         clear_error();
         record_error("bad\0nul");
         let ptr = unsafe { nodedb_last_error(std::ptr::null_mut()) };
-        assert!(!ptr.is_null(), "NUL-containing message must still be recorded");
+        assert!(
+            !ptr.is_null(),
+            "NUL-containing message must still be recorded"
+        );
         let got = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
         assert_eq!(got, "bad?nul");
         unsafe { drop(CString::from_raw(ptr)) };
