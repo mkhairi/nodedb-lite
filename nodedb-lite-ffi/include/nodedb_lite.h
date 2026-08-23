@@ -215,6 +215,10 @@ int32_t nodedb_execute_sql(struct NodeDbNodeDbHandle *handle, const char *sql, c
 /**
  * Insert a directed graph edge into `collection`.
  *
+ * On success, the created edge id is written to `*out_edge_id` (caller frees
+ * with `nodedb_free_string`). Passing NULL for `out_edge_id` keeps the old
+ * fire-and-forget behaviour and still returns `NODEDB_OK`.
+ *
  * # Safety
  * All pointer parameters must be valid null-terminated UTF-8.
  */
@@ -222,7 +226,8 @@ int32_t nodedb_graph_insert_edge(struct NodeDbNodeDbHandle *handle,
                                  const char *collection,
                                  const char *from,
                                  const char *to,
-                                 const char *edge_type);
+                                 const char *edge_type,
+                                 char **out_edge_id);
 
 /**
  * Delete a graph edge by ID from `collection`.

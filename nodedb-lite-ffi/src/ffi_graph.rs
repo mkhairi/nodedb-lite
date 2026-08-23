@@ -12,6 +12,10 @@ use crate::{
 
 /// Insert a directed graph edge into `collection`.
 ///
+/// On success, the created edge id is written to `*out_edge_id` (caller frees
+/// with `nodedb_free_string`). Passing NULL for `out_edge_id` keeps the old
+/// fire-and-forget behaviour and still returns `NODEDB_OK`.
+///
 /// # Safety
 /// All pointer parameters must be valid null-terminated UTF-8.
 #[unsafe(no_mangle)]
@@ -21,6 +25,7 @@ pub unsafe extern "C" fn nodedb_graph_insert_edge(
     from: *const c_char,
     to: *const c_char,
     edge_type: *const c_char,
+    out_edge_id: *mut *mut c_char,
 ) -> i32 {
     ffi_guard(NODEDB_ERR_FAILED, || {
         let Some(h) = handle_ref(handle) else {
@@ -52,7 +57,17 @@ pub unsafe extern "C" fn nodedb_graph_insert_edge(
             .rt
             .block_on(h.db.graph_insert_edge(collection, &from_id, &to_id, edge_type, None))
         {
-            Ok(_) => NODEDB_OK,
+            Ok(edge_id) => {
+                if out_edge_id.is_null() {
+                    // Backward-compatible: existing callers pass NULL and
+                    // ignore the id, as before this fix.
+                    NODEDB_OK
+                } else {
+                    // The id string round-trips through nodedb_graph_delete_edge
+                    // (EdgeId::from_str accepts the Display form).
+                    unsafe { write_c_string(out_edge_id, edge_id.to_string()) }
+                }
+            }
             Err(_) => NODEDB_ERR_FAILED,
         }
     })

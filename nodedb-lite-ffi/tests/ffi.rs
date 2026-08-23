@@ -72,6 +72,7 @@ fn graph_insert_and_traverse() {
             from.as_ptr(),
             to.as_ptr(),
             label.as_ptr(),
+            std::ptr::null_mut(),
         );
         assert_eq!(rc, NODEDB_OK);
 
@@ -85,6 +86,45 @@ fn graph_insert_and_traverse() {
         assert!(json.contains("bob"));
         nodedb_free_string(out);
 
+        nodedb_close(handle);
+    }
+}
+
+/// REPLICATE #14: `nodedb_graph_insert_edge` must return the created edge id
+/// so the caller can pass it to `nodedb_graph_delete_edge`. Today the id is
+/// discarded (`Ok(_) => NODEDB_OK`), making insert-then-delete impossible.
+#[test]
+fn graph_insert_edge_returns_id_for_delete() {
+    let path = CString::new(":memory:").unwrap();
+    unsafe {
+        let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+        assert!(!handle.is_null());
+
+        let collection = CString::new("social").unwrap();
+        let from = CString::new("alice").unwrap();
+        let to = CString::new("bob").unwrap();
+        let label = CString::new("KNOWS").unwrap();
+
+        let mut edge_id: *mut c_char = std::ptr::null_mut();
+        let rc = nodedb_graph_insert_edge(
+            handle,
+            collection.as_ptr(),
+            from.as_ptr(),
+            to.as_ptr(),
+            label.as_ptr(),
+            &mut edge_id,
+        );
+        assert_eq!(rc, NODEDB_OK);
+        assert!(!edge_id.is_null(), "edge id must be returned");
+
+        let edge_id_str = CStr::from_ptr(edge_id).to_str().unwrap();
+        assert!(!edge_id_str.is_empty());
+
+        // The returned id must be accepted by nodedb_graph_delete_edge.
+        let rc = nodedb_graph_delete_edge(handle, collection.as_ptr(), edge_id);
+        assert_eq!(rc, NODEDB_OK);
+
+        nodedb_free_string(edge_id);
         nodedb_close(handle);
     }
 }
