@@ -489,7 +489,8 @@ int32_t nodedb_compact(struct NodeDbNodeDbHandle *handle,
  * and continuously pushes pending deltas / receives shape updates.
  * Runs forever in the background with auto-reconnect.
  *
- * Returns `NODEDB_OK` on successful launch (sync runs asynchronously).
+ * Returns `NODEDB_OK` on successful launch (sync runs asynchronously),
+ * `NODEDB_ERR_FAILED` if a sync task is already running on this handle.
  *
  * The background task is owned by the handle: `nodedb_close` stops it
  * deterministically before tearing down the runtime, and `nodedb_stop_sync`

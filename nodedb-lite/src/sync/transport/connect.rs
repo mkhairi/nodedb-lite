@@ -156,11 +156,37 @@ pub(super) async fn connect_and_run(
         ping_loop(&ping_client, &ping_sink).await;
     });
 
+    // Own the child handles in a drop guard: cancellation of this future
+    // (abort from the FFI stop/close path) drops it and aborts both children.
+    let children = AbortChildrenOnDrop {
+        handles: vec![push_handle, ping_handle],
+    };
+
     let recv_result = receive_loop(client, delegate, &mut stream).await;
 
-    push_handle.abort();
-    ping_handle.abort();
+    // Normal path: abort children before returning. The guard would do it
+    // anyway on drop; this makes shutdown explicit and ordered.
+    drop(children);
 
     client.set_state(SyncState::Disconnected).await;
     recv_result
+}
+
+/// Aborts every child task when dropped — including when the parent future is
+/// cancelled mid-await, which skips the normal cleanup path above.
+///
+/// Without this, an aborted `connect_and_run` detaches `delta_push_loop` and
+/// `ping_loop` (their `JoinHandle`s drop), and the children keep polling the
+/// sink and database after the caller considers the sync task quiescent —
+/// exactly the runtime-teardown race #11 guarded against at the FFI boundary.
+struct AbortChildrenOnDrop {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for AbortChildrenOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
 }

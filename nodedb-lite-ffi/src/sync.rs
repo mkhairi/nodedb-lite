@@ -17,7 +17,8 @@ use crate::util::{ffi_guard, handle_ref, ptr_to_str};
 /// and continuously pushes pending deltas / receives shape updates.
 /// Runs forever in the background with auto-reconnect.
 ///
-/// Returns `NODEDB_OK` on successful launch (sync runs asynchronously).
+/// Returns `NODEDB_OK` on successful launch (sync runs asynchronously),
+/// `NODEDB_ERR_FAILED` if a sync task is already running on this handle.
 ///
 /// The background task is owned by the handle: `nodedb_close` stops it
 /// deterministically before tearing down the runtime, and `nodedb_stop_sync`
@@ -54,6 +55,14 @@ pub unsafe extern "C" fn nodedb_start_sync(
             token_lifetime_secs: 0,
         };
 
+        // Guard the slot: a second start must not silently detach the running
+        // loop (dropping its JoinHandle would orphan it and make it
+        // unstoppable). Reject instead.
+        let mut slot = h.sync_task.lock().unwrap();
+        if slot.is_some() {
+            return NODEDB_ERR_FAILED;
+        }
+
         // Spawn the sync loop ourselves (rather than via `start_sync`) so the
         // JoinHandle is retained in the handle — `nodedb_close` needs it to
         // stop the task deterministically before the runtime is dropped (#11).
@@ -63,7 +72,7 @@ pub unsafe extern "C" fn nodedb_start_sync(
         let task = h.rt.spawn(async move {
             nodedb_lite::sync::run_sync_loop(client_task, delegate).await;
         });
-        *h.sync_task.lock().unwrap() = Some(task);
+        *slot = Some(task);
 
         NODEDB_OK
     })
@@ -92,7 +101,7 @@ pub unsafe extern "C" fn nodedb_stop_sync(handle: *mut NodeDbHandle) -> i32 {
         task.abort();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut task = task;
-        let _ = h.rt.block_on(async move {
+        h.rt.block_on(async move {
             tokio::select! {
                 _ = &mut task => {}
                 _ = tokio::time::sleep_until(deadline) => {}

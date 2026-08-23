@@ -74,7 +74,7 @@ impl Drop for NodeDbHandle {
             // makes cancellation immediate instead of racing teardown.
             let deadline = tokio::time::Instant::now() + SYNC_STOP_TIMEOUT;
             let mut task = task;
-            let _ = self.rt.block_on(async move {
+            self.rt.block_on(async move {
                 tokio::select! {
                     _ = &mut task => {}
                     _ = tokio::time::sleep_until(deadline) => {}
