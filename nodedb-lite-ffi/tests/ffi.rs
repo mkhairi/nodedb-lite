@@ -259,8 +259,6 @@ fn version_export_exists() {
 /// on breaking FFI changes instead of dying on a missing symbol.
 #[test]
 fn abi_version_export_exists() {
-    unsafe {
-        let abi = nodedb_abi_version();
-        assert!(abi > 0, "nodedb_abi_version must be a positive integer");
-    }
+    let abi = nodedb_abi_version();
+    assert!(abi > 0, "nodedb_abi_version must be a positive integer");
 }
