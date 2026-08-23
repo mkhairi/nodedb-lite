@@ -71,7 +71,7 @@ where
 /// # Safety
 /// All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ndb_array_create(
+pub unsafe extern "C" fn nodedb_array_create(
     handle: *mut NodeDbHandle,
     name: *const c_char,
     schema_msgpack: *const u8,
@@ -112,7 +112,7 @@ pub unsafe extern "C" fn ndb_array_create(
 /// # Safety
 /// All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ndb_array_put_cell(
+pub unsafe extern "C" fn nodedb_array_put_cell(
     handle: *mut NodeDbHandle,
     name: *const c_char,
     coord_msgpack: *const u8,
@@ -179,7 +179,7 @@ pub unsafe extern "C" fn ndb_array_put_cell(
 /// All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
 /// `out_buf` and `out_len` must not be null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ndb_array_slice(
+pub unsafe extern "C" fn nodedb_array_slice(
     handle: *mut NodeDbHandle,
     name: *const c_char,
     ranges_msgpack: *const u8,
@@ -246,7 +246,7 @@ pub unsafe extern "C" fn ndb_array_slice(
 /// All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
 /// `out_buf` and `out_len` must not be null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ndb_array_read_coord(
+pub unsafe extern "C" fn nodedb_array_read_coord(
     handle: *mut NodeDbHandle,
     name: *const c_char,
     coord_msgpack: *const u8,
@@ -316,7 +316,7 @@ pub unsafe extern "C" fn ndb_array_read_coord(
 /// # Safety
 /// All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ndb_array_delete_cell(
+pub unsafe extern "C" fn nodedb_array_delete_cell(
     handle: *mut NodeDbHandle,
     name: *const c_char,
     coord_msgpack: *const u8,
@@ -359,13 +359,13 @@ pub unsafe extern "C" fn ndb_array_delete_cell(
 ///
 /// `coord_msgpack` — zerompk-encoded `Vec<CoordValue>`.
 ///
-/// After this call `ndb_array_read_coord` returns empty for the coordinate
+/// After this call `nodedb_array_read_coord` returns empty for the coordinate
 /// at any system time >= the erasure system timestamp.
 ///
 /// # Safety
 /// All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ndb_array_gdpr_erase_cell(
+pub unsafe extern "C" fn nodedb_array_gdpr_erase_cell(
     handle: *mut NodeDbHandle,
     name: *const c_char,
     coord_msgpack: *const u8,

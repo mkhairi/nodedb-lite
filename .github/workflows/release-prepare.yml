@@ -113,6 +113,9 @@ jobs:
           cp target/${TARGET}/release/libnodedb_lite_ffi.so "dist/${PKG}/lib/"
           cp target/${TARGET}/release/libnodedb_lite_ffi.a  "dist/${PKG}/lib/"
           cp nodedb-lite-ffi/include/nodedb_lite.h "dist/${PKG}/include/"
+          # Adapter authors diff this between releases to see what moved.
+          mkdir -p "dist/${PKG}/abi"
+          cp nodedb-lite-ffi/abi/surface.txt "dist/${PKG}/abi/"
           cp -r nodedb-lite-ffi/kotlin "dist/${PKG}/kotlin"
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
           ls -lh "dist/${PKG}.tar.gz"
@@ -182,6 +185,9 @@ jobs:
           mkdir -p "dist/${PKG}/include"
           cp -r jniLibs "dist/${PKG}/jniLibs"
           cp nodedb-lite-ffi/include/nodedb_lite.h "dist/${PKG}/include/"
+          # Adapter authors diff this between releases to see what moved.
+          mkdir -p "dist/${PKG}/abi"
+          cp nodedb-lite-ffi/abi/surface.txt "dist/${PKG}/abi/"
           cp -r nodedb-lite-ffi/kotlin "dist/${PKG}/kotlin"
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
           ls -lh "dist/${PKG}.tar.gz"
@@ -238,6 +244,9 @@ jobs:
           mkdir -p "dist/${PKG}"
           cp -r NodeDbLite.xcframework "dist/${PKG}/NodeDbLite.xcframework"
           cp -r nodedb-lite-ffi/kotlin "dist/${PKG}/kotlin"
+          # Adapter authors diff this between releases to see what moved.
+          mkdir -p "dist/${PKG}/abi"
+          cp nodedb-lite-ffi/abi/surface.txt "dist/${PKG}/abi/"
           (cd dist && zip -ry "${PKG}.zip" "${PKG}")
           ls -lh "dist/${PKG}.zip"
 

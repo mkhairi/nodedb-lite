@@ -71,6 +71,33 @@ jobs:
         run: cargo clippy --workspace --all-targets --profile ci -- -D warnings
       - name: Check wasm32 target
         run: cargo check -p nodedb-lite-wasm --target wasm32-unknown-unknown
+      # build.rs regenerates the C header on every build. Nothing else notices
+      # when the committed copy no longer matches what cbindgen produces, so
+      # the repo can ship a header that declares a surface the library does
+      # not have.
+      - name: Check the committed C header is current
+        run: |
+          cargo build -p nodedb-lite-ffi --profile ci
+          git diff --exit-code -- nodedb-lite-ffi/include/nodedb_lite.h
+      # abi/surface.txt is read from the header and from source. This proves
+      # those declarations correspond to symbols the built library actually
+      # exports — a source-only check is blind wherever the two disagree.
+      - name: Check exported symbols match the recorded surface
+        run: |
+          set -euo pipefail
+          SO=$(find target -name 'libnodedb_lite_ffi.so' -print -quit)
+          test -n "$SO" || { echo "::error::cdylib not found"; exit 1; }
+          nm -D --defined-only "$SO" \
+            | awk '$2 == "T" { print $3 }' | sort -u > /tmp/exported.txt
+          grep -oE '\b(nodedb_[a-z0-9_]+|Java_[A-Za-z0-9_]+)\(' \
+            nodedb-lite-ffi/abi/surface.txt \
+            | tr -d '(' | sort -u > /tmp/recorded.txt
+          if ! diff -u /tmp/recorded.txt /tmp/exported.txt; then
+            echo "::error::Exported symbols differ from abi/surface.txt."
+            echo "Re-record with: UPDATE_ABI_SNAPSHOT=1 cargo nextest run \
+              -p nodedb-lite-ffi -E 'binary(abi_surface)'"
+            exit 1
+          fi
       - name: Install cargo-deny
         uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
         with:

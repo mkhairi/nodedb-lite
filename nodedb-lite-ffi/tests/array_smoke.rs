@@ -13,9 +13,9 @@ use nodedb_array::types::cell_value::value::CellValue;
 use nodedb_array::types::coord::value::CoordValue;
 use nodedb_array::types::domain::{Domain, DomainBound};
 use nodedb_lite_ffi::{
-    NODEDB_OK, ndb_array_create, ndb_array_delete_cell, ndb_array_gdpr_erase_cell,
-    ndb_array_put_cell, ndb_array_read_coord, ndb_array_slice, nodedb_close, nodedb_free_buf,
-    nodedb_open,
+    NODEDB_OK, nodedb_array_create, nodedb_array_delete_cell, nodedb_array_gdpr_erase_cell,
+    nodedb_array_put_cell, nodedb_array_read_coord, nodedb_array_slice, nodedb_close,
+    nodedb_free_buf, nodedb_open,
 };
 use nodedb_types::OPEN_UPPER;
 
@@ -48,7 +48,7 @@ fn array_create_put_slice_roundtrip() {
         let schema_bytes = encode(&schema);
 
         // Create.
-        let rc = ndb_array_create(
+        let rc = nodedb_array_create(
             handle,
             name.as_ptr(),
             schema_bytes.as_ptr(),
@@ -59,7 +59,7 @@ fn array_create_put_slice_roundtrip() {
         // Put two cells.
         let coord1 = encode(&vec![CoordValue::Int64(1)]);
         let attrs1 = encode(&vec![CellValue::Int64(100)]);
-        let rc = ndb_array_put_cell(
+        let rc = nodedb_array_put_cell(
             handle,
             name.as_ptr(),
             coord1.as_ptr(),
@@ -73,7 +73,7 @@ fn array_create_put_slice_roundtrip() {
 
         let coord5 = encode(&vec![CoordValue::Int64(5)]);
         let attrs5 = encode(&vec![CellValue::Int64(200)]);
-        let rc = ndb_array_put_cell(
+        let rc = nodedb_array_put_cell(
             handle,
             name.as_ptr(),
             coord5.as_ptr(),
@@ -89,7 +89,7 @@ fn array_create_put_slice_roundtrip() {
         let ranges = encode(&vec![Option::<DimRange>::None]);
         let mut out_buf: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = ndb_array_slice(
+        let rc = nodedb_array_slice(
             handle,
             name.as_ptr(),
             ranges.as_ptr(),
@@ -123,7 +123,7 @@ fn array_read_coord_returns_cell() {
 
         let name = CString::new("rc").unwrap();
         let schema_bytes = encode(&make_schema());
-        ndb_array_create(
+        nodedb_array_create(
             handle,
             name.as_ptr(),
             schema_bytes.as_ptr(),
@@ -132,7 +132,7 @@ fn array_read_coord_returns_cell() {
 
         let coord = encode(&vec![CoordValue::Int64(7)]);
         let attrs = encode(&vec![CellValue::Int64(77)]);
-        ndb_array_put_cell(
+        nodedb_array_put_cell(
             handle,
             name.as_ptr(),
             coord.as_ptr(),
@@ -145,7 +145,7 @@ fn array_read_coord_returns_cell() {
 
         let mut out_buf: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = ndb_array_read_coord(
+        let rc = nodedb_array_read_coord(
             handle,
             name.as_ptr(),
             coord.as_ptr(),
@@ -178,7 +178,7 @@ fn array_delete_cell_tombstones_coord() {
 
         let name = CString::new("del").unwrap();
         let schema_bytes = encode(&make_schema());
-        ndb_array_create(
+        nodedb_array_create(
             handle,
             name.as_ptr(),
             schema_bytes.as_ptr(),
@@ -187,7 +187,7 @@ fn array_delete_cell_tombstones_coord() {
 
         let coord = encode(&vec![CoordValue::Int64(3)]);
         let attrs = encode(&vec![CellValue::Int64(33)]);
-        ndb_array_put_cell(
+        nodedb_array_put_cell(
             handle,
             name.as_ptr(),
             coord.as_ptr(),
@@ -198,13 +198,13 @@ fn array_delete_cell_tombstones_coord() {
             OPEN_UPPER,
         );
 
-        let rc = ndb_array_delete_cell(handle, name.as_ptr(), coord.as_ptr(), coord.len());
+        let rc = nodedb_array_delete_cell(handle, name.as_ptr(), coord.as_ptr(), coord.len());
         assert_eq!(rc, NODEDB_OK, "delete_cell");
 
         // After deletion, read_coord should return OK with null/zero out (not found).
         let mut out_buf: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = ndb_array_read_coord(
+        let rc = nodedb_array_read_coord(
             handle,
             name.as_ptr(),
             coord.as_ptr(),
@@ -233,7 +233,7 @@ fn array_gdpr_erase_cell_removes_content() {
 
         let name = CString::new("gdpr").unwrap();
         let schema_bytes = encode(&make_schema());
-        ndb_array_create(
+        nodedb_array_create(
             handle,
             name.as_ptr(),
             schema_bytes.as_ptr(),
@@ -242,7 +242,7 @@ fn array_gdpr_erase_cell_removes_content() {
 
         let coord = encode(&vec![CoordValue::Int64(9)]);
         let attrs = encode(&vec![CellValue::Int64(99)]);
-        ndb_array_put_cell(
+        nodedb_array_put_cell(
             handle,
             name.as_ptr(),
             coord.as_ptr(),
@@ -253,13 +253,13 @@ fn array_gdpr_erase_cell_removes_content() {
             OPEN_UPPER,
         );
 
-        let rc = ndb_array_gdpr_erase_cell(handle, name.as_ptr(), coord.as_ptr(), coord.len());
+        let rc = nodedb_array_gdpr_erase_cell(handle, name.as_ptr(), coord.as_ptr(), coord.len());
         assert_eq!(rc, NODEDB_OK, "gdpr_erase_cell");
 
         // After erasure, coord must not be found.
         let mut out_buf: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
-        let rc = ndb_array_read_coord(
+        let rc = nodedb_array_read_coord(
             handle,
             name.as_ptr(),
             coord.as_ptr(),

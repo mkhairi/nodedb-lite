@@ -61,10 +61,10 @@ char *nodedb_last_error(struct NodeDbNodeDbHandle *handle);
  * # Safety
  * All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
  */
-int32_t ndb_array_create(struct NodeDbNodeDbHandle *handle,
-                         const char *name,
-                         const uint8_t *schema_msgpack,
-                         uintptr_t schema_len);
+int32_t nodedb_array_create(struct NodeDbNodeDbHandle *handle,
+                            const char *name,
+                            const uint8_t *schema_msgpack,
+                            uintptr_t schema_len);
 
 /**
  * Write a cell into array `name` at `coord`.
@@ -77,14 +77,14 @@ int32_t ndb_array_create(struct NodeDbNodeDbHandle *handle,
  * # Safety
  * All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
  */
-int32_t ndb_array_put_cell(struct NodeDbNodeDbHandle *handle,
-                           const char *name,
-                           const uint8_t *coord_msgpack,
-                           uintptr_t coord_len,
-                           const uint8_t *payload_msgpack,
-                           uintptr_t payload_len,
-                           int64_t valid_from_ms,
-                           int64_t valid_until_ms);
+int32_t nodedb_array_put_cell(struct NodeDbNodeDbHandle *handle,
+                              const char *name,
+                              const uint8_t *coord_msgpack,
+                              uintptr_t coord_len,
+                              const uint8_t *payload_msgpack,
+                              uintptr_t payload_len,
+                              int64_t valid_from_ms,
+                              int64_t valid_until_ms);
 
 /**
  * Slice query: return all live cells whose coordinates fall within `ranges`.
@@ -100,14 +100,14 @@ int32_t ndb_array_put_cell(struct NodeDbNodeDbHandle *handle,
  * All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
  * `out_buf` and `out_len` must not be null.
  */
-int32_t ndb_array_slice(struct NodeDbNodeDbHandle *handle,
-                        const char *name,
-                        const uint8_t *ranges_msgpack,
-                        uintptr_t ranges_len,
-                        int64_t as_of_system_ms,
-                        uint8_t has_as_of,
-                        uint8_t **out_buf,
-                        uintptr_t *out_len);
+int32_t nodedb_array_slice(struct NodeDbNodeDbHandle *handle,
+                           const char *name,
+                           const uint8_t *ranges_msgpack,
+                           uintptr_t ranges_len,
+                           int64_t as_of_system_ms,
+                           uint8_t has_as_of,
+                           uint8_t **out_buf,
+                           uintptr_t *out_len);
 
 /**
  * Read the most recent live payload for `coord` at or before `as_of_system_ms`.
@@ -124,14 +124,14 @@ int32_t ndb_array_slice(struct NodeDbNodeDbHandle *handle,
  * All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
  * `out_buf` and `out_len` must not be null.
  */
-int32_t ndb_array_read_coord(struct NodeDbNodeDbHandle *handle,
-                             const char *name,
-                             const uint8_t *coord_msgpack,
-                             uintptr_t coord_len,
-                             int64_t as_of_system_ms,
-                             uint8_t has_as_of,
-                             uint8_t **out_buf,
-                             uintptr_t *out_len);
+int32_t nodedb_array_read_coord(struct NodeDbNodeDbHandle *handle,
+                                const char *name,
+                                const uint8_t *coord_msgpack,
+                                uintptr_t coord_len,
+                                int64_t as_of_system_ms,
+                                uint8_t has_as_of,
+                                uint8_t **out_buf,
+                                uintptr_t *out_len);
 
 /**
  * Soft-delete a cell by writing a tombstone at the current system time.
@@ -141,26 +141,26 @@ int32_t ndb_array_read_coord(struct NodeDbNodeDbHandle *handle,
  * # Safety
  * All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
  */
-int32_t ndb_array_delete_cell(struct NodeDbNodeDbHandle *handle,
-                              const char *name,
-                              const uint8_t *coord_msgpack,
-                              uintptr_t coord_len);
+int32_t nodedb_array_delete_cell(struct NodeDbNodeDbHandle *handle,
+                                 const char *name,
+                                 const uint8_t *coord_msgpack,
+                                 uintptr_t coord_len);
 
 /**
  * GDPR erasure: permanently remove cell content at `coord`.
  *
  * `coord_msgpack` — zerompk-encoded `Vec<CoordValue>`.
  *
- * After this call `ndb_array_read_coord` returns empty for the coordinate
+ * After this call `nodedb_array_read_coord` returns empty for the coordinate
  * at any system time >= the erasure system timestamp.
  *
  * # Safety
  * All pointer parameters must be valid. `name` must be a null-terminated UTF-8 string.
  */
-int32_t ndb_array_gdpr_erase_cell(struct NodeDbNodeDbHandle *handle,
-                                  const char *name,
-                                  const uint8_t *coord_msgpack,
-                                  uintptr_t coord_len);
+int32_t nodedb_array_gdpr_erase_cell(struct NodeDbNodeDbHandle *handle,
+                                     const char *name,
+                                     const uint8_t *coord_msgpack,
+                                     uintptr_t coord_len);
 
 /**
  * Get a document by ID. Result written as JSON to `out_json`.
@@ -368,7 +368,7 @@ int32_t nodedb_generate_id_typed(const char *id_type, char **out);
 void nodedb_free_string(char *ptr);
 
 /**
- * Free a byte buffer returned by nodedb_* functions (e.g. `ndb_array_slice`).
+ * Free a byte buffer returned by nodedb_* functions (e.g. `nodedb_array_slice`).
  *
  * `len` must be the exact length originally written to `*out_len`.
  *
@@ -525,8 +525,10 @@ const char *nodedb_version(void);
 /**
  * Return the ABI version as an integer.
  *
- * Bumped on breaking FFI changes. Bindings should compare this against their
- * compile-time expectation and refuse to run on mismatch.
+ * Call it before anything else — it needs no handle — and refuse to run when
+ * it differs from the value the adapter was built against. Additions never
+ * move it, so an equal value means every symbol the adapter knows still has
+ * the shape it expects.
  */
 uint32_t nodedb_abi_version(void);
 

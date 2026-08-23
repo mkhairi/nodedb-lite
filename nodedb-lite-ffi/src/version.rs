@@ -13,8 +13,13 @@ use std::sync::OnceLock;
 
 /// Integer ABI version, bumped only on breaking FFI changes.
 ///
-/// A binding can compare this against the version it was compiled against and
-/// fail fast with a clear message instead of dying on a missing symbol.
+/// Breaking means an existing export changed shape or went away. Adding a new
+/// export is backward-compatible and leaves this alone: an adapter that has
+/// never heard of the new symbol is unaffected by it.
+///
+/// `abi/surface.txt` records this number alongside the surface it describes,
+/// and `tests/abi_surface.rs` fails when the two disagree — so a signature
+/// cannot change without the bump landing in the same commit.
 const NODEDB_ABI_VERSION: u32 = 1;
 
 /// The full version string, e.g. `"0.1.0+ee9ccdd"` (CARGO_PKG_VERSION plus the
@@ -45,8 +50,10 @@ pub extern "C" fn nodedb_version() -> *const c_char {
 
 /// Return the ABI version as an integer.
 ///
-/// Bumped on breaking FFI changes. Bindings should compare this against their
-/// compile-time expectation and refuse to run on mismatch.
+/// Call it before anything else — it needs no handle — and refuse to run when
+/// it differs from the value the adapter was built against. Additions never
+/// move it, so an equal value means every symbol the adapter knows still has
+/// the shape it expects.
 #[unsafe(no_mangle)]
 pub extern "C" fn nodedb_abi_version() -> u32 {
     NODEDB_ABI_VERSION

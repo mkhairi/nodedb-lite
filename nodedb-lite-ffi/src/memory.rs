@@ -20,7 +20,7 @@ pub unsafe extern "C" fn nodedb_free_string(ptr: *mut c_char) {
     })
 }
 
-/// Free a byte buffer returned by nodedb_* functions (e.g. `ndb_array_slice`).
+/// Free a byte buffer returned by nodedb_* functions (e.g. `nodedb_array_slice`).
 ///
 /// `len` must be the exact length originally written to `*out_len`.
 ///

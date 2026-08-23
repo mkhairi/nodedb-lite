@@ -49,8 +49,29 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
             return if (msg.isNullOrEmpty()) "" else ": $msg"
         }
 
+        /**
+         * Generate a UUIDv7 — time-sortable, the recommended primary key.
+         *
+         * Use it to mint a document id before the write, so optimistic UI has
+         * the id it will store under.
+         */
+        fun generateId(): String =
+            nativeGenerateId() ?: throw NodeDbException("generateId failed${detail()}")
+
+        /**
+         * Generate an id of a named type.
+         *
+         * @param idType one of `uuidv7`, `uuidv4`, `ulid`, `cuid2`, `nanoid`.
+         * @throws NodeDbException if the type is not one of those.
+         */
+        fun generateId(idType: String): String =
+            nativeGenerateIdTyped(idType)
+                ?: throw NodeDbException("generateId($idType) failed${detail()}")
+
         @JvmStatic private external fun nativeOpen(path: String, peerId: Long): Long
         @JvmStatic private external fun nativeLastError(): String?
+        @JvmStatic private external fun nativeGenerateId(): String?
+        @JvmStatic private external fun nativeGenerateIdTyped(idType: String): String?
     }
 
     // ── Lifecycle ───────────
@@ -198,6 +219,91 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
         if (rc != 0) throw NodeDbException("documentDelete failed: error $rc${detail()}")
     }
 
+    // ── Array Operations ────
+
+    // Coordinates, cell payloads and slice ranges cross this boundary as
+    // MessagePack, the same encoding the C API uses. Encode and decode them
+    // with a MessagePack library; this binding passes the bytes through
+    // untouched and does not interpret them.
+
+    /**
+     * Create an ND sparse array.
+     *
+     * @param schemaMsgpack MessagePack-encoded array schema.
+     */
+    fun arrayCreate(name: String, schemaMsgpack: ByteArray) {
+        checkOpen()
+        val rc = nativeArrayCreate(handle, name, schemaMsgpack)
+        if (rc != 0) throw NodeDbException("arrayCreate failed: error $rc${detail()}")
+    }
+
+    /**
+     * Write a cell at a coordinate.
+     *
+     * @param coordMsgpack MessagePack-encoded coordinate tuple.
+     * @param payloadMsgpack MessagePack-encoded attribute values.
+     * @param validFromMs valid-time start, in milliseconds since the epoch.
+     * @param validUntilMs valid-time end, or [Long.MAX_VALUE] for open-ended.
+     */
+    fun arrayPutCell(
+        name: String,
+        coordMsgpack: ByteArray,
+        payloadMsgpack: ByteArray,
+        validFromMs: Long,
+        validUntilMs: Long,
+    ) {
+        checkOpen()
+        val rc = nativeArrayPutCell(
+            handle, name, coordMsgpack, payloadMsgpack, validFromMs, validUntilMs
+        )
+        if (rc != 0) throw NodeDbException("arrayPutCell failed: error $rc${detail()}")
+    }
+
+    /**
+     * Read every live cell in a slice.
+     *
+     * @param rangesMsgpack MessagePack-encoded per-dimension ranges.
+     * @param asOfMs system time to read at, or [Long.MAX_VALUE] for the latest.
+     * @return MessagePack-encoded cells.
+     */
+    fun arraySlice(name: String, rangesMsgpack: ByteArray, asOfMs: Long): ByteArray {
+        checkOpen()
+        return nativeArraySlice(handle, name, rangesMsgpack, asOfMs)
+            ?: throw NodeDbException("arraySlice failed${detail()}")
+    }
+
+    /**
+     * Read one cell by coordinate.
+     *
+     * @param asOfMs system time to read at, or [Long.MAX_VALUE] for the latest.
+     * @return MessagePack-encoded cell, or null when no live cell is there.
+     */
+    fun arrayReadCoord(name: String, coordMsgpack: ByteArray, asOfMs: Long): ByteArray? {
+        checkOpen()
+        return nativeArrayReadCoord(handle, name, coordMsgpack, asOfMs)
+    }
+
+    /**
+     * Tombstone the cell at a coordinate. Earlier versions stay readable at an
+     * earlier `asOfMs`.
+     */
+    fun arrayDeleteCell(name: String, coordMsgpack: ByteArray) {
+        checkOpen()
+        val rc = nativeArrayDeleteCell(handle, name, coordMsgpack)
+        if (rc != 0) throw NodeDbException("arrayDeleteCell failed: error $rc${detail()}")
+    }
+
+    /**
+     * Erase a cell's content permanently, including its history.
+     *
+     * Unlike [arrayDeleteCell] this is not recoverable at any `asOfMs`.
+     */
+    fun arrayGdprEraseCell(name: String, coordMsgpack: ByteArray) {
+        checkOpen()
+        val rc = nativeArrayGdprEraseCell(handle, name, coordMsgpack)
+        if (rc != 0) throw NodeDbException("arrayGdprEraseCell failed: error $rc${detail()}")
+    }
+
     // ── Internal ────────────
 
     private fun checkOpen() {
@@ -234,6 +340,25 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     private external fun nativeDocumentGet(handle: Long, collection: String, id: String): String?
     private external fun nativeDocumentPut(handle: Long, collection: String, jsonBody: String): Int
     private external fun nativeDocumentDelete(handle: Long, collection: String, id: String): Int
+    private external fun nativeArrayCreate(
+        handle: Long, name: String, schemaMsgpack: ByteArray
+    ): Int
+    private external fun nativeArrayPutCell(
+        handle: Long, name: String, coordMsgpack: ByteArray,
+        payloadMsgpack: ByteArray, validFromMs: Long, validUntilMs: Long
+    ): Int
+    private external fun nativeArraySlice(
+        handle: Long, name: String, rangesMsgpack: ByteArray, asOfMs: Long
+    ): ByteArray?
+    private external fun nativeArrayReadCoord(
+        handle: Long, name: String, coordMsgpack: ByteArray, asOfMs: Long
+    ): ByteArray?
+    private external fun nativeArrayDeleteCell(
+        handle: Long, name: String, coordMsgpack: ByteArray
+    ): Int
+    private external fun nativeArrayGdprEraseCell(
+        handle: Long, name: String, coordMsgpack: ByteArray
+    ): Int
 }
 
 /**
