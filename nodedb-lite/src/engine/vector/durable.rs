@@ -79,8 +79,10 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Vec<f32>> {
     }
     Some(
         bytes
-            .chunks_exact(F32_BYTES)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<F32_BYTES>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
     )
 }

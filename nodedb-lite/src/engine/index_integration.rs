@@ -131,9 +131,11 @@ fn index_vector(
             .collect(),
         Value::Bytes(b) => {
             // Packed f32 bytes.
-            b.chunks_exact(4)
+            b.as_chunks::<4>()
+                .0
+                .iter()
                 .take(dim as usize)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         }
         _ => return,

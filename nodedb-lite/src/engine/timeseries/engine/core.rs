@@ -147,13 +147,10 @@ impl TimeseriesEngine {
     /// Decode a flushed series_id block (raw LE u64).
     pub fn decode_series_ids(block: &[u8]) -> Vec<SeriesId> {
         block
-            .chunks_exact(8)
-            .map(|chunk| {
-                let arr: [u8; 8] = chunk
-                    .try_into()
-                    .expect("chunks_exact(8) guarantees 8 bytes");
-                u64::from_le_bytes(arr)
-            })
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_le_bytes(*chunk))
             .collect()
     }
 }
