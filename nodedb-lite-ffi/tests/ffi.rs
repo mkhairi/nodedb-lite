@@ -235,3 +235,30 @@ fn free_null_string_is_noop() {
         nodedb_free_string(std::ptr::null_mut());
     }
 }
+
+/// REPLICATE #13: the cdylib must export `nodedb_version` so bindings can
+/// detect library/ABI skew at runtime. Today no version symbol exists —
+/// bindings pin the build by comparing sha256sum of the .so, which can only
+/// say "different", not "which one".
+#[test]
+fn version_export_exists() {
+    unsafe {
+        let version = nodedb_version();
+        assert!(!version.is_null(), "nodedb_version must be exported");
+        let v = CStr::from_ptr(version).to_str().unwrap();
+        assert!(!v.is_empty(), "version string must not be empty");
+        // e.g. "0.1.0" or "0.1.0+<sha>"
+        assert!(
+            v.split(['+', '-']).next().unwrap().split('.').count() >= 2,
+            "version must be semver-ish, got: {v}"
+        );
+    }
+}
+
+/// REPLICATE #13 (companion): an integer ABI version lets bindings fail fast
+/// on breaking FFI changes instead of dying on a missing symbol.
+#[test]
+fn abi_version_export_exists() {
+    let abi = nodedb_abi_version();
+    assert!(abi > 0, "nodedb_abi_version must be a positive integer");
+}

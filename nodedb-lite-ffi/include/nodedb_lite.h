@@ -476,4 +476,20 @@ int32_t nodedb_start_sync(struct NodeDbNodeDbHandle *handle,
                           const char *url,
                           const char *jwt_token);
 
+/**
+ * Return the library version as a static string, e.g. `"0.1.0+ee9ccdd"`.
+ *
+ * Safe to call before any open; no allocation per call.
+ * The returned pointer is owned by the library — do not free it.
+ */
+const char *nodedb_version(void);
+
+/**
+ * Return the ABI version as an integer.
+ *
+ * Bumped on breaking FFI changes. Bindings should compare this against their
+ * compile-time expectation and refuse to run on mismatch.
+ */
+uint32_t nodedb_abi_version(void);
+
 #endif  /* NODEDB_LITE_H */
