@@ -57,7 +57,7 @@ pub struct NodeDbHandle {
 }
 
 /// How long `Drop` waits for the sync task to wind down after abort.
-const SYNC_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const SYNC_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Drop for NodeDbHandle {
     fn drop(&mut self) {
