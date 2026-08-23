@@ -48,6 +48,7 @@ pub mod sequence;
 pub mod storage;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sync;
+pub mod tasks;
 
 pub use config::LiteConfig;
 pub use error::LiteError;

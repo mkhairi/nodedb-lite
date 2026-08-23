@@ -62,12 +62,20 @@ pub(crate) fn get(id: u64) -> Option<Arc<NodeDbHandle>> {
 /// otherwise it remains alive until the last clone is dropped.
 ///
 /// Returns `false` for id 0 or ids that are not present.
+///
+/// The registry write lock is released BEFORE the `Arc` is dropped: the
+/// handle's `Drop` (sync stop + runtime teardown) can block for
+/// [`SYNC_STOP_TIMEOUT`](crate::handle::SYNC_STOP_TIMEOUT), and dropping it
+/// under the lock would stall every other handle operation that long.
 pub(crate) fn remove(id: u64) -> bool {
     if id == 0 {
         return false;
     }
     let mut map = registry().write().unwrap_or_else(|e| e.into_inner());
-    map.remove(&id).is_some()
+    let removed = map.remove(&id);
+    // Unlock before the Arc (and possibly the whole handle) is dropped.
+    drop(map);
+    removed.is_some()
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

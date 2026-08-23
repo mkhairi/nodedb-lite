@@ -442,6 +442,9 @@ struct NodeDbNodeDbHandle *nodedb_open_discarding_corrupt_store(const char *path
 /**
  * Close a NodeDB-Lite database and free the handle.
  *
+ * Blocks until the database's background tasks have stopped, so it can take
+ * up to a few seconds when sync is mid-connect. Call it off the UI thread.
+ *
  * # Safety
  * `handle` must be a token returned by `nodedb_open`, or NULL/0 (no-op).
  * The token is a `u64` id packed into a pointer-width integer; it is never
@@ -481,9 +484,13 @@ int32_t nodedb_compact(struct NodeDbNodeDbHandle *handle,
  *
  * Connects via WebSocket to the given URL, authenticates with the JWT token,
  * and continuously pushes pending deltas / receives shape updates.
- * Runs forever in the background with auto-reconnect.
+ * Reconnects on its own.
  *
- * Returns `NODEDB_OK` on successful launch (sync runs asynchronously).
+ * Returns `NODEDB_OK` on successful launch (sync runs asynchronously), or
+ * `NODEDB_ERR_FAILED` when sync is already running on this handle.
+ *
+ * The database owns the task: `nodedb_close` stops it before tearing down
+ * the runtime, and `nodedb_stop_sync` stops it on demand.
  *
  * # Safety
  * `url` and `jwt_token` must be valid null-terminated UTF-8 strings.
@@ -491,6 +498,21 @@ int32_t nodedb_compact(struct NodeDbNodeDbHandle *handle,
 int32_t nodedb_start_sync(struct NodeDbNodeDbHandle *handle,
                           const char *url,
                           const char *jwt_token);
+
+/**
+ * Stop background sync started by `nodedb_start_sync`.
+ *
+ * The database handle stays open and usable, and sync can be restarted with
+ * a new token. Blocks until the sync task has wound down.
+ *
+ * Returns `NODEDB_OK` if sync was running and was stopped,
+ * `NODEDB_ERR_FAILED` if no sync was active, `NODEDB_ERR_NULL` for a NULL
+ * handle.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `nodedb_open`.
+ */
+int32_t nodedb_stop_sync(struct NodeDbNodeDbHandle *handle);
 
 /**
  * Return the library version as a static string, e.g. `"0.1.0+ee9ccdd"`.

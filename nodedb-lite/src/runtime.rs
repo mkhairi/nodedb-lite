@@ -11,25 +11,80 @@
 use std::future::Future;
 use std::time::Duration;
 
-/// Spawn a future on the runtime.
+/// Spawn a future on the runtime, returning a handle to the running task.
 ///
 /// - Native: `tokio::spawn` (runs on Tokio thread pool, requires `Send`).
 /// - WASM: `wasm_bindgen_futures::spawn_local` (runs on the microtask queue,
 ///   no `Send` requirement).
+///
+/// Ignoring the handle detaches the task: nothing can then stop it or wait for
+/// it. Register it with [`crate::tasks::TaskRegistry`] instead, so database
+/// shutdown can stop it before the runtime goes away.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn spawn<F>(future: F)
+pub fn spawn<F>(future: F) -> TaskHandle
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(future);
+    TaskHandle {
+        inner: tokio::spawn(future),
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn spawn<F>(future: F)
+pub fn spawn<F>(future: F) -> TaskHandle
 where
     F: Future<Output = ()> + 'static,
 {
     wasm_bindgen_futures::spawn_local(future);
+    TaskHandle
+}
+
+/// Handle to a task started by [`spawn`].
+///
+/// Native wraps a Tokio `JoinHandle`, so the task can be joined and, as a last
+/// resort, aborted. WASM has neither primitive — `spawn_local` returns nothing
+/// — so the handle is inert there and shutdown rests entirely on the
+/// cooperative stop signal.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct TaskHandle {
+    inner: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(target_arch = "wasm32")]
+pub struct TaskHandle;
+
+impl TaskHandle {
+    /// Cancel the task at its next await point.
+    ///
+    /// The backstop for a task that does not observe its stop signal. Prefer
+    /// the signal: abort drops the future wherever it happens to be suspended,
+    /// which can be mid-write.
+    pub fn abort(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.inner.abort();
+        }
+    }
+
+    /// Wait for the task to finish, up to `timeout`.
+    ///
+    /// Returns `true` when the task finished, `false` on timeout — leaving the
+    /// caller free to [`abort`](Self::abort) it. Always `true` on WASM, which
+    /// has nothing to join.
+    pub async fn join_within(&mut self, timeout: Duration) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tokio::select! {
+                _ = &mut self.inner => true,
+                _ = tokio::time::sleep(timeout) => false,
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = timeout;
+            true
+        }
+    }
 }
 
 /// Run a blocking closure off the async runtime.

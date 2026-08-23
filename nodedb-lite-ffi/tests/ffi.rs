@@ -277,6 +277,116 @@ fn open_null_path_records_null_error() {
     }
 }
 
+/// Closing a handle with active sync must not crash.
+///
+/// A sync task torn down with the runtime crashed the process. Close now
+/// stops the database's tasks first.
+///
+/// Sync points at a local TCP listener and the test waits for the accept, so
+/// the task has provably reached the connect path before the close. Closing
+/// before the task is ever polled would test nothing.
+#[test]
+fn close_with_active_sync_does_not_crash() {
+    unsafe {
+        for _ in 0..10 {
+            let path = CString::new(":memory:").unwrap();
+            let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+            assert!(!handle.is_null());
+
+            // Reachable endpoint: plain TCP listener. The client connects and
+            // starts the WebSocket handshake, then stalls waiting for our
+            // (never sent) response — the mid-connect state that crashed.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let url = CString::new(url).unwrap();
+            let jwt = CString::new("some-jwt").unwrap();
+            let rc = nodedb_start_sync(handle, url.as_ptr(), jwt.as_ptr());
+            assert_eq!(rc, NODEDB_OK);
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut accepted = false;
+            while std::time::Instant::now() < deadline {
+                if listener.accept().is_ok() {
+                    accepted = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(accepted, "sync task never reached the connect path");
+
+            nodedb_close(handle);
+        }
+    }
+}
+
+/// `nodedb_stop_sync` quiesces sync without closing the handle.
+///
+/// A second stop reports no task.
+#[test]
+fn stop_sync_quiesces_and_handle_stays_usable() {
+    unsafe {
+        let path = CString::new(":memory:").unwrap();
+        let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+        assert!(!handle.is_null());
+
+        let url = CString::new("ws://127.0.0.1:1").unwrap();
+        let jwt = CString::new("some-jwt").unwrap();
+        let rc = nodedb_start_sync(handle, url.as_ptr(), jwt.as_ptr());
+        assert_eq!(rc, NODEDB_OK);
+
+        // Stopping returns OK and does not invalidate the handle.
+        let rc = nodedb_stop_sync(handle);
+        assert_eq!(rc, NODEDB_OK);
+
+        // Second stop: no sync task left.
+        let rc = nodedb_stop_sync(handle);
+        assert_eq!(rc, NODEDB_ERR_FAILED);
+
+        // Handle still works after stop.
+        let coll = CString::new("notes").unwrap();
+        let body = CString::new(r#"{"id":"n1","fields":{"title":{"String":"Hello"}}}"#).unwrap();
+        let rc = nodedb_document_put(handle, coll.as_ptr(), body.as_ptr(), std::ptr::null_mut());
+        assert_eq!(rc, NODEDB_OK);
+
+        nodedb_close(handle);
+    }
+}
+
+/// A second `nodedb_start_sync` on a running handle must be rejected, not
+/// silently detach the running loop (which would make it unstoppable).
+#[test]
+fn second_start_sync_is_rejected() {
+    unsafe {
+        let path = CString::new(":memory:").unwrap();
+        let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+        assert!(!handle.is_null());
+
+        let url = CString::new("ws://127.0.0.1:1").unwrap();
+        let jwt = CString::new("some-jwt").unwrap();
+        let rc = nodedb_start_sync(handle, url.as_ptr(), jwt.as_ptr());
+        assert_eq!(rc, NODEDB_OK);
+
+        // Second start while the first is still running: rejected, with a
+        // reason the embedder can read.
+        let rc = nodedb_start_sync(handle, url.as_ptr(), jwt.as_ptr());
+        assert_eq!(rc, NODEDB_ERR_FAILED);
+        let err = nodedb_last_error(handle);
+        assert!(!err.is_null(), "the rejection must record a reason");
+        let msg = CStr::from_ptr(err).to_str().unwrap();
+        assert!(msg.contains("already running"), "unexpected reason: {msg}");
+        nodedb_free_string(err);
+
+        // After a stop, starting again succeeds.
+        let rc = nodedb_stop_sync(handle);
+        assert_eq!(rc, NODEDB_OK);
+        let rc = nodedb_start_sync(handle, url.as_ptr(), jwt.as_ptr());
+        assert_eq!(rc, NODEDB_OK);
+
+        nodedb_close(handle);
+    }
+}
+
 #[test]
 fn free_null_string_is_noop() {
     unsafe {

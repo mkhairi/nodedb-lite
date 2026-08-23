@@ -63,7 +63,7 @@ js-sys = { workspace = true }
 # `rt-multi-thread` feature now that engines are interior-mutable
 # (Sections A-G of LITE_RUNTIME_REFACTOR_CHECKLIST). Tests that
 # legitimately need a multi-thread runtime opt in via dev-dependencies.
-tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 

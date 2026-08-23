@@ -48,3 +48,14 @@ pub struct NodeDbHandle {
     pub(crate) rt: tokio::runtime::Runtime,
     pub(crate) _tmpdir: Option<OwnedTempDir>,
 }
+
+impl Drop for NodeDbHandle {
+    fn drop(&mut self) {
+        // Stop the database's background tasks before the runtime is dropped.
+        // Auto-flush, auto-compact and the sync loop can each be mid-poll on a
+        // worker thread, and a runtime torn down under one of them has crashed
+        // the process. The database decides how its own tasks wind down; this
+        // only has to wait for them.
+        self.rt.block_on(self.db.shutdown());
+    }
+}
