@@ -277,6 +277,63 @@ fn open_null_path_records_null_error() {
     }
 }
 
+/// REPLICATE #11: closing a handle with active sync must not crash.
+///
+/// Reported: `nodedb_close` during active sync intermittently SIGSEGVs (6-10
+/// of 10 runs on a signal-active host) because the sync task is torn down
+/// with the runtime. The fix retains the sync task in the handle and stops it
+/// (abort + bounded join) before the runtime is dropped. This loop is the
+/// regression guard: before the fix it was a race, after it is deterministic.
+#[test]
+fn close_with_active_sync_does_not_crash() {
+    unsafe {
+        for _ in 0..10 {
+            let path = CString::new(":memory:").unwrap();
+            let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+            assert!(!handle.is_null());
+
+            // Deliberately unreachable origin — sync stays in connect/retry.
+            let url = CString::new("ws://127.0.0.1:1").unwrap();
+            let jwt = CString::new("some-jwt").unwrap();
+            let rc = nodedb_start_sync(handle, url.as_ptr(), jwt.as_ptr());
+            assert_eq!(rc, NODEDB_OK);
+
+            nodedb_close(handle);
+        }
+    }
+}
+
+/// REPLICATE #11 (companion): nodedb_stop_sync must quiesce sync on demand
+/// without closing the handle, and a second stop must report no task.
+#[test]
+fn stop_sync_quiesces_and_handle_stays_usable() {
+    unsafe {
+        let path = CString::new(":memory:").unwrap();
+        let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+        assert!(!handle.is_null());
+
+        let url = CString::new("ws://127.0.0.1:1").unwrap();
+        let jwt = CString::new("some-jwt").unwrap();
+        let rc = nodedb_start_sync(handle, url.as_ptr(), jwt.as_ptr());
+        assert_eq!(rc, NODEDB_OK);
+
+        // Stopping returns OK and does not invalidate the handle.
+        let rc = nodedb_stop_sync(handle);
+        assert_eq!(rc, NODEDB_OK);
+
+        // Second stop: no sync task left.
+        let rc = nodedb_stop_sync(handle);
+        assert_eq!(rc, NODEDB_ERR_FAILED);
+
+        // Handle still works after stop.
+        let coll = CString::new("notes").unwrap();
+        let body = CString::new(r#"{"id":"n1","fields":{"title":{"String":"Hello"}}}"#).unwrap();
+        let rc = nodedb_document_put(handle, coll.as_ptr(), body.as_ptr(), std::ptr::null_mut());
+        assert_eq!(rc, NODEDB_OK);
+
+        nodedb_close(handle);    }
+}
+
 #[test]
 fn free_null_string_is_noop() {
     unsafe {

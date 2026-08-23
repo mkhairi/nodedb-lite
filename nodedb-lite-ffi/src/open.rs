@@ -57,6 +57,10 @@ fn open_handle(
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
+        // #11: the sync connect path runs close to the default 2 MiB worker
+        // stack floor (~20 KiB headroom observed in core dumps); give the
+        // worker real headroom so a deep poll cannot exhaust the stack.
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
     {
@@ -103,6 +107,7 @@ fn open_handle(
         db,
         rt,
         _tmpdir: tmpdir,
+        sync_task: std::sync::Mutex::new(None),
     }) as *mut NodeDbHandle
 }
 

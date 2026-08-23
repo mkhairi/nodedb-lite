@@ -31,6 +31,12 @@
  *
  * `_tmpdir` is `Some` when the database was opened with the `:memory:` path.
  * The directory is deleted when the handle is dropped.
+ *
+ * `sync_task` holds the background sync loop (if `nodedb_start_sync` was
+ * called). It is aborted and joined before the runtime is dropped — see
+ * `Drop` — so closing a handle with active sync cannot tear the runtime down
+ * under a mid-poll sync task (SIGSEGV, #11). Mutex because handles are shared
+ * behind `Arc` (registry lookups) while start/stop mutate the slot.
  */
 typedef struct NodeDbNodeDbHandle NodeDbNodeDbHandle;
 
@@ -484,6 +490,10 @@ int32_t nodedb_compact(struct NodeDbNodeDbHandle *handle,
  * Runs forever in the background with auto-reconnect.
  *
  * Returns `NODEDB_OK` on successful launch (sync runs asynchronously).
+ *
+ * The background task is owned by the handle: `nodedb_close` stops it
+ * deterministically before tearing down the runtime, and `nodedb_stop_sync`
+ * stops it on demand (e.g. reconnect with a new token).
  *
  * # Safety
  * `url` and `jwt_token` must be valid null-terminated UTF-8 strings.

@@ -3,6 +3,9 @@
 //! CRDT sync to an Origin server.
 
 use std::os::raw::c_char;
+use std::sync::Arc;
+
+use nodedb_lite::sync::{SyncClient, SyncConfig, SyncDelegate};
 
 use crate::handle::NodeDbHandle;
 use crate::status::{NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK};
@@ -15,6 +18,10 @@ use crate::util::{ffi_guard, handle_ref, ptr_to_str};
 /// Runs forever in the background with auto-reconnect.
 ///
 /// Returns `NODEDB_OK` on successful launch (sync runs asynchronously).
+///
+/// The background task is owned by the handle: `nodedb_close` stops it
+/// deterministically before tearing down the runtime, and `nodedb_stop_sync`
+/// stops it on demand (e.g. reconnect with a new token).
 ///
 /// # Safety
 /// `url` and `jwt_token` must be valid null-terminated UTF-8 strings.
@@ -35,7 +42,7 @@ pub unsafe extern "C" fn nodedb_start_sync(
             return NODEDB_ERR_UTF8;
         };
 
-        let config = nodedb_lite::sync::SyncConfig {
+        let config = SyncConfig {
             url: url_str.to_string(),
             jwt_token: jwt_str.to_string(),
             client_version: format!("nodedb-lite-ffi/{}", env!("CARGO_PKG_VERSION")),
@@ -47,10 +54,50 @@ pub unsafe extern "C" fn nodedb_start_sync(
             token_lifetime_secs: 0,
         };
 
-        // start_sync requires a tokio runtime context for spawning the background task.
-        let _guard = h.rt.enter();
-        let _sync_client = h.db.start_sync(config);
+        // Spawn the sync loop ourselves (rather than via `start_sync`) so the
+        // JoinHandle is retained in the handle — `nodedb_close` needs it to
+        // stop the task deterministically before the runtime is dropped (#11).
+        let client = Arc::new(SyncClient::new(config));
+        let delegate: Arc<dyn SyncDelegate> = Arc::clone(&h.db) as _;
+        let client_task = Arc::clone(&client);
+        let task = h.rt.spawn(async move {
+            nodedb_lite::sync::run_sync_loop(client_task, delegate).await;
+        });
+        *h.sync_task.lock().unwrap() = Some(task);
 
+        NODEDB_OK
+    })
+}
+
+/// Stop background sync started by `nodedb_start_sync`.
+///
+/// Aborts the sync task and waits (bounded) for it to wind down. The database
+/// handle stays open and usable; sync can be restarted with a new call.
+///
+/// Returns `NODEDB_OK` if a sync task was running and was stopped,
+/// `NODEDB_ERR_FAILED` if no sync was active, `NODEDB_ERR_NULL` for a NULL
+/// handle.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `nodedb_open`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nodedb_stop_sync(handle: *mut NodeDbHandle) -> i32 {
+    ffi_guard(NODEDB_ERR_FAILED, || {
+        let Some(h) = handle_ref(handle) else {
+            return NODEDB_ERR_NULL;
+        };
+        let Some(task) = h.sync_task.lock().unwrap().take() else {
+            return NODEDB_ERR_FAILED;
+        };
+        task.abort();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut task = task;
+        let _ = h.rt.block_on(async move {
+            tokio::select! {
+                _ = &mut task => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        });
         NODEDB_OK
     })
 }
