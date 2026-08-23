@@ -123,7 +123,14 @@ pub(crate) unsafe fn write_c_string(out: *mut *mut c_char, s: String) -> i32 {
             unsafe { *out = cs.into_raw() };
             NODEDB_OK
         }
-        Err(_) => NODEDB_ERR_FAILED,
+        Err(e) => {
+            crate::error::record_error(format!(
+                "result contains an interior NUL byte at offset {}, so it cannot cross the C \
+                 string boundary",
+                e.nul_position()
+            ));
+            NODEDB_ERR_FAILED
+        }
     }
 }
 

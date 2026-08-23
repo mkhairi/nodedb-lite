@@ -32,22 +32,31 @@ unsafe fn write_msgpack_out(bytes: Vec<u8>, out_buf: *mut *mut u8, out_len: *mut
 /// Decode a msgpack byte slice from a raw C pointer + length pair.
 ///
 /// Returns `None` if the pointer is null, len is zero, or deserialization fails.
+/// `what` names the argument in the recorded error, so an embedder reading
+/// `nodedb_last_error` learns which buffer was rejected.
 ///
 /// # Safety contract (callers must uphold)
 /// When `ptr` is non-null and `len > 0`, `ptr` must be non-null, properly aligned
 /// for `u8`, and valid for exactly `len` bytes for the entire duration of this call.
 /// No runtime length validation beyond the null/zero check is possible; passing a
 /// mismatched `len` or a dangling pointer is immediate undefined behaviour.
-fn decode_msgpack<T>(ptr: *const u8, len: usize) -> Option<T>
+fn decode_msgpack<T>(ptr: *const u8, len: usize, what: &str) -> Option<T>
 where
     T: for<'a> zerompk::FromMessagePack<'a>,
 {
     if ptr.is_null() || len == 0 {
+        record_error(format!("{what}: msgpack buffer is NULL or empty"));
         return None;
     }
     // Safety: caller guarantees ptr is valid for len bytes.
     let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-    zerompk::from_msgpack(slice).ok()
+    match zerompk::from_msgpack(slice) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            record_error(format!("{what}: msgpack decode failed: {e}"));
+            None
+        }
+    }
 }
 
 // ─── public FFI ──────────────────────────────────────────────────────────────
@@ -75,9 +84,11 @@ pub unsafe extern "C" fn ndb_array_create(
         let Some(name_str) = ptr_to_str(name) else {
             return NODEDB_ERR_UTF8;
         };
-        let Some(schema) =
-            decode_msgpack::<nodedb_array::schema::ArraySchema>(schema_msgpack, schema_len)
-        else {
+        let Some(schema) = decode_msgpack::<nodedb_array::schema::ArraySchema>(
+            schema_msgpack,
+            schema_len,
+            "schema",
+        ) else {
             return NODEDB_ERR_FAILED;
         };
 
@@ -121,12 +132,14 @@ pub unsafe extern "C" fn ndb_array_put_cell(
         let Some(coord) = decode_msgpack::<Vec<nodedb_array::types::coord::value::CoordValue>>(
             coord_msgpack,
             coord_len,
+            "coord",
         ) else {
             return NODEDB_ERR_FAILED;
         };
         let Some(attrs) = decode_msgpack::<Vec<nodedb_array::types::cell_value::value::CellValue>>(
             payload_msgpack,
             payload_len,
+            "payload",
         ) else {
             return NODEDB_ERR_FAILED;
         };
@@ -189,6 +202,7 @@ pub unsafe extern "C" fn ndb_array_slice(
         let Some(ranges) = decode_msgpack::<Vec<Option<nodedb_array::query::slice::DimRange>>>(
             ranges_msgpack,
             ranges_len,
+            "ranges",
         ) else {
             return NODEDB_ERR_FAILED;
         };
@@ -255,6 +269,7 @@ pub unsafe extern "C" fn ndb_array_read_coord(
         let Some(coord) = decode_msgpack::<Vec<nodedb_array::types::coord::value::CoordValue>>(
             coord_msgpack,
             coord_len,
+            "coord",
         ) else {
             return NODEDB_ERR_FAILED;
         };
@@ -317,6 +332,7 @@ pub unsafe extern "C" fn ndb_array_delete_cell(
         let Some(coord) = decode_msgpack::<Vec<nodedb_array::types::coord::value::CoordValue>>(
             coord_msgpack,
             coord_len,
+            "coord",
         ) else {
             return NODEDB_ERR_FAILED;
         };
@@ -365,6 +381,7 @@ pub unsafe extern "C" fn ndb_array_gdpr_erase_cell(
         let Some(coord) = decode_msgpack::<Vec<nodedb_array::types::coord::value::CoordValue>>(
             coord_msgpack,
             coord_len,
+            "coord",
         ) else {
             return NODEDB_ERR_FAILED;
         };

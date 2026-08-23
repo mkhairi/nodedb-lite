@@ -17,6 +17,7 @@ use jni::sys::{jint, jlong, jstring};
 use std::sync::Arc;
 
 use super::super::{NODEDB_ERR_FAILED, NODEDB_OK, NodeDbHandle, ffi_guard};
+use crate::error::record_error;
 
 /// Look up the handle for an opaque token returned by `nativeOpen`.
 ///
@@ -44,7 +45,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_00024Companion_nativeOpen
         };
         let path_c = match std::ffi::CString::new(path) {
             Ok(c) => c,
-            Err(_) => return 0,
+            Err(_) => {
+                record_error("path contains an interior NUL byte");
+                return 0;
+            }
         };
 
         // `passphrase` is a nullable JString. Convert to an Option<CString> so we can pass
@@ -61,7 +65,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_00024Companion_nativeOpen
             };
             match std::ffi::CString::new(s) {
                 Ok(c) => Some(c),
-                Err(_) => return 0,
+                Err(_) => {
+                    record_error("passphrase contains an interior NUL byte");
+                    return 0;
+                }
             }
         };
         let passphrase_ptr = passphrase_cstring
@@ -98,7 +105,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeFlush(
         };
         match h.rt.block_on(h.db.flush()) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -117,7 +127,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeCompact(
         };
         match h.rt.block_on(h.db.compact()) {
             Ok(outcome) => i64::try_from(outcome.file_bytes_freed).unwrap_or(i64::MAX),
-            Err(_) => -1,
+            Err(e) => {
+                record_error(e);
+                -1
+            }
         }
     })
 }
@@ -170,7 +183,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeVectorInsert(
             .block_on(h.db.vector_insert(&collection, &id, &buf, None))
         {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -217,7 +233,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeVectorSearch(
                 .block_on(h.db.vector_search(&collection, &buf, k as usize, None, None))
             {
                 Ok(r) => r,
-                Err(_) => return std::ptr::null_mut(),
+                Err(e) => {
+                    record_error(e);
+                    return std::ptr::null_mut();
+                }
             };
 
         let json: Vec<serde_json::Value> = results
@@ -265,7 +284,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeVectorDelete(
         use nodedb_client::NodeDb;
         match h.rt.block_on(h.db.vector_delete(&collection, &id)) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -319,11 +341,17 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphInsertEdge(
         use nodedb_client::NodeDb;
         let from_id = match nodedb_types::id::NodeId::try_new(from) {
             Ok(id) => id,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => {
+                record_error(e);
+                return std::ptr::null_mut();
+            }
         };
         let to_id = match nodedb_types::id::NodeId::try_new(to) {
             Ok(id) => id,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => {
+                record_error(e);
+                return std::ptr::null_mut();
+            }
         };
         let edge_id = match h.rt.block_on(h.db.graph_insert_edge(
             &collection,
@@ -333,7 +361,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphInsertEdge(
             None,
         )) {
             Ok(id) => id,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => {
+                record_error(e);
+                return std::ptr::null_mut();
+            }
         };
         match env.new_string(edge_id.to_string()) {
             Ok(s) => s.into_raw(),
@@ -379,11 +410,17 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphDeleteEdge(
         use nodedb_client::NodeDb;
         let eid: nodedb_types::id::EdgeId = match edge_id.parse() {
             Ok(id) => id,
-            Err(_) => return NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                return NODEDB_ERR_FAILED;
+            }
         };
         match h.rt.block_on(h.db.graph_delete_edge(&collection, &eid)) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -420,7 +457,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphTraverse(
         use nodedb_client::NodeDb;
         let start_id = match nodedb_types::id::NodeId::try_new(start) {
             Ok(id) => id,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => {
+                record_error(e);
+                return std::ptr::null_mut();
+            }
         };
         let subgraph =
             match h
@@ -428,7 +468,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphTraverse(
                 .block_on(h.db.graph_traverse(&collection, &start_id, depth as u8, None))
             {
                 Ok(sg) => sg,
-                Err(_) => return std::ptr::null_mut(),
+                Err(e) => {
+                    record_error(e);
+                    return std::ptr::null_mut();
+                }
             };
 
         let json = serde_json::json!({
@@ -437,6 +480,33 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphTraverse(
         });
         let json_str = serde_json::to_string(&json).unwrap_or_else(|_| "{}".into());
         match env.new_string(&json_str) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Return the message for the most recent failure on this thread, or null when
+/// none is recorded.
+///
+/// Static (Companion) because open failures return no handle, and the error
+/// slot is thread-local rather than per-handle. Read it on the same thread that
+/// made the failing call, before that thread makes another one — the next call
+/// clears the slot.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_00024Companion_nativeLastError(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    // Keep the slot: this reads the error, it does not start an operation.
+    crate::util::ffi_guard_keep_error(std::ptr::null_mut(), || {
+        let Some(msg) = crate::error::last_error_message() else {
+            return std::ptr::null_mut();
+        };
+        match env.new_string(&msg) {
             Ok(s) => s.into_raw(),
             Err(_) => {
                 let _ = env.exception_clear();

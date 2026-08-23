@@ -33,12 +33,24 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
         fun open(path: String, peerId: Long): NodeDbLite {
             val handle = nativeOpen(path, peerId)
             if (handle == 0L) {
-                throw NodeDbException("Failed to open database at $path")
+                throw NodeDbException("Failed to open database at $path${detail()}")
             }
             return NodeDbLite(handle)
         }
 
+        /**
+         * The reason for the most recent failure on this thread, formatted for
+         * appending to an exception message. Empty when nothing was recorded.
+         *
+         * Read it before making another call: the next call clears the slot.
+         */
+        internal fun detail(): String {
+            val msg = nativeLastError()
+            return if (msg.isNullOrEmpty()) "" else ": $msg"
+        }
+
         @JvmStatic private external fun nativeOpen(path: String, peerId: Long): Long
+        @JvmStatic private external fun nativeLastError(): String?
     }
 
     // ── Lifecycle ───────────
@@ -50,7 +62,7 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     fun flush() {
         checkOpen()
         val rc = nativeFlush(handle)
-        if (rc != 0) throw NodeDbException("flush failed: error $rc")
+        if (rc != 0) throw NodeDbException("flush failed: error $rc${detail()}")
     }
 
     /**
@@ -65,7 +77,7 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     fun compact(): Long {
         checkOpen()
         val freed = nativeCompact(handle)
-        if (freed < 0) throw NodeDbException("compact failed")
+        if (freed < 0) throw NodeDbException("compact failed${detail()}")
         return freed
     }
 
@@ -92,7 +104,7 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     fun vectorInsert(collection: String, id: String, embedding: FloatArray) {
         checkOpen()
         val rc = nativeVectorInsert(handle, collection, id, embedding, embedding.size)
-        if (rc != 0) throw NodeDbException("vectorInsert failed: error $rc")
+        if (rc != 0) throw NodeDbException("vectorInsert failed: error $rc${detail()}")
     }
 
     /**
@@ -103,7 +115,7 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     fun vectorSearch(collection: String, query: FloatArray, k: Int): String {
         checkOpen()
         return nativeVectorSearch(handle, collection, query, query.size, k)
-            ?: throw NodeDbException("vectorSearch failed")
+            ?: throw NodeDbException("vectorSearch failed${detail()}")
     }
 
     /**
@@ -112,7 +124,7 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     fun vectorDelete(collection: String, id: String) {
         checkOpen()
         val rc = nativeVectorDelete(handle, collection, id)
-        if (rc != 0) throw NodeDbException("vectorDelete failed: error $rc")
+        if (rc != 0) throw NodeDbException("vectorDelete failed: error $rc${detail()}")
     }
 
     // ── Graph Operations ────
@@ -128,7 +140,7 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     fun graphInsertEdge(collection: String, from: String, to: String, edgeType: String): String {
         checkOpen()
         return nativeGraphInsertEdge(handle, collection, from, to, edgeType)
-            ?: throw NodeDbException("graphInsertEdge failed")
+            ?: throw NodeDbException("graphInsertEdge failed${detail()}")
     }
 
     /**
@@ -140,7 +152,7 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     fun graphDeleteEdge(collection: String, edgeId: String) {
         checkOpen()
         val rc = nativeGraphDeleteEdge(handle, collection, edgeId)
-        if (rc != 0) throw NodeDbException("graphDeleteEdge failed: error $rc")
+        if (rc != 0) throw NodeDbException("graphDeleteEdge failed: error $rc${detail()}")
     }
 
     /**
@@ -151,7 +163,7 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     fun graphTraverse(collection: String, start: String, depth: Int): String {
         checkOpen()
         return nativeGraphTraverse(handle, collection, start, depth)
-            ?: throw NodeDbException("graphTraverse failed")
+            ?: throw NodeDbException("graphTraverse failed${detail()}")
     }
 
     // ── Document Operations ─
@@ -174,7 +186,7 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     fun documentPut(collection: String, jsonBody: String) {
         checkOpen()
         val rc = nativeDocumentPut(handle, collection, jsonBody)
-        if (rc != 0) throw NodeDbException("documentPut failed: error $rc")
+        if (rc != 0) throw NodeDbException("documentPut failed: error $rc${detail()}")
     }
 
     /**
@@ -183,7 +195,7 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     fun documentDelete(collection: String, id: String) {
         checkOpen()
         val rc = nativeDocumentDelete(handle, collection, id)
-        if (rc != 0) throw NodeDbException("documentDelete failed: error $rc")
+        if (rc != 0) throw NodeDbException("documentDelete failed: error $rc${detail()}")
     }
 
     // ── Internal ────────────

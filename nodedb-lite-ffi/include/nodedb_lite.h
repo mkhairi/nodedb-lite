@@ -48,7 +48,7 @@ typedef struct NodeDbNodeDbHandle NodeDbNodeDbHandle;
  * # Safety
  * `handle` may be NULL or any token; it is never dereferenced.
  */
-char *nodedb_last_error(struct NodeDbNodeDbHandle *_handle);
+char *nodedb_last_error(struct NodeDbNodeDbHandle *handle);
 
 /**
  * Create a new ND sparse array.

@@ -53,7 +53,13 @@ pub unsafe extern "C" fn nodedb_generate_id_typed(
         };
         let id = match nodedb_types::id_gen::generate_by_type(id_type_str) {
             Some(id) => id,
-            None => return NODEDB_ERR_FAILED,
+            None => {
+                record_error(format!(
+                    "unknown id type {id_type_str:?}: expected one of \
+                     uuidv7, uuidv4, ulid, cuid2, nanoid"
+                ));
+                return NODEDB_ERR_FAILED;
+            }
         };
         match CString::new(id) {
             Ok(cs) => {
