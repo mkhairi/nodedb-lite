@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use nodedb_physical::physical_plan::VectorOp;
+use nodedb_types::RlsWriteCheck;
 use nodedb_types::SparseVector;
 use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
@@ -19,7 +20,7 @@ use crate::nodedb::lock_ext::LockExt;
 use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
-use super::adapter::LitePhysicalFut;
+use super::adapter::{LitePhysicalFut, deny_policy};
 use super::vector_write::{
     vector_delete_by_id, vector_delete_by_surrogate, vector_direct_upsert, vector_drop_index,
     vector_insert, vector_query_stats, vector_set_params,
@@ -190,16 +191,29 @@ where
             vector,
             quantization,
             storage_dtype,
+            returning,
+            rls_filters,
             ..
-        } => Ok(vector_direct_upsert(
-            engine,
-            collection.as_str().to_string(),
-            field.clone(),
-            surrogate.to_string(),
-            vector.clone(),
-            *quantization,
-            *storage_dtype,
-        )),
+        } => {
+            // DirectUpsert has no rls_write_check slot: admission happens
+            // Control-Plane-side against the payload image, so only returning
+            // and rls_filters can carry a policy here.
+            deny_policy(
+                "VectorOp::DirectUpsert",
+                returning.as_ref(),
+                &[rls_filters.as_slice()],
+                &RlsWriteCheck::NoPolicyApplies,
+            )?;
+            Ok(vector_direct_upsert(
+                engine,
+                collection.as_str().to_string(),
+                field.clone(),
+                surrogate.to_string(),
+                vector.clone(),
+                *quantization,
+                *storage_dtype,
+            ))
+        }
 
         VectorOp::QueryStats {
             collection,
