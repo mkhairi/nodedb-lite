@@ -8,8 +8,8 @@
 use std::os::raw::c_char;
 
 use crate::{
-    NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK, NodeDbHandle, ffi_guard,
-    handle_ref, ptr_to_str,
+    NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK, NodeDbHandle,
+    error::record_error, ffi_guard, handle_ref, ptr_to_str,
 };
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -83,7 +83,10 @@ pub unsafe extern "C" fn ndb_array_create(
 
         match h.rt.block_on(h.db.create_array(name_str, schema)) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -142,7 +145,10 @@ pub unsafe extern "C" fn ndb_array_put_cell(
             valid_until_ms,
         )) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -197,11 +203,17 @@ pub unsafe extern "C" fn ndb_array_slice(
             Ok(cells) => {
                 let encoded = match zerompk::to_msgpack_vec(&cells) {
                     Ok(b) => b,
-                    Err(_) => return NODEDB_ERR_FAILED,
+                    Err(e) => {
+                        record_error(e);
+                        return NODEDB_ERR_FAILED;
+                    }
                 };
                 unsafe { write_msgpack_out(encoded, out_buf, out_len) }
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -260,7 +272,10 @@ pub unsafe extern "C" fn ndb_array_read_coord(
             Ok(Some(cell)) => {
                 let encoded = match zerompk::to_msgpack_vec(&cell) {
                     Ok(b) => b,
-                    Err(_) => return NODEDB_ERR_FAILED,
+                    Err(e) => {
+                        record_error(e);
+                        return NODEDB_ERR_FAILED;
+                    }
                 };
                 unsafe { write_msgpack_out(encoded, out_buf, out_len) }
             }
@@ -271,7 +286,10 @@ pub unsafe extern "C" fn ndb_array_read_coord(
                 }
                 NODEDB_OK
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -313,7 +331,10 @@ pub unsafe extern "C" fn ndb_array_delete_cell(
             .block_on(h.db.array_delete_cell(name_str, coord, system_from_ms))
         {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -358,7 +379,10 @@ pub unsafe extern "C" fn ndb_array_gdpr_erase_cell(
             .block_on(h.db.array_gdpr_erase_cell(name_str, coord, system_from_ms))
         {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }

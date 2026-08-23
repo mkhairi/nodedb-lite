@@ -6,7 +6,7 @@ use nodedb_client::NodeDb;
 
 use crate::{
     NODEDB_ERR_FAILED, NODEDB_ERR_NOT_FOUND, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK,
-    NodeDbHandle, ffi_guard, handle_ref, ptr_to_str, write_c_string,
+    NodeDbHandle, error::record_error, ffi_guard, handle_ref, ptr_to_str, write_c_string,
 };
 
 /// Get a document by ID. Result written as JSON to `out_json`.
@@ -44,7 +44,10 @@ pub unsafe extern "C" fn nodedb_document_get(
                 unsafe { write_c_string(out_json, json_str) }
             }
             Ok(None) => NODEDB_ERR_NOT_FOUND,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -77,7 +80,10 @@ pub unsafe extern "C" fn nodedb_document_put(
 
         let mut doc: nodedb_types::Document = match sonic_rs::from_str(json_str) {
             Ok(d) => d,
-            Err(_) => return NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                return NODEDB_ERR_FAILED;
+            }
         };
 
         if doc.id.is_empty() {
@@ -92,7 +98,10 @@ pub unsafe extern "C" fn nodedb_document_put(
                 }
                 NODEDB_OK
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -119,7 +128,10 @@ pub unsafe extern "C" fn nodedb_document_delete(
         };
         match h.rt.block_on(h.db.document_delete(collection, id)) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -173,7 +185,10 @@ pub unsafe extern "C" fn nodedb_text_search(
                 let json_str = serde_json::to_string(&json_items).unwrap_or_else(|_| "[]".into());
                 unsafe { write_c_string(out_json, json_str) }
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -211,7 +226,10 @@ pub unsafe extern "C" fn nodedb_execute_sql(
                 let json_str = serde_json::to_string(&json).unwrap_or_else(|_| "{}".into());
                 unsafe { write_c_string(out_json, json_str) }
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }

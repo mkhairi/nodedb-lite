@@ -10,6 +10,7 @@
 //! - Returned strings/buffers are Rust-allocated — caller must free via `nodedb_free_*`.
 //! - Error codes: 0 = success, -1 = null pointer, -2 = invalid UTF-8, -3 = operation failed.
 
+pub mod error;
 pub mod ffi_array;
 pub mod ffi_document;
 pub mod ffi_graph;
@@ -25,6 +26,7 @@ pub mod sync;
 pub(crate) mod util;
 pub mod version;
 
+pub use error::*;
 pub use ffi_array::*;
 pub use ffi_document::*;
 pub use ffi_graph::*;
@@ -39,4 +41,4 @@ pub use status::{
 pub use sync::*;
 pub use version::*;
 
-pub(crate) use util::{ffi_guard, handle_ref, ptr_to_str, write_c_string};
+pub(crate) use util::{ffi_guard, ffi_guard_keep_error, handle_ref, ptr_to_str, write_c_string};

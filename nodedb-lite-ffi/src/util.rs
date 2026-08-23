@@ -13,7 +13,21 @@ use crate::status::{NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_OK};
 
 /// Run `f`, catching any panic so it never unwinds across the FFI boundary
 /// (which is UB). On panic, returns `default`.
+///
+/// Also clears the last-error slot first, so a stale error from a previous
+/// call is never attributed to this one; operations record a fresh error via
+/// [`crate::error::record_error`] before returning a non-OK status.
 pub(crate) fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    crate::error::clear_error();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => default,
+    }
+}
+
+/// Like [`ffi_guard`] but does NOT clear the last-error slot — used by
+/// `nodedb_last_error` itself, which must read the slot, not wipe it.
+pub(crate) fn ffi_guard_keep_error<T>(default: T, f: impl FnOnce() -> T) -> T {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(_) => default,

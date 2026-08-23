@@ -6,6 +6,7 @@ use std::os::raw::c_char;
 
 use nodedb_lite::{CorruptionPolicy, LiteConfig, NodeDbLite};
 
+use crate::error::record_error;
 use crate::handle::{NodeDbHandle, OwnedTempDir};
 use crate::handle_registry;
 use crate::status::{NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_OK};
@@ -16,6 +17,8 @@ use crate::util::{ffi_guard, handle_ref, ptr_to_str, resolve_encryption};
 /// Each exported function differs only in the [`LiteConfig`] it builds, so the
 /// runtime setup, `:memory:` handling and handle registration live here once.
 /// Returns NULL on any failure, matching the C convention of the callers.
+/// Every failure records a reason via [`record_error`] so the embedder can
+/// distinguish failure modes via `nodedb_last_error`.
 fn open_handle(
     path: *const c_char,
     passphrase: *const c_char,
@@ -23,13 +26,26 @@ fn open_handle(
 ) -> *mut NodeDbHandle {
     let path = match ptr_to_str(path) {
         Some(s) => s,
-        None => return std::ptr::null_mut(),
+        None => {
+            record_error("path is not valid UTF-8");
+            return std::ptr::null_mut();
+        }
     };
 
     let is_memory = path == ":memory:";
     let enc = match resolve_encryption(passphrase, is_memory) {
         Some(e) => e,
-        None => return std::ptr::null_mut(),
+        None => {
+            if passphrase.is_null() {
+                record_error(
+                    "persistent plaintext storage refused: pass a passphrase or an empty \
+                     string to opt out explicitly",
+                );
+            } else {
+                record_error("passphrase is not valid UTF-8");
+            }
+            return std::ptr::null_mut();
+        }
     };
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -38,7 +54,10 @@ fn open_handle(
         .build()
     {
         Ok(rt) => rt,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => {
+            record_error(format!("failed to build tokio runtime: {e}"));
+            return std::ptr::null_mut();
+        }
     };
 
     let config = build_config();
@@ -46,17 +65,26 @@ fn open_handle(
     let (db, tmpdir) = if is_memory {
         let tmp = match OwnedTempDir::new() {
             Some(t) => t,
-            None => return std::ptr::null_mut(),
+            None => {
+                record_error("failed to create temporary directory for :memory: database");
+                return std::ptr::null_mut();
+            }
         };
         let db = match rt.block_on(NodeDbLite::open_at_path_with_config(&tmp.0, enc, config)) {
             Ok(db) => db,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => {
+                record_error(format!("failed to open in-memory store: {e}"));
+                return std::ptr::null_mut();
+            }
         };
         (db, Some(tmp))
     } else {
         let db = match rt.block_on(NodeDbLite::open_at_path_with_config(path, enc, config)) {
             Ok(db) => db,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => {
+                record_error(format!("failed to open store at {path:?}: {e}"));
+                return std::ptr::null_mut();
+            }
         };
         (db, None)
     };

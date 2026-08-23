@@ -5,6 +5,7 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
 
+use crate::error::record_error;
 use crate::status::{NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK};
 use crate::util::{ffi_guard, ptr_to_str};
 
@@ -24,7 +25,10 @@ pub unsafe extern "C" fn nodedb_generate_id(out: *mut *mut c_char) -> i32 {
                 unsafe { *out = cs.into_raw() };
                 NODEDB_OK
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -56,7 +60,10 @@ pub unsafe extern "C" fn nodedb_generate_id_typed(
                 unsafe { *out = cs.into_raw() };
                 NODEDB_OK
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }

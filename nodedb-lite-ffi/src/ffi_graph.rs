@@ -6,8 +6,8 @@ use std::str::FromStr as _;
 use nodedb_client::NodeDb;
 
 use crate::{
-    NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK, NodeDbHandle, ffi_guard,
-    handle_ref, ptr_to_str, write_c_string,
+    NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK, NodeDbHandle,
+    error::record_error, ffi_guard, handle_ref, ptr_to_str, write_c_string,
 };
 
 /// Insert a directed graph edge into `collection`.
@@ -52,11 +52,17 @@ pub unsafe extern "C" fn nodedb_graph_insert_edge(
 
         let from_id = match nodedb_types::id::NodeId::try_new(from) {
             Ok(id) => id,
-            Err(_) => return NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                return NODEDB_ERR_FAILED;
+            }
         };
         let to_id = match nodedb_types::id::NodeId::try_new(to) {
             Ok(id) => id,
-            Err(_) => return NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                return NODEDB_ERR_FAILED;
+            }
         };
 
         match h
@@ -71,7 +77,10 @@ pub unsafe extern "C" fn nodedb_graph_insert_edge(
                 }
                 NODEDB_OK
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -106,11 +115,17 @@ pub unsafe extern "C" fn nodedb_graph_delete_edge(
 
         let eid = match nodedb_types::id::EdgeId::from_str(edge_id_str) {
             Ok(id) => id,
-            Err(_) => return NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                return NODEDB_ERR_FAILED;
+            }
         };
         match h.rt.block_on(h.db.graph_delete_edge(collection, &eid)) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -145,7 +160,10 @@ pub unsafe extern "C" fn nodedb_graph_traverse(
 
         let start_id = match nodedb_types::id::NodeId::try_new(start) {
             Ok(id) => id,
-            Err(_) => return NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                return NODEDB_ERR_FAILED;
+            }
         };
 
         match h
@@ -167,7 +185,10 @@ pub unsafe extern "C" fn nodedb_graph_traverse(
                 let json_str = serde_json::to_string(&json).unwrap_or_else(|_| "{}".into());
                 unsafe { write_c_string(out_json, json_str) }
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -207,11 +228,17 @@ pub unsafe extern "C" fn nodedb_graph_shortest_path(
 
         let from_id = match nodedb_types::id::NodeId::try_new(from) {
             Ok(id) => id,
-            Err(_) => return NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                return NODEDB_ERR_FAILED;
+            }
         };
         let to_id = match nodedb_types::id::NodeId::try_new(to) {
             Ok(id) => id,
-            Err(_) => return NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                return NODEDB_ERR_FAILED;
+            }
         };
 
         match h
@@ -224,7 +251,10 @@ pub unsafe extern "C" fn nodedb_graph_shortest_path(
                 unsafe { write_c_string(out_json, json_str) }
             }
             Ok(None) => unsafe { write_c_string(out_json, "null".to_string()) },
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }

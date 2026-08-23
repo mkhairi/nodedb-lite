@@ -229,6 +229,39 @@ fn sql_execute_returns_json() {
     }
 }
 
+/// REPLICATE #12: open failures must be distinguishable via nodedb_last_error.
+/// Today nodedb_open returns NULL for every failure mode (wrong passphrase,
+/// corrupt store, bad path) with no error-detail surface at all.
+#[test]
+fn open_failure_records_last_error() {
+    unsafe {
+        // A non-:memory: path with NULL passphrase is refused (persistent
+        // plaintext storage is not allowed) — NULL handle, and the reason
+        // must be retrievable.
+        let path = CString::new("/tmp/nodedb-ffi-no-such-dir-x/store").unwrap();
+        let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+        assert!(handle.is_null());
+
+        let err = nodedb_last_error(handle);
+        assert!(
+            !err.is_null(),
+            "nodedb_last_error must return a reason after open failure"
+        );
+        let msg = CStr::from_ptr(err).to_str().unwrap();
+        assert!(!msg.is_empty());
+        nodedb_free_string(err);
+
+        // The error slot must be cleared after a successful call, so a stale
+        // failure is never attributed to a later successful operation.
+        let mem = CString::new(":memory:").unwrap();
+        let ok_handle = nodedb_open(mem.as_ptr(), std::ptr::null());
+        assert!(!ok_handle.is_null());
+        let err2 = nodedb_last_error(ok_handle);
+        assert!(err2.is_null(), "error slot must be cleared after success");
+        nodedb_close(ok_handle);
+    }
+}
+
 #[test]
 fn free_null_string_is_noop() {
     unsafe {
