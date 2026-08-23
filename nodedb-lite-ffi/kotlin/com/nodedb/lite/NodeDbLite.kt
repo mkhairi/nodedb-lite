@@ -119,11 +119,28 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
 
     /**
      * Insert a directed edge.
+     *
+     * An edge is keyed by `(from, to, edgeType)`. Re-inserting the same triple
+     * returns the same id and creates no second edge.
+     *
+     * @return The created edge id. Pass it to [graphDeleteEdge] to remove the edge.
      */
-    fun graphInsertEdge(from: String, to: String, edgeType: String) {
+    fun graphInsertEdge(collection: String, from: String, to: String, edgeType: String): String {
         checkOpen()
-        val rc = nativeGraphInsertEdge(handle, from, to, edgeType)
-        if (rc != 0) throw NodeDbException("graphInsertEdge failed: error $rc")
+        return nativeGraphInsertEdge(handle, collection, from, to, edgeType)
+            ?: throw NodeDbException("graphInsertEdge failed")
+    }
+
+    /**
+     * Delete a graph edge by the id from [graphInsertEdge].
+     *
+     * Deletion is idempotent: an id naming no live edge succeeds.
+     * A malformed id throws.
+     */
+    fun graphDeleteEdge(collection: String, edgeId: String) {
+        checkOpen()
+        val rc = nativeGraphDeleteEdge(handle, collection, edgeId)
+        if (rc != 0) throw NodeDbException("graphDeleteEdge failed: error $rc")
     }
 
     /**
@@ -131,9 +148,9 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
      *
      * @return JSON string: `{"nodes":[...],"edges":[...]}`
      */
-    fun graphTraverse(start: String, depth: Int): String {
+    fun graphTraverse(collection: String, start: String, depth: Int): String {
         checkOpen()
-        return nativeGraphTraverse(handle, start, depth)
+        return nativeGraphTraverse(handle, collection, start, depth)
             ?: throw NodeDbException("graphTraverse failed")
     }
 
@@ -194,9 +211,14 @@ class NodeDbLite private constructor(private var handle: Long) : Closeable {
     ): String?
     private external fun nativeVectorDelete(handle: Long, collection: String, id: String): Int
     private external fun nativeGraphInsertEdge(
-        handle: Long, from: String, to: String, edgeType: String
+        handle: Long, collection: String, from: String, to: String, edgeType: String
+    ): String?
+    private external fun nativeGraphDeleteEdge(
+        handle: Long, collection: String, edgeId: String
     ): Int
-    private external fun nativeGraphTraverse(handle: Long, start: String, depth: Int): String?
+    private external fun nativeGraphTraverse(
+        handle: Long, collection: String, start: String, depth: Int
+    ): String?
     private external fun nativeDocumentGet(handle: Long, collection: String, id: String): String?
     private external fun nativeDocumentPut(handle: Long, collection: String, jsonBody: String): Int
     private external fun nativeDocumentDelete(handle: Long, collection: String, id: String): Int

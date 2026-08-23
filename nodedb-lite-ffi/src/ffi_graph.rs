@@ -10,16 +10,22 @@ use crate::{
     handle_ref, ptr_to_str, write_c_string,
 };
 
-/// Insert a directed graph edge into `collection`, optionally returning the
-/// created edge id.
+/// Insert a directed graph edge into `collection`.
+///
+/// On success, writes the created edge id to `*out_edge_id` when it is non-null.
+/// The caller frees it via `nodedb_free_string`, and passes it to
+/// `nodedb_graph_delete_edge` to remove the edge.
+///
+/// `*out_edge_id` is written only on success. Initialise it to NULL.
+///
+/// An edge is keyed by `(from, to, edge_type)`. Re-inserting the same triple
+/// returns the same id and creates no second edge.
 ///
 /// # Safety
-/// `handle` must be a valid pointer returned by `nodedb_open`. `collection`,
-/// `from`, `to` and `edge_type` must each be a valid null-terminated UTF-8
-/// string. `out_edge_id` must be NULL or point to writable storage; on success
-/// a caller-owned string is written there (caller frees with
-/// `nodedb_free_string`).
-unsafe fn insert_edge_impl(
+/// All pointer parameters must be valid null-terminated UTF-8. `out_edge_id`
+/// may be null (id not returned).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nodedb_graph_insert_edge(
     handle: *mut NodeDbHandle,
     collection: *const c_char,
     from: *const c_char,
@@ -58,78 +64,26 @@ unsafe fn insert_edge_impl(
             .block_on(h.db.graph_insert_edge(collection, &from_id, &to_id, edge_type, None))
         {
             Ok(edge_id) => {
-                if out_edge_id.is_null() {
-                    // Fire-and-forget: caller does not want the id.
-                    NODEDB_OK
-                } else {
-                    // The id string round-trips through nodedb_graph_delete_edge
-                    // (EdgeId::from_str accepts the Display form).
-                    unsafe { write_c_string(out_edge_id, edge_id.to_string()) }
+                if !out_edge_id.is_null() {
+                    // A write failure is non-fatal: the edge is already inserted,
+                    // and an error return would invite a retry of a done write.
+                    let _ = unsafe { write_c_string(out_edge_id, edge_id.to_string()) };
                 }
+                NODEDB_OK
             }
             Err(_) => NODEDB_ERR_FAILED,
         }
     })
 }
 
-/// Insert a directed graph edge into `collection`, discarding the created id.
-///
-/// Legacy entry point: keeps the original five-argument ABI so binaries
-/// compiled against the old declaration keep working. Use
-/// [`nodedb_graph_insert_edge_with_id`] to receive the created edge id.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `nodedb_open`. `collection`,
-/// `from`, `to` and `edge_type` must each be a valid null-terminated UTF-8
-/// string.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn nodedb_graph_insert_edge(
-    handle: *mut NodeDbHandle,
-    collection: *const c_char,
-    from: *const c_char,
-    to: *const c_char,
-    edge_type: *const c_char,
-) -> i32 {
-    unsafe {
-        insert_edge_impl(
-            handle,
-            collection,
-            from,
-            to,
-            edge_type,
-            std::ptr::null_mut(),
-        )
-    }
-}
-
-/// Insert a directed graph edge into `collection`, writing the created edge id
-/// to `*out_edge_id`.
-///
-/// On success, the created edge id is written to `*out_edge_id` as a string
-/// the caller frees with `nodedb_free_string`. Passing NULL for `out_edge_id`
-/// keeps the fire-and-forget behaviour and still returns `NODEDB_OK`.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `nodedb_open`. `collection`,
-/// `from`, `to` and `edge_type` must each be a valid null-terminated UTF-8
-/// string. `out_edge_id` must be NULL or point to writable storage; it is only
-/// written on success.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn nodedb_graph_insert_edge_with_id(
-    handle: *mut NodeDbHandle,
-    collection: *const c_char,
-    from: *const c_char,
-    to: *const c_char,
-    edge_type: *const c_char,
-    out_edge_id: *mut *mut c_char,
-) -> i32 {
-    unsafe { insert_edge_impl(handle, collection, from, to, edge_type, out_edge_id) }
-}
-
 /// Delete a graph edge by ID from `collection`.
 ///
 /// Edge ID format: length-prefixed form as returned by `graph_insert_edge`
 /// Display (`"{src_len}:{src}|{label_len}:{label}|{dst_len}:{dst}|{seq}"`).
+/// Take the id from `nodedb_graph_insert_edge`, never build the string by hand.
+///
+/// Deletion is idempotent: an id naming no live edge returns `NODEDB_OK`.
+/// A malformed id returns `NODEDB_ERR_FAILED`.
 ///
 /// # Safety
 /// All pointer parameters must be valid null-terminated UTF-8.

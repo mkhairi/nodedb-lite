@@ -270,6 +270,9 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeVectorDelete(
     })
 }
 
+/// Insert a directed edge, return its id as a Java string, null on error.
+///
+/// `nativeGraphDeleteEdge` needs that id. Never discard it.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphInsertEdge(
     mut env: JNIEnv,
@@ -279,6 +282,80 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphInsertEdge(
     from: JString,
     to: JString,
     edge_type: JString,
+) -> jstring {
+    ffi_guard(std::ptr::null_mut(), || {
+        let Some(h) = get_handle(handle) else {
+            return std::ptr::null_mut();
+        };
+        let collection: String = match env.get_string(&collection) {
+            Ok(s) => s.into(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                return std::ptr::null_mut();
+            }
+        };
+        let from: String = match env.get_string(&from) {
+            Ok(s) => s.into(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                return std::ptr::null_mut();
+            }
+        };
+        let to: String = match env.get_string(&to) {
+            Ok(s) => s.into(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                return std::ptr::null_mut();
+            }
+        };
+        let edge_type: String = match env.get_string(&edge_type) {
+            Ok(s) => s.into(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                return std::ptr::null_mut();
+            }
+        };
+
+        use nodedb_client::NodeDb;
+        let from_id = match nodedb_types::id::NodeId::try_new(from) {
+            Ok(id) => id,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let to_id = match nodedb_types::id::NodeId::try_new(to) {
+            Ok(id) => id,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let edge_id = match h.rt.block_on(h.db.graph_insert_edge(
+            &collection,
+            &from_id,
+            &to_id,
+            &edge_type,
+            None,
+        )) {
+            Ok(id) => id,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match env.new_string(edge_id.to_string()) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Delete a graph edge by the id from `nativeGraphInsertEdge`.
+///
+/// Deletion is idempotent: an id naming no live edge returns `NODEDB_OK`.
+/// A malformed id returns `NODEDB_ERR_FAILED`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphDeleteEdge(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    collection: JString,
+    edge_id: JString,
 ) -> jint {
     ffi_guard(NODEDB_ERR_FAILED, || {
         let Some(h) = get_handle(handle) else {
@@ -291,21 +368,7 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphInsertEdge(
                 return NODEDB_ERR_FAILED;
             }
         };
-        let from: String = match env.get_string(&from) {
-            Ok(s) => s.into(),
-            Err(_) => {
-                let _ = env.exception_clear();
-                return NODEDB_ERR_FAILED;
-            }
-        };
-        let to: String = match env.get_string(&to) {
-            Ok(s) => s.into(),
-            Err(_) => {
-                let _ = env.exception_clear();
-                return NODEDB_ERR_FAILED;
-            }
-        };
-        let edge_type: String = match env.get_string(&edge_type) {
+        let edge_id: String = match env.get_string(&edge_id) {
             Ok(s) => s.into(),
             Err(_) => {
                 let _ = env.exception_clear();
@@ -314,19 +377,12 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeGraphInsertEdge(
         };
 
         use nodedb_client::NodeDb;
-        let from_id = match nodedb_types::id::NodeId::try_new(from) {
+        let eid: nodedb_types::id::EdgeId = match edge_id.parse() {
             Ok(id) => id,
             Err(_) => return NODEDB_ERR_FAILED,
         };
-        let to_id = match nodedb_types::id::NodeId::try_new(to) {
-            Ok(id) => id,
-            Err(_) => return NODEDB_ERR_FAILED,
-        };
-        match h
-            .rt
-            .block_on(h.db.graph_insert_edge(&collection, &from_id, &to_id, &edge_type, None))
-        {
-            Ok(_) => NODEDB_OK,
+        match h.rt.block_on(h.db.graph_delete_edge(&collection, &eid)) {
+            Ok(()) => NODEDB_OK,
             Err(_) => NODEDB_ERR_FAILED,
         }
     })
