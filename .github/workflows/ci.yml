@@ -1,10 +1,19 @@
-# CI — the single pull-request entry point. Calls the reusable native and wasm
-# suites so a PR produces one stable set of check names to require in the
-# branch ruleset.
+# CI — the pull-request entry point. Calls the reusable native and wasm suites
+# so a PR produces one stable set of check names.
 #
-# Unlike the Origin workspace, whose suite is a ~10-minute cold compile behind
-# a `run-ci` label, Lite's runs unconditionally on every pull request. Lite is
-# small enough that opting in would only ever be forgotten.
+# Opt-in, matching the Origin workspace: a pull request runs the suites only
+# while it carries the `run-ci` label. Lite builds against the sibling
+# nodedb/pagedb sources at a moving ref, so an unrelated commit landing in the
+# Origin workspace mid-refactor fails `setup-workspace` before a line of Lite
+# compiles. Running that on every push reports upstream breakage as if it were
+# the PR's, and the contributor cannot fix it. Nothing in the `main` ruleset
+# requires these checks, so an unlabelled PR stays mergeable.
+#
+# To run it:
+#   - add the `run-ci` label to the PR (remove + re-add to force a re-run), or
+#   - Actions → CI → Run workflow, against any branch.
+#
+# While the label is on, every subsequent push to the PR re-runs the suites.
 #
 # PRs build against the sibling nodedb/pagedb sources (the `sources` default);
 # the release path passes `registry` instead. See test.yml's header.
@@ -14,7 +23,7 @@ name: CI
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [labeled, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 concurrency:
@@ -25,19 +34,21 @@ permissions:
   contents: read
 
 jobs:
-  # A manual dispatch always runs; a pull request runs unless it is a draft.
-  # The previous `github.event.pull_request.draft == false` also skipped every
-  # workflow_dispatch run, where `github.event.pull_request` is null.
+  # A manual dispatch always runs. A pull request runs only when opted in via
+  # the label, and never while it is a draft. `github.event.pull_request` is
+  # null on a dispatch, so the event check has to come first.
   test:
     name: Test Suite
     if: >-
       github.event_name != 'pull_request' ||
-      github.event.pull_request.draft != true
+      (contains(github.event.pull_request.labels.*.name, 'run-ci') &&
+       github.event.pull_request.draft != true)
     uses: ./.github/workflows/test.yml
 
   wasm:
     name: WASM
     if: >-
       github.event_name != 'pull_request' ||
-      github.event.pull_request.draft != true
+      (contains(github.event.pull_request.labels.*.name, 'run-ci') &&
+       github.event.pull_request.draft != true)
     uses: ./.github/workflows/wasm.yml

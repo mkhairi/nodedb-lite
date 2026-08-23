@@ -2,7 +2,7 @@
 # and a wasm32 build check.
 #
 # Called by:
-#   - ci.yml              (PR checks — runs on every pull request)
+#   - ci.yml              (PR checks — opt-in via the `run-ci` label)
 #   - release-prepare.yml (tag gate)
 #
 # Lite is a separate workspace from Origin and consumes the shared `nodedb-*`
