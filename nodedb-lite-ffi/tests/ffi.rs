@@ -263,6 +263,21 @@ fn open_failure_records_last_error() {
 }
 
 #[test]
+fn open_null_path_records_null_error() {
+    unsafe {
+        // NULL path is a programming error and must not be reported as an
+        // invalid-UTF-8 input error.
+        let handle = nodedb_open(std::ptr::null(), std::ptr::null());
+        assert!(handle.is_null());
+        let err = nodedb_last_error(handle);
+        assert!(!err.is_null());
+        let msg = CStr::from_ptr(err).to_str().unwrap();
+        assert_eq!(msg, "path is NULL");
+        nodedb_free_string(err);
+    }
+}
+
+#[test]
 fn free_null_string_is_noop() {
     unsafe {
         nodedb_free_string(std::ptr::null_mut());

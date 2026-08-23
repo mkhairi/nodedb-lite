@@ -27,7 +27,14 @@ fn open_handle(
     let path = match ptr_to_str(path) {
         Some(s) => s,
         None => {
-            record_error("path is not valid UTF-8");
+            // ptr_to_str returns None for both NULL and non-UTF-8 input;
+            // distinguish them so "programming error" is not reported as
+            // "bad input".
+            if path.is_null() {
+                record_error("path is NULL");
+            } else {
+                record_error("path is not valid UTF-8");
+            }
             return std::ptr::null_mut();
         }
     };
@@ -217,7 +224,10 @@ pub unsafe extern "C" fn nodedb_flush(handle: *mut NodeDbHandle) -> i32 {
         };
         match h.rt.block_on(h.db.flush()) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -258,7 +268,10 @@ pub unsafe extern "C" fn nodedb_compact(
                 }
                 NODEDB_OK
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }

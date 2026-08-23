@@ -10,7 +10,7 @@
 //! - Returned strings/buffers are Rust-allocated — caller must free via `nodedb_free_*`.
 //! - Error codes: 0 = success, -1 = null pointer, -2 = invalid UTF-8, -3 = operation failed.
 
-pub mod error;
+pub(crate) mod error;
 pub mod ffi_array;
 pub mod ffi_document;
 pub mod ffi_graph;

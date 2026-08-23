@@ -28,8 +28,14 @@ thread_local! {
 pub(crate) fn record_error(err: impl Display) {
     let msg = err.to_string();
     // Truncate defensively: error strings must stay small enough for an
-    // embedder to surface in a UI/log line, and interior NULs are rejected.
-    let truncated: String = msg.chars().take(512).collect();
+    // embedder to surface in a UI/log line. Interior NULs are replaced rather
+    // than rejected so a bad message still surfaces (CString would otherwise
+    // reject the whole string and the slot would stay empty).
+    let truncated: String = msg
+        .chars()
+        .take(512)
+        .map(|c| if c == '\0' { '?' } else { c })
+        .collect();
     if let Ok(cs) = CString::new(truncated) {
         LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(cs));
     }
@@ -107,5 +113,16 @@ mod tests {
             drop(CString::from_raw(a));
             drop(CString::from_raw(b));
         }
+    }
+
+    #[test]
+    fn interior_nul_is_replaced_not_dropped() {
+        clear_error();
+        record_error("bad\0nul");
+        let ptr = unsafe { nodedb_last_error(std::ptr::null_mut()) };
+        assert!(!ptr.is_null(), "NUL-containing message must still be recorded");
+        let got = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(got, "bad?nul");
+        unsafe { drop(CString::from_raw(ptr)) };
     }
 }
