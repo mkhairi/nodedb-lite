@@ -175,10 +175,9 @@ pub(super) async fn connect_and_run(
 /// Aborts every child task when dropped — including when the parent future is
 /// cancelled mid-await, which skips the normal cleanup path above.
 ///
-/// Without this, an aborted `connect_and_run` detaches `delta_push_loop` and
+/// Without this, a cancelled `connect_and_run` detaches `delta_push_loop` and
 /// `ping_loop` (their `JoinHandle`s drop), and the children keep polling the
-/// sink and database after the caller considers the sync task quiescent —
-/// exactly the runtime-teardown race #11 guarded against at the FFI boundary.
+/// sink and database after the caller considers the sync task quiescent.
 struct AbortChildrenOnDrop {
     handles: Vec<tokio::task::JoinHandle<()>>,
 }

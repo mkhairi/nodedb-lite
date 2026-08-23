@@ -254,6 +254,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 overlay: HashMap::new(),
             }),
             sync_gate: std::sync::RwLock::new(None),
+            tasks: crate::tasks::TaskRegistry::default(),
         };
 
         // Rebuild text indices from CRDT state only when no checkpoint exists.

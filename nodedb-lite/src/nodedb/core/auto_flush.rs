@@ -39,9 +39,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
     ///
     /// # Task lifecycle
     ///
-    /// The spawned task holds a `Weak` reference to the database. When the
-    /// `Arc<NodeDbLite>` is dropped, the `Weak` upgrade fails and the task
-    /// exits cleanly — no task leak.
+    /// The task is registered with the database's task registry, so
+    /// [`NodeDbLite::shutdown`](crate::NodeDbLite::shutdown) stops it before
+    /// the host drops its async runtime. It also holds a `Weak` reference, so
+    /// a database dropped without a shutdown still ends the loop at its next
+    /// tick rather than keeping the database alive.
     ///
     /// # Disabling
     ///
@@ -54,7 +56,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
         let weak: Weak<Self> = Arc::downgrade(self);
         let period = Duration::from_millis(interval_ms);
 
-        crate::runtime::spawn(async move {
+        let (stop_tx, mut stop) = crate::tasks::TaskRegistry::signal();
+        let handle = crate::runtime::spawn(async move {
             let mut ticker = crate::runtime::interval(period);
             // A flush that outlasts its own period must not be followed by the
             // ticks it missed, back to back. Each pass takes the `crdt` lock,
@@ -68,7 +71,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
             ticker.tick().await;
 
             loop {
-                ticker.tick().await;
+                if !stop.tick_or_stop(&mut ticker).await {
+                    break;
+                }
 
                 let db = match weak.upgrade() {
                     Some(db) => db,
@@ -84,5 +89,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 drop(db);
             }
         });
+        self.tasks
+            .track(crate::tasks::TaskKind::AutoFlush, stop_tx, handle);
     }
 }

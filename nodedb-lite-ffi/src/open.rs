@@ -57,9 +57,9 @@ fn open_handle(
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
-        // #11: the sync connect path runs close to the default 2 MiB worker
-        // stack floor (~20 KiB headroom observed in core dumps); give the
-        // worker real headroom so a deep poll cannot exhaust the stack.
+        // The sync connect path runs close to the default 2 MiB worker stack
+        // floor — core dumps put it ~20 KiB from the end — so a deep poll can
+        // exhaust the stack and fault. Give the worker real headroom.
         .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
@@ -107,7 +107,6 @@ fn open_handle(
         db,
         rt,
         _tmpdir: tmpdir,
-        sync_task: std::sync::Mutex::new(None),
     }) as *mut NodeDbHandle
 }
 
@@ -204,6 +203,9 @@ pub unsafe extern "C" fn nodedb_open_discarding_corrupt_store(
 }
 
 /// Close a NodeDB-Lite database and free the handle.
+///
+/// Blocks until the database's background tasks have stopped, so it can take
+/// up to a few seconds when sync is mid-connect. Call it off the UI thread.
 ///
 /// # Safety
 /// `handle` must be a token returned by `nodedb_open`, or NULL/0 (no-op).

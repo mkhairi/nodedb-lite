@@ -277,19 +277,14 @@ fn open_null_path_records_null_error() {
     }
 }
 
-/// REPLICATE #11: closing a handle with active sync must not crash.
+/// Closing a handle with active sync must not crash.
 ///
-/// Reported: `nodedb_close` during active sync intermittently SIGSEGVs (6-10
-/// of 10 runs on a signal-active host) because the sync task is torn down
-/// with the runtime. The fix retains the sync task in the handle and stops it
-/// (abort + bounded join) before the runtime is dropped. This loop is the
-/// regression guard: before the fix it was a race, after it is deterministic.
+/// A sync task torn down with the runtime crashed the process. Close now
+/// stops the database's tasks first.
 ///
-/// Readiness is made deterministic: sync points at a local TCP listener and
-/// the test waits until the listener accepts a connection, proving the sync
-/// task was actually scheduled and reached the connect path before the
-/// handle is closed — a close that happens before the task is ever polled
-/// would test nothing.
+/// Sync points at a local TCP listener and the test waits for the accept, so
+/// the task has provably reached the connect path before the close. Closing
+/// before the task is ever polled would test nothing.
 #[test]
 fn close_with_active_sync_does_not_crash() {
     unsafe {
@@ -300,8 +295,7 @@ fn close_with_active_sync_does_not_crash() {
 
             // Reachable endpoint: plain TCP listener. The client connects and
             // starts the WebSocket handshake, then stalls waiting for our
-            // (never sent) response — exactly the mid-connect state #11
-            // crashed in.
+            // (never sent) response — the mid-connect state that crashed.
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("ws://{}", listener.local_addr().unwrap());
             let url = CString::new(url).unwrap();
@@ -326,8 +320,9 @@ fn close_with_active_sync_does_not_crash() {
     }
 }
 
-/// REPLICATE #11 (companion): nodedb_stop_sync must quiesce sync on demand
-/// without closing the handle, and a second stop must report no task.
+/// `nodedb_stop_sync` quiesces sync without closing the handle.
+///
+/// A second stop reports no task.
 #[test]
 fn stop_sync_quiesces_and_handle_stays_usable() {
     unsafe {
@@ -354,7 +349,8 @@ fn stop_sync_quiesces_and_handle_stays_usable() {
         let rc = nodedb_document_put(handle, coll.as_ptr(), body.as_ptr(), std::ptr::null_mut());
         assert_eq!(rc, NODEDB_OK);
 
-        nodedb_close(handle);    }
+        nodedb_close(handle);
+    }
 }
 
 /// A second `nodedb_start_sync` on a running handle must be rejected, not
@@ -371,9 +367,15 @@ fn second_start_sync_is_rejected() {
         let rc = nodedb_start_sync(handle, url.as_ptr(), jwt.as_ptr());
         assert_eq!(rc, NODEDB_OK);
 
-        // Second start while the first is still running: rejected.
+        // Second start while the first is still running: rejected, with a
+        // reason the embedder can read.
         let rc = nodedb_start_sync(handle, url.as_ptr(), jwt.as_ptr());
         assert_eq!(rc, NODEDB_ERR_FAILED);
+        let err = nodedb_last_error(handle);
+        assert!(!err.is_null(), "the rejection must record a reason");
+        let msg = CStr::from_ptr(err).to_str().unwrap();
+        assert!(msg.contains("already running"), "unexpected reason: {msg}");
+        nodedb_free_string(err);
 
         // After a stop, starting again succeeds.
         let rc = nodedb_stop_sync(handle);

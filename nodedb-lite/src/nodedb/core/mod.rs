@@ -5,6 +5,7 @@ mod flush;
 mod open;
 mod ops;
 mod rebuild;
+mod shutdown;
 mod sparse_ops;
 mod types;
 

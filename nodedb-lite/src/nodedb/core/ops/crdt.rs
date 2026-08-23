@@ -127,22 +127,52 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
     /// Start background sync to Origin.
     ///
-    /// Spawns a Tokio task that connects to the Origin WebSocket endpoint,
-    /// pushes pending deltas, and receives shape updates. Runs forever
-    /// with auto-reconnect.
+    /// Spawns a task that connects to the Origin WebSocket endpoint, pushes
+    /// pending deltas, and receives shape updates, reconnecting on its own.
     ///
-    /// Returns immediately — the sync runs in the background.
+    /// Returns immediately — the sync runs in the background. Returns `None`
+    /// when sync is already running on this database: a second loop would
+    /// push the same deltas twice, and the first would no longer be the one
+    /// [`stop_sync`](Self::stop_sync) stops.
+    ///
+    /// The task is registered with the database, so `stop_sync` and
+    /// [`shutdown`](Self::shutdown) both stop it.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn start_sync(
         self: &Arc<Self>,
         config: crate::sync::SyncConfig,
-    ) -> Arc<crate::sync::SyncClient> {
+    ) -> Option<Arc<crate::sync::SyncClient>> {
+        if self.tasks.has(crate::tasks::TaskKind::Sync) {
+            return None;
+        }
+
         let client = Arc::new(crate::sync::SyncClient::new(config));
         let delegate: Arc<dyn crate::sync::SyncDelegate> = Arc::clone(self) as _;
         let client_clone = Arc::clone(&client);
-        tokio::spawn(async move {
-            crate::sync::run_sync_loop(client_clone, delegate).await;
+        let (stop_tx, mut stop) = crate::tasks::TaskRegistry::signal();
+        let handle = crate::runtime::spawn(async move {
+            // `run_sync_loop` reconnects forever and has no exit of its own,
+            // so the stop signal is what ends it. Racing the two cancels the
+            // loop at its current await point, which is why the transport
+            // aborts its own children on drop rather than relying on the
+            // normal return path.
+            tokio::select! {
+                _ = crate::sync::run_sync_loop(client_clone, delegate) => {}
+                _ = stop.stopped() => {}
+            }
         });
-        client
+        self.tasks
+            .track(crate::tasks::TaskKind::Sync, stop_tx, handle);
+        Some(client)
+    }
+
+    /// Stop background sync, leaving the database open and usable.
+    ///
+    /// Returns `true` when sync was running. Sync can be restarted afterwards
+    /// with a fresh [`start_sync`](Self::start_sync) — the reconnect-with-a-
+    /// new-token path.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn stop_sync(&self) -> bool {
+        self.tasks.stop(crate::tasks::TaskKind::Sync).await
     }
 }

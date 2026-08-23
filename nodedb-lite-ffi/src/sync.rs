@@ -3,10 +3,10 @@
 //! CRDT sync to an Origin server.
 
 use std::os::raw::c_char;
-use std::sync::Arc;
 
-use nodedb_lite::sync::{SyncClient, SyncConfig, SyncDelegate};
+use nodedb_lite::sync::SyncConfig;
 
+use crate::error::record_error;
 use crate::handle::NodeDbHandle;
 use crate::status::{NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK};
 use crate::util::{ffi_guard, handle_ref, ptr_to_str};
@@ -15,14 +15,13 @@ use crate::util::{ffi_guard, handle_ref, ptr_to_str};
 ///
 /// Connects via WebSocket to the given URL, authenticates with the JWT token,
 /// and continuously pushes pending deltas / receives shape updates.
-/// Runs forever in the background with auto-reconnect.
+/// Reconnects on its own.
 ///
-/// Returns `NODEDB_OK` on successful launch (sync runs asynchronously),
-/// `NODEDB_ERR_FAILED` if a sync task is already running on this handle.
+/// Returns `NODEDB_OK` on successful launch (sync runs asynchronously), or
+/// `NODEDB_ERR_FAILED` when sync is already running on this handle.
 ///
-/// The background task is owned by the handle: `nodedb_close` stops it
-/// deterministically before tearing down the runtime, and `nodedb_stop_sync`
-/// stops it on demand (e.g. reconnect with a new token).
+/// The database owns the task: `nodedb_close` stops it before tearing down
+/// the runtime, and `nodedb_stop_sync` stops it on demand.
 ///
 /// # Safety
 /// `url` and `jwt_token` must be valid null-terminated UTF-8 strings.
@@ -55,24 +54,15 @@ pub unsafe extern "C" fn nodedb_start_sync(
             token_lifetime_secs: 0,
         };
 
-        // Guard the slot: a second start must not silently detach the running
-        // loop (dropping its JoinHandle would orphan it and make it
-        // unstoppable). Reject instead.
-        let mut slot = h.sync_task.lock().unwrap();
-        if slot.is_some() {
+        // start_sync spawns the loop, so it needs a runtime context.
+        let _guard = h.rt.enter();
+        if h.db.start_sync(config).is_none() {
+            record_error(
+                "sync is already running on this handle: stop it with \
+                 nodedb_stop_sync before starting it again",
+            );
             return NODEDB_ERR_FAILED;
         }
-
-        // Spawn the sync loop ourselves (rather than via `start_sync`) so the
-        // JoinHandle is retained in the handle — `nodedb_close` needs it to
-        // stop the task deterministically before the runtime is dropped (#11).
-        let client = Arc::new(SyncClient::new(config));
-        let delegate: Arc<dyn SyncDelegate> = Arc::clone(&h.db) as _;
-        let client_task = Arc::clone(&client);
-        let task = h.rt.spawn(async move {
-            nodedb_lite::sync::run_sync_loop(client_task, delegate).await;
-        });
-        *slot = Some(task);
 
         NODEDB_OK
     })
@@ -80,10 +70,10 @@ pub unsafe extern "C" fn nodedb_start_sync(
 
 /// Stop background sync started by `nodedb_start_sync`.
 ///
-/// Aborts the sync task and waits (bounded) for it to wind down. The database
-/// handle stays open and usable; sync can be restarted with a new call.
+/// The database handle stays open and usable, and sync can be restarted with
+/// a new token. Blocks until the sync task has wound down.
 ///
-/// Returns `NODEDB_OK` if a sync task was running and was stopped,
+/// Returns `NODEDB_OK` if sync was running and was stopped,
 /// `NODEDB_ERR_FAILED` if no sync was active, `NODEDB_ERR_NULL` for a NULL
 /// handle.
 ///
@@ -95,18 +85,10 @@ pub unsafe extern "C" fn nodedb_stop_sync(handle: *mut NodeDbHandle) -> i32 {
         let Some(h) = handle_ref(handle) else {
             return NODEDB_ERR_NULL;
         };
-        let Some(task) = h.sync_task.lock().unwrap().take() else {
+        if !h.rt.block_on(h.db.stop_sync()) {
+            record_error("no sync task is running on this handle");
             return NODEDB_ERR_FAILED;
-        };
-        task.abort();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut task = task;
-        h.rt.block_on(async move {
-            tokio::select! {
-                _ = &mut task => {}
-                _ = tokio::time::sleep_until(deadline) => {}
-            }
-        });
+        }
         NODEDB_OK
     })
 }

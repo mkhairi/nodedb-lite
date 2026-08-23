@@ -158,6 +158,13 @@ pub struct NodeDbLite<S: StorageEngine> {
     /// hosts (e.g. ma8e) to keep confidential entries from leaving the machine.
     /// Set-once-at-startup; read on every write, so `RwLock` keeps reads cheap.
     pub(crate) sync_gate: std::sync::RwLock<Option<std::sync::Arc<dyn SyncGate>>>,
+    /// Background tasks started by this database: auto-flush, auto-compact,
+    /// and the sync loop.
+    ///
+    /// Every long-lived task registers here so [`NodeDbLite::shutdown`] can
+    /// stop it before the host drops its async runtime. A task left detached
+    /// keeps polling through that teardown.
+    pub(crate) tasks: crate::tasks::TaskRegistry,
 }
 
 /// Per-document policy deciding whether a write may leave this node via sync.

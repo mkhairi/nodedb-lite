@@ -43,43 +43,19 @@ impl OwnedTempDir {
 ///
 /// `_tmpdir` is `Some` when the database was opened with the `:memory:` path.
 /// The directory is deleted when the handle is dropped.
-///
-/// `sync_task` holds the background sync loop (if `nodedb_start_sync` was
-/// called). It is aborted and joined before the runtime is dropped — see
-/// `Drop` — so closing a handle with active sync cannot tear the runtime down
-/// under a mid-poll sync task (SIGSEGV, #11). Mutex because handles are shared
-/// behind `Arc` (registry lookups) while start/stop mutate the slot.
 pub struct NodeDbHandle {
     pub(crate) db: Arc<NodeDbLite<PagedbStorageDefault>>,
     pub(crate) rt: tokio::runtime::Runtime,
     pub(crate) _tmpdir: Option<OwnedTempDir>,
-    pub(crate) sync_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
-
-/// How long `Drop` waits for the sync task to wind down after abort.
-pub(crate) const SYNC_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Drop for NodeDbHandle {
     fn drop(&mut self) {
-        // Stop sync deterministically BEFORE the runtime is dropped: the sync
-        // task may be mid-poll (connect/handshake/push) on a worker thread,
-        // and tearing the runtime down under it crashed the process (#11).
-        let task = self.sync_task.lock().unwrap().take();
-        if let Some(task) = task {
-            task.abort();
-            // Bounded wait: abort cancels the task at its next await point.
-            // A connect attempt can take a moment, so cap the wait — the
-            // runtime drop after the deadline is still safe because the
-            // runtime's own shutdown also cancels remaining tasks; the abort
-            // makes cancellation immediate instead of racing teardown.
-            let deadline = tokio::time::Instant::now() + SYNC_STOP_TIMEOUT;
-            let mut task = task;
-            self.rt.block_on(async move {
-                tokio::select! {
-                    _ = &mut task => {}
-                    _ = tokio::time::sleep_until(deadline) => {}
-                }
-            });
-        }
+        // Stop the database's background tasks before the runtime is dropped.
+        // Auto-flush, auto-compact and the sync loop can each be mid-poll on a
+        // worker thread, and a runtime torn down under one of them has crashed
+        // the process. The database decides how its own tasks wind down; this
+        // only has to wait for them.
+        self.rt.block_on(self.db.shutdown());
     }
 }
