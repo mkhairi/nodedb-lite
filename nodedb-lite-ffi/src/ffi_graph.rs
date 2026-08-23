@@ -12,8 +12,18 @@ use crate::{
 
 /// Insert a directed graph edge into `collection`.
 ///
+/// On success, writes the created edge id to `*out_edge_id` when it is non-null.
+/// The caller frees it via `nodedb_free_string`, and passes it to
+/// `nodedb_graph_delete_edge` to remove the edge.
+///
+/// `*out_edge_id` is written only on success. Initialise it to NULL.
+///
+/// An edge is keyed by `(from, to, edge_type)`. Re-inserting the same triple
+/// returns the same id and creates no second edge.
+///
 /// # Safety
-/// All pointer parameters must be valid null-terminated UTF-8.
+/// All pointer parameters must be valid null-terminated UTF-8. `out_edge_id`
+/// may be null (id not returned).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nodedb_graph_insert_edge(
     handle: *mut NodeDbHandle,
@@ -21,6 +31,7 @@ pub unsafe extern "C" fn nodedb_graph_insert_edge(
     from: *const c_char,
     to: *const c_char,
     edge_type: *const c_char,
+    out_edge_id: *mut *mut c_char,
 ) -> i32 {
     ffi_guard(NODEDB_ERR_FAILED, || {
         let Some(h) = handle_ref(handle) else {
@@ -52,7 +63,14 @@ pub unsafe extern "C" fn nodedb_graph_insert_edge(
             .rt
             .block_on(h.db.graph_insert_edge(collection, &from_id, &to_id, edge_type, None))
         {
-            Ok(_) => NODEDB_OK,
+            Ok(edge_id) => {
+                if !out_edge_id.is_null() {
+                    // A write failure is non-fatal: the edge is already inserted,
+                    // and an error return would invite a retry of a done write.
+                    let _ = unsafe { write_c_string(out_edge_id, edge_id.to_string()) };
+                }
+                NODEDB_OK
+            }
             Err(_) => NODEDB_ERR_FAILED,
         }
     })
@@ -62,6 +80,10 @@ pub unsafe extern "C" fn nodedb_graph_insert_edge(
 ///
 /// Edge ID format: length-prefixed form as returned by `graph_insert_edge`
 /// Display (`"{src_len}:{src}|{label_len}:{label}|{dst_len}:{dst}|{seq}"`).
+/// Take the id from `nodedb_graph_insert_edge`, never build the string by hand.
+///
+/// Deletion is idempotent: an id naming no live edge returns `NODEDB_OK`.
+/// A malformed id returns `NODEDB_ERR_FAILED`.
 ///
 /// # Safety
 /// All pointer parameters must be valid null-terminated UTF-8.

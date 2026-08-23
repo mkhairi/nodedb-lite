@@ -72,6 +72,7 @@ fn graph_insert_and_traverse() {
             from.as_ptr(),
             to.as_ptr(),
             label.as_ptr(),
+            std::ptr::null_mut(),
         );
         assert_eq!(rc, NODEDB_OK);
 
@@ -86,6 +87,91 @@ fn graph_insert_and_traverse() {
         nodedb_free_string(out);
 
         nodedb_close(handle);
+    }
+}
+
+/// The id returned by `nodedb_graph_insert_edge` must delete that exact edge.
+///
+/// Deletion is idempotent, so `NODEDB_OK` proves nothing. Traversal decides.
+#[test]
+fn graph_insert_edge_returns_id_that_deletes_that_edge() {
+    let path = CString::new(":memory:").unwrap();
+    unsafe {
+        let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+        assert!(!handle.is_null());
+
+        let collection = CString::new("social").unwrap();
+        let from = CString::new("alice").unwrap();
+        let to = CString::new("bob").unwrap();
+        let label = CString::new("KNOWS").unwrap();
+
+        let mut edge_id: *mut c_char = std::ptr::null_mut();
+        let rc = nodedb_graph_insert_edge(
+            handle,
+            collection.as_ptr(),
+            from.as_ptr(),
+            to.as_ptr(),
+            label.as_ptr(),
+            &mut edge_id,
+        );
+        assert_eq!(rc, NODEDB_OK);
+        assert!(!edge_id.is_null(), "edge id must be returned");
+
+        // Length-prefixed form: "{src_len}:{src}|{label_len}:{label}|{dst_len}:{dst}|{seq}".
+        let edge_id_str = CStr::from_ptr(edge_id).to_str().unwrap();
+        assert_eq!(edge_id_str, "5:alice|5:KNOWS|3:bob|0");
+
+        // A well-formed id for another edge must not touch this one.
+        let other_id = CString::new("5:alice|5:KNOWS|5:carol|0").unwrap();
+        let rc = nodedb_graph_delete_edge(handle, collection.as_ptr(), other_id.as_ptr());
+        assert_eq!(rc, NODEDB_OK, "deleting an absent edge is idempotent");
+        assert!(
+            graph_traverse_json(handle, &collection, &from).contains("bob"),
+            "alice -KNOWS-> bob must survive an unrelated delete"
+        );
+
+        let rc = nodedb_graph_delete_edge(handle, collection.as_ptr(), edge_id);
+        assert_eq!(rc, NODEDB_OK);
+        assert!(
+            !graph_traverse_json(handle, &collection, &from).contains("bob"),
+            "alice -KNOWS-> bob must be gone after deleting its id"
+        );
+
+        nodedb_free_string(edge_id);
+        nodedb_close(handle);
+    }
+}
+
+/// A malformed edge id must report an error, never silent success.
+#[test]
+fn graph_delete_edge_rejects_malformed_id() {
+    let path = CString::new(":memory:").unwrap();
+    unsafe {
+        let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+        let collection = CString::new("social").unwrap();
+        let bogus = CString::new("not-an-edge-id").unwrap();
+        assert_eq!(
+            nodedb_graph_delete_edge(handle, collection.as_ptr(), bogus.as_ptr()),
+            NODEDB_ERR_FAILED
+        );
+        nodedb_close(handle);
+    }
+}
+
+/// Traverse depth 2 from `start`, return the JSON body.
+unsafe fn graph_traverse_json(
+    handle: *mut NodeDbHandle,
+    collection: &CString,
+    start: &CString,
+) -> String {
+    unsafe {
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let rc = nodedb_graph_traverse(handle, collection.as_ptr(), start.as_ptr(), 2, &mut out);
+        assert_eq!(rc, NODEDB_OK);
+        assert!(!out.is_null());
+        let json = CStr::from_ptr(out).to_str().unwrap().to_string();
+        nodedb_free_string(out);
+        json
     }
 }
 

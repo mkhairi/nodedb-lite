@@ -215,20 +215,35 @@ int32_t nodedb_execute_sql(struct NodeDbNodeDbHandle *handle, const char *sql, c
 /**
  * Insert a directed graph edge into `collection`.
  *
+ * On success, writes the created edge id to `*out_edge_id` when it is non-null.
+ * The caller frees it via `nodedb_free_string`, and passes it to
+ * `nodedb_graph_delete_edge` to remove the edge.
+ *
+ * `*out_edge_id` is written only on success. Initialise it to NULL.
+ *
+ * An edge is keyed by `(from, to, edge_type)`. Re-inserting the same triple
+ * returns the same id and creates no second edge.
+ *
  * # Safety
- * All pointer parameters must be valid null-terminated UTF-8.
+ * All pointer parameters must be valid null-terminated UTF-8. `out_edge_id`
+ * may be null (id not returned).
  */
 int32_t nodedb_graph_insert_edge(struct NodeDbNodeDbHandle *handle,
                                  const char *collection,
                                  const char *from,
                                  const char *to,
-                                 const char *edge_type);
+                                 const char *edge_type,
+                                 char **out_edge_id);
 
 /**
  * Delete a graph edge by ID from `collection`.
  *
  * Edge ID format: length-prefixed form as returned by `graph_insert_edge`
  * Display (`"{src_len}:{src}|{label_len}:{label}|{dst_len}:{dst}|{seq}"`).
+ * Take the id from `nodedb_graph_insert_edge`, never build the string by hand.
+ *
+ * Deletion is idempotent: an id naming no live edge returns `NODEDB_OK`.
+ * A malformed id returns `NODEDB_ERR_FAILED`.
  *
  * # Safety
  * All pointer parameters must be valid null-terminated UTF-8.
