@@ -213,21 +213,43 @@ int32_t nodedb_text_search(struct NodeDbNodeDbHandle *handle,
 int32_t nodedb_execute_sql(struct NodeDbNodeDbHandle *handle, const char *sql, char **out_json);
 
 /**
- * Insert a directed graph edge into `collection`.
+ * Insert a directed graph edge into `collection`, discarding the created id.
  *
- * On success, the created edge id is written to `*out_edge_id` (caller frees
- * with `nodedb_free_string`). Passing NULL for `out_edge_id` keeps the old
- * fire-and-forget behaviour and still returns `NODEDB_OK`.
+ * Legacy entry point: keeps the original five-argument ABI so binaries
+ * compiled against the old declaration keep working. Use
+ * [`nodedb_graph_insert_edge_with_id`] to receive the created edge id.
  *
  * # Safety
- * All pointer parameters must be valid null-terminated UTF-8.
+ * `handle` must be a valid pointer returned by `nodedb_open`. `collection`,
+ * `from`, `to` and `edge_type` must each be a valid null-terminated UTF-8
+ * string.
  */
 int32_t nodedb_graph_insert_edge(struct NodeDbNodeDbHandle *handle,
                                  const char *collection,
                                  const char *from,
                                  const char *to,
-                                 const char *edge_type,
-                                 char **out_edge_id);
+                                 const char *edge_type);
+
+/**
+ * Insert a directed graph edge into `collection`, writing the created edge id
+ * to `*out_edge_id`.
+ *
+ * On success, the created edge id is written to `*out_edge_id` as a string
+ * the caller frees with `nodedb_free_string`. Passing NULL for `out_edge_id`
+ * keeps the fire-and-forget behaviour and still returns `NODEDB_OK`.
+ *
+ * # Safety
+ * `handle` must be a valid pointer returned by `nodedb_open`. `collection`,
+ * `from`, `to` and `edge_type` must each be a valid null-terminated UTF-8
+ * string. `out_edge_id` must be NULL or point to writable storage; it is only
+ * written on success.
+ */
+int32_t nodedb_graph_insert_edge_with_id(struct NodeDbNodeDbHandle *handle,
+                                         const char *collection,
+                                         const char *from,
+                                         const char *to,
+                                         const char *edge_type,
+                                         char **out_edge_id);
 
 /**
  * Delete a graph edge by ID from `collection`.

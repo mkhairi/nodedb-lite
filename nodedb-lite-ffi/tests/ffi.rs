@@ -72,7 +72,6 @@ fn graph_insert_and_traverse() {
             from.as_ptr(),
             to.as_ptr(),
             label.as_ptr(),
-            std::ptr::null_mut(),
         );
         assert_eq!(rc, NODEDB_OK);
 
@@ -90,9 +89,9 @@ fn graph_insert_and_traverse() {
     }
 }
 
-/// REPLICATE #14: `nodedb_graph_insert_edge` must return the created edge id
-/// so the caller can pass it to `nodedb_graph_delete_edge`. Today the id is
-/// discarded (`Ok(_) => NODEDB_OK`), making insert-then-delete impossible.
+/// REPLICATE #14: the created edge id must be returned so the caller can pass
+/// it to `nodedb_graph_delete_edge`. The five-argument entry point historically
+/// discarded the id; `nodedb_graph_insert_edge_with_id` returns it.
 #[test]
 fn graph_insert_edge_returns_id_for_delete() {
     let path = CString::new(":memory:").unwrap();
@@ -106,7 +105,7 @@ fn graph_insert_edge_returns_id_for_delete() {
         let label = CString::new("KNOWS").unwrap();
 
         let mut edge_id: *mut c_char = std::ptr::null_mut();
-        let rc = nodedb_graph_insert_edge(
+        let rc = nodedb_graph_insert_edge_with_id(
             handle,
             collection.as_ptr(),
             from.as_ptr(),
