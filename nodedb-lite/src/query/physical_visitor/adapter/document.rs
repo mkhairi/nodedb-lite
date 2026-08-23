@@ -327,5 +327,19 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                 document_ops::sets::materialize_scan(engine, &col, &cursor, count).await
             }))
         }
+
+        // A materialized-sum binding splits its write across the source row and
+        // the target balance, which Origin homes on separate vShards and commits
+        // through Calvin. Lite has no binding maintenance, so a plan carrying
+        // this op would apply the source write and silently lose the balance.
+        DocumentOp::ApplyBalanceDelta {
+            collection, column, ..
+        } => Err(LiteError::Unsupported {
+            detail: format!(
+                "ApplyBalanceDelta on {collection}.{column}: materialized-sum \
+                 bindings are maintained by the Origin data plane and are \
+                 unsupported on the Lite engine"
+            ),
+        }),
     }
 }

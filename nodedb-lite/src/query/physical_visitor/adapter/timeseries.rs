@@ -9,6 +9,7 @@ use crate::query::timeseries_ops;
 use crate::storage::engine::StorageEngine;
 
 use super::LitePhysicalFut;
+use super::policy::deny_policy;
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
@@ -99,7 +100,15 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             wal_lsn,
             surrogates,
             provenance: _,
+            rls_write_check,
+            returning,
+            rls_filters,
         } => {
+            deny_policy(
+                "TimeseriesOp::Ingest",
+                returning.as_ref(),
+                &[rls_filters.as_slice(), rls_write_check.as_slice()],
+            )?;
             let col = collection.clone();
             let pay = payload.clone();
             let fmt = format.clone();

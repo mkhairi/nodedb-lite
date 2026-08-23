@@ -187,6 +187,11 @@ pub(super) fn lower_timeseries_ingest<'a, S: StorageEngine + 'a>(
         wal_lsn: None,
         surrogates: Vec::new(),
         provenance: None,
+        // Lite's planner produces no RLS program and no RETURNING projection;
+        // the adapter rejects either if one ever appears.
+        rls_write_check: Vec::new(),
+        returning: None,
+        rls_filters: Vec::new(),
     };
 
     let mut phys = LiteDataPlaneVisitor { engine };

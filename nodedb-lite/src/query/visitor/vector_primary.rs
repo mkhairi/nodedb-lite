@@ -86,6 +86,10 @@ pub(super) fn lower_vector_primary_insert<'a, S: StorageEngine + 'a>(
                 quantization,
                 storage_dtype,
                 payload_indexes: payload_indexes.clone(),
+                // Lite's planner produces no RLS program and no RETURNING
+                // projection; the adapter rejects either if one ever appears.
+                returning: None,
+                rls_filters: Vec::new(),
             };
             let mut phys = LiteDataPlaneVisitor { engine };
             let fut = phys.vector(&op)?;

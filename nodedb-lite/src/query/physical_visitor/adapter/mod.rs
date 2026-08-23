@@ -36,6 +36,7 @@ mod graph;
 mod graph_resolve;
 mod kv;
 mod meta;
+mod policy;
 mod query;
 mod spatial;
 mod timeseries;

@@ -9,6 +9,7 @@ use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
 use super::LitePhysicalFut;
+use super::policy::deny_policy;
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
@@ -80,7 +81,15 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             schema_bytes,
             wal_lsn: _,
             provenance: _,
+            rls_write_check,
+            returning,
+            rls_filters,
         } => {
+            deny_policy(
+                "ColumnarOp::Insert",
+                returning.as_ref(),
+                &[rls_filters.as_slice(), rls_write_check.as_slice()],
+            )?;
             let col = collection.clone();
             let pay = payload.clone();
             let fmt = format.clone();
@@ -120,7 +129,9 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             collection,
             filters,
             updates,
+            rls_write_check,
         } => {
+            deny_policy("ColumnarOp::Update", None, &[rls_write_check.as_slice()])?;
             let col = collection.clone();
             let filt = filters.clone();
             let upd = updates.clone();
@@ -132,7 +143,9 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         ColumnarOp::Delete {
             collection,
             filters,
+            rls_write_check,
         } => {
+            deny_policy("ColumnarOp::Delete", None, &[rls_write_check.as_slice()])?;
             let col = collection.clone();
             let filt = filters.clone();
             Ok(Box::pin(async move {

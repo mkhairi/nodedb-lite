@@ -116,6 +116,8 @@ pub(super) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
                 value,
                 ttl_ms,
                 surrogate: Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             },
             KvInsertIntent::InsertIfAbsent => KvOp::InsertIfAbsent {
                 collection: collection.clone(),
@@ -123,6 +125,8 @@ pub(super) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
                 value,
                 ttl_ms,
                 surrogate: Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             },
             KvInsertIntent::Put if !updates.is_empty() => KvOp::InsertOnConflictUpdate {
                 collection: collection.clone(),
@@ -131,6 +135,9 @@ pub(super) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
                 ttl_ms,
                 updates,
                 surrogate: Surrogate::ZERO,
+                rls_write_check: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
             },
             KvInsertIntent::Put => KvOp::Put {
                 collection: collection.clone(),
@@ -138,6 +145,8 @@ pub(super) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
                 value,
                 ttl_ms,
                 surrogate: Surrogate::ZERO,
+                returning: None,
+                rls_filters: Vec::new(),
             },
         };
         ops.push(op);
