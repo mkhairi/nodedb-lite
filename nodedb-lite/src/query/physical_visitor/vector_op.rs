@@ -19,7 +19,7 @@ use crate::nodedb::lock_ext::LockExt;
 use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
-use super::adapter::LitePhysicalFut;
+use super::adapter::{LitePhysicalFut, deny_policy};
 use super::vector_write::{
     vector_delete_by_id, vector_delete_by_surrogate, vector_direct_upsert, vector_drop_index,
     vector_insert, vector_query_stats, vector_set_params,
@@ -186,16 +186,25 @@ where
             vector,
             quantization,
             storage_dtype,
+            rls_filters,
+            returning,
             ..
-        } => Ok(vector_direct_upsert(
-            engine,
-            collection.clone(),
-            field.clone(),
-            surrogate.to_string(),
-            vector.clone(),
-            *quantization,
-            *storage_dtype,
-        )),
+        } => {
+            deny_policy(
+                "VectorOp::DirectUpsert",
+                returning.as_ref(),
+                &[rls_filters.as_slice()],
+            )?;
+            Ok(vector_direct_upsert(
+                engine,
+                collection.clone(),
+                field.clone(),
+                surrogate.to_string(),
+                vector.clone(),
+                *quantization,
+                *storage_dtype,
+            ))
+        }
 
         VectorOp::QueryStats {
             collection,

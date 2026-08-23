@@ -9,6 +9,7 @@ use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
 use super::LitePhysicalFut;
+use super::policy::deny_policy;
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
@@ -219,8 +220,10 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             fields_json,
             partial,
             returning,
+            rls_filters,
             ..
         } => {
+            deny_policy("CrdtOp::DocUpsert", None, &[rls_filters.as_slice()])?;
             let col = collection.clone();
             let doc_id = document_id.clone();
             let fields = fields_json.clone();
@@ -243,8 +246,10 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             collection,
             document_id,
             returning,
+            rls_filters,
             ..
         } => {
+            deny_policy("CrdtOp::DocDelete", None, &[rls_filters.as_slice()])?;
             let col = collection.clone();
             let doc_id = document_id.clone();
             let returning = returning.clone();

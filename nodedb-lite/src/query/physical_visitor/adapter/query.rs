@@ -27,6 +27,7 @@ use crate::query::query_ops::{
 use crate::storage::engine::StorageEngine;
 
 use super::LitePhysicalFut;
+use super::policy::deny_policy;
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
@@ -96,8 +97,15 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             post_aggregates,
             projection,
             post_filters,
+            left_rls_filters,
+            right_rls_filters,
             ..
         } => {
+            deny_policy(
+                "QueryOp::HashJoin",
+                None,
+                &[left_rls_filters.as_slice(), right_rls_filters.as_slice()],
+            )?;
             let lc = left_collection.clone();
             let rc = right_collection.clone();
             let la = left_alias.clone();

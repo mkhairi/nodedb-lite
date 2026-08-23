@@ -51,6 +51,8 @@ pub(crate) type LitePhysicalFut<'a> =
 pub(crate) type LitePhysicalFut<'a> =
     Pin<Box<dyn Future<Output = Result<QueryResult, LiteError>> + 'a>>;
 
+pub(crate) use policy::deny_policy;
+
 pub(crate) struct LiteDataPlaneVisitor<'a, S: StorageEngine> {
     pub(crate) engine: &'a LiteQueryEngine<S>,
 }

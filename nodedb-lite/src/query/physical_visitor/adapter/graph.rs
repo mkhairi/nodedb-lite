@@ -23,6 +23,7 @@ use crate::query::graph_ops::{
 use crate::storage::engine::StorageEngine;
 
 use super::graph_resolve::resolve_collection_for_nodes;
+use super::policy::deny_policy;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) type GraphFut<'a> =
@@ -78,8 +79,10 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             src_id,
             label,
             dst_id,
+            rls_write_check,
             ..
         } => {
+            deny_policy("GraphOp::EdgeDelete", None, &[rls_write_check.as_slice()])?;
             let storage = engine.storage.clone();
             let csr_map = engine.csr.clone();
             let collection = collection.clone();
@@ -107,8 +110,10 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             depth,
             options,
             frontier_bitmap,
+            rls_filters,
             ..
         } => {
+            deny_policy("GraphOp::Hop", None, &[rls_filters.as_slice()])?;
             let csr_map = engine.csr.clone();
             // Hop is scoped to a single collection; collection is implicit in Lite
             // as all edges share the same CSR map keyed by collection. The caller
@@ -147,8 +152,10 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             node_id,
             edge_label,
             direction,
+            rls_filters,
             ..
         } => {
+            deny_policy("GraphOp::Neighbors", None, &[rls_filters.as_slice()])?;
             let csr_map = engine.csr.clone();
             let node_id = node_id.clone();
             let edge_label = edge_label.clone();
@@ -171,8 +178,10 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             edge_label,
             direction,
             max_results,
+            rls_filters,
             ..
         } => {
+            deny_policy("GraphOp::NeighborsMulti", None, &[rls_filters.as_slice()])?;
             let csr_map = engine.csr.clone();
             let node_ids = node_ids.clone();
             let edge_label = edge_label.clone();
@@ -198,8 +207,10 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             max_depth,
             options,
             frontier_bitmap,
+            rls_filters,
             ..
         } => {
+            deny_policy("GraphOp::Path", None, &[rls_filters.as_slice()])?;
             let csr_map = engine.csr.clone();
             let src = src.clone();
             let dst = dst.clone();
@@ -228,8 +239,10 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             edge_label,
             depth,
             options,
+            rls_filters,
             ..
         } => {
+            deny_policy("GraphOp::Subgraph", None, &[rls_filters.as_slice()])?;
             let csr_map = engine.csr.clone();
             let start_nodes = start_nodes.clone();
             let edge_label = edge_label.clone();
@@ -285,8 +298,14 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             direction,
             system_time,
             valid_at_ms,
+            rls_filters,
             ..
         } => {
+            deny_policy(
+                "GraphOp::TemporalNeighbors",
+                None,
+                &[rls_filters.as_slice()],
+            )?;
             use nodedb_types::SystemTimeScope;
             // Mirror Origin: AllVersions is not supported on the graph engine.
             if system_time.is_all_versions() {

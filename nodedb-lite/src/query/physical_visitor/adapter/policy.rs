@@ -15,7 +15,7 @@ use crate::error::LiteError;
 /// `rls` holds every RLS program on the op: read filters and write checks
 /// alike. `op` names the variant, so the message points at the statement that
 /// produced it.
-pub(super) fn deny_policy(
+pub(crate) fn deny_policy(
     op: &str,
     returning: Option<&ReturningSpec>,
     rls: &[&[u8]],
