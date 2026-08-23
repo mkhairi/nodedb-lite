@@ -13,6 +13,7 @@ use jni::sys::{jint, jlong, jstring};
 
 use super::super::{NODEDB_ERR_FAILED, NODEDB_OK, ffi_guard};
 use super::core::get_handle;
+use crate::error::record_error;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeDocumentGet(
@@ -88,7 +89,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeDocumentPut(
 
         let mut doc: nodedb_types::Document = match sonic_rs::from_str(&json_str) {
             Ok(d) => d,
-            Err(_) => return NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                return NODEDB_ERR_FAILED;
+            }
         };
 
         if doc.id.is_empty() {
@@ -98,7 +102,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeDocumentPut(
         use nodedb_client::NodeDb;
         match h.rt.block_on(h.db.document_put(&collection, doc)) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -132,7 +139,10 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_nativeDocumentDelete(
         use nodedb_client::NodeDb;
         match h.rt.block_on(h.db.document_delete(&collection, &id)) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -174,7 +184,13 @@ pub extern "system" fn Java_com_nodedb_lite_NodeDbLite_00024Companion_nativeGene
         };
         let id = match nodedb_types::id_gen::generate_by_type(&id_type_str) {
             Some(id) => id,
-            None => return std::ptr::null_mut(),
+            None => {
+                record_error(format!(
+                    "unknown id type {id_type_str:?}: expected one of \
+                     uuidv7, uuidv4, ulid, cuid2, nanoid"
+                ));
+                return std::ptr::null_mut();
+            }
         };
         match env.new_string(&id) {
             Ok(s) => s.into_raw(),

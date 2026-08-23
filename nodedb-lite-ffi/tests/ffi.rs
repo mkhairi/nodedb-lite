@@ -229,6 +229,54 @@ fn sql_execute_returns_json() {
     }
 }
 
+/// A failed open records a reason; a successful one leaves no stale reason.
+///
+/// `nodedb_open` returns NULL for every failure mode, so the message is the
+/// only way an embedder tells "wrong passphrase" from "corrupt store".
+#[test]
+fn open_failure_records_last_error() {
+    unsafe {
+        // A persistent path with a NULL passphrase is refused: silent plaintext
+        // storage is not allowed. The refusal must name itself.
+        let path = CString::new("/tmp/nodedb-ffi-no-such-dir-x/store").unwrap();
+        let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+        assert!(handle.is_null());
+
+        let err = nodedb_last_error(handle);
+        assert!(
+            !err.is_null(),
+            "nodedb_last_error must return a reason after open failure"
+        );
+        let msg = CStr::from_ptr(err).to_str().unwrap();
+        assert!(!msg.is_empty());
+        nodedb_free_string(err);
+
+        // The error slot must be cleared after a successful call, so a stale
+        // failure is never attributed to a later successful operation.
+        let mem = CString::new(":memory:").unwrap();
+        let ok_handle = nodedb_open(mem.as_ptr(), std::ptr::null());
+        assert!(!ok_handle.is_null());
+        let err2 = nodedb_last_error(ok_handle);
+        assert!(err2.is_null(), "error slot must be cleared after success");
+        nodedb_close(ok_handle);
+    }
+}
+
+#[test]
+fn open_null_path_records_null_error() {
+    unsafe {
+        // NULL path is a programming error and must not be reported as an
+        // invalid-UTF-8 input error.
+        let handle = nodedb_open(std::ptr::null(), std::ptr::null());
+        assert!(handle.is_null());
+        let err = nodedb_last_error(handle);
+        assert!(!err.is_null());
+        let msg = CStr::from_ptr(err).to_str().unwrap();
+        assert_eq!(msg, "path is NULL");
+        nodedb_free_string(err);
+    }
+}
+
 #[test]
 fn free_null_string_is_noop() {
     unsafe {
@@ -261,4 +309,49 @@ fn version_export_exists() {
 fn abi_version_export_exists() {
     let abi = nodedb_abi_version();
     assert!(abi > 0, "nodedb_abi_version must be a positive integer");
+}
+
+/// An operational failure records the engine's reason, not just `-3`.
+#[test]
+fn operation_failure_records_last_error() {
+    let path = CString::new(":memory:").unwrap();
+    unsafe {
+        let handle = nodedb_open(path.as_ptr(), std::ptr::null());
+        assert!(!handle.is_null());
+
+        let coll = CString::new("notes").unwrap();
+        let body = CString::new("{ this is not json }").unwrap();
+        let rc = nodedb_document_put(handle, coll.as_ptr(), body.as_ptr(), std::ptr::null_mut());
+        assert_eq!(rc, NODEDB_ERR_FAILED);
+
+        let err = nodedb_last_error(handle);
+        assert!(!err.is_null(), "a failed put must record its reason");
+        let msg = CStr::from_ptr(err).to_str().unwrap();
+        assert!(!msg.is_empty(), "reason must not be empty");
+        nodedb_free_string(err);
+
+        nodedb_close(handle);
+    }
+}
+
+/// An argument rejected before the engine runs names the argument.
+#[test]
+fn unknown_id_type_records_last_error() {
+    unsafe {
+        let id_type = CString::new("uuidv9").unwrap();
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(
+            nodedb_generate_id_typed(id_type.as_ptr(), &mut out),
+            NODEDB_ERR_FAILED
+        );
+
+        let err = nodedb_last_error(std::ptr::null_mut());
+        assert!(!err.is_null());
+        let msg = CStr::from_ptr(err).to_str().unwrap();
+        assert!(
+            msg.contains("uuidv9") && msg.contains("uuidv7"),
+            "message must name the rejected type and the supported set, got: {msg}"
+        );
+        nodedb_free_string(err);
+    }
 }

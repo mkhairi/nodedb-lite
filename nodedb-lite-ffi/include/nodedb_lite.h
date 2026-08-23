@@ -35,6 +35,22 @@
 typedef struct NodeDbNodeDbHandle NodeDbNodeDbHandle;
 
 /**
+ * Return the most recent error message on this thread as a C string the
+ * caller frees with `nodedb_free_string`, or NULL when no error is recorded.
+ *
+ * The returned string is a copy owned by the caller — the thread-local slot
+ * can be overwritten by later calls without dangling the pointer.
+ *
+ * `handle` may be NULL or a handle from a failed `nodedb_open` (open failures
+ * happen before a valid handle exists); the error slot is thread-local, so it
+ * is ignored.
+ *
+ * # Safety
+ * `handle` may be NULL or any token; it is never dereferenced.
+ */
+char *nodedb_last_error(struct NodeDbNodeDbHandle *handle);
+
+/**
  * Create a new ND sparse array.
  *
  * `schema_msgpack` — zerompk-encoded `ArraySchema`.

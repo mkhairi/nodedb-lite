@@ -5,8 +5,8 @@ use std::os::raw::c_char;
 use nodedb_client::NodeDb;
 
 use crate::{
-    NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK, NodeDbHandle, ffi_guard,
-    handle_ref, ptr_to_str, write_c_string,
+    NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK, NodeDbHandle,
+    error::record_error, ffi_guard, handle_ref, ptr_to_str, write_c_string,
 };
 
 /// Insert a vector into a collection.
@@ -41,7 +41,10 @@ pub unsafe extern "C" fn nodedb_vector_insert(
 
         match h.rt.block_on(h.db.vector_insert(collection, id, emb, None)) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -88,7 +91,10 @@ pub unsafe extern "C" fn nodedb_vector_search(
                 let json_str = serde_json::to_string(&json_items).unwrap_or_else(|_| "[]".into());
                 unsafe { write_c_string(out_json, json_str) }
             }
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }
@@ -115,7 +121,10 @@ pub unsafe extern "C" fn nodedb_vector_delete(
         };
         match h.rt.block_on(h.db.vector_delete(collection, id)) {
             Ok(()) => NODEDB_OK,
-            Err(_) => NODEDB_ERR_FAILED,
+            Err(e) => {
+                record_error(e);
+                NODEDB_ERR_FAILED
+            }
         }
     })
 }

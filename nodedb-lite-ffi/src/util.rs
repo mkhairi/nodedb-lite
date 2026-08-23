@@ -12,8 +12,43 @@ use crate::handle_registry;
 use crate::status::{NODEDB_ERR_FAILED, NODEDB_ERR_NULL, NODEDB_OK};
 
 /// Run `f`, catching any panic so it never unwinds across the FFI boundary
-/// (which is UB). On panic, returns `default`.
+/// (which is UB). On panic, records `internal panic: …` and returns `default`.
+///
+/// Also clears the last-error slot first, so a stale error from a previous
+/// call is never attributed to this one; operations record a fresh error via
+/// [`crate::error::record_error`] before returning `NODEDB_ERR_FAILED` (or
+/// NULL from an open).
 pub(crate) fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    crate::error::clear_error();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(payload) => {
+            crate::error::record_error(format!("internal panic: {}", panic_message(&payload)));
+            default
+        }
+    }
+}
+
+/// Best-effort text of a panic payload: `&str` and `String` carry the message
+/// most callers pass to `panic!`; anything else gets a placeholder.
+///
+/// Must downcast through the `Box` itself: coercing to `&dyn Any` (or
+/// `&dyn Any + Send`) rebuilds the vtable so `type_id` reports the trait-object
+/// type, and every downcast misses. Method lookup on the `Box` keeps the
+/// concrete vtable from `catch_unwind`.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "unknown panic payload"
+    }
+}
+
+/// Like [`ffi_guard`] but does NOT clear the last-error slot — used by
+/// `nodedb_last_error` itself, which must read the slot, not wipe it.
+pub(crate) fn ffi_guard_keep_error<T>(default: T, f: impl FnOnce() -> T) -> T {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(_) => default,
@@ -88,7 +123,14 @@ pub(crate) unsafe fn write_c_string(out: *mut *mut c_char, s: String) -> i32 {
             unsafe { *out = cs.into_raw() };
             NODEDB_OK
         }
-        Err(_) => NODEDB_ERR_FAILED,
+        Err(e) => {
+            crate::error::record_error(format!(
+                "result contains an interior NUL byte at offset {}, so it cannot cross the C \
+                 string boundary",
+                e.nul_position()
+            ));
+            NODEDB_ERR_FAILED
+        }
     }
 }
 
@@ -112,5 +154,20 @@ mod tests {
     fn ffi_guard_unit_does_not_propagate_panic() {
         // Must not unwind out of the test — the panic is caught.
         ffi_guard((), || panic!("intentional panic in unit test"));
+    }
+
+    #[test]
+    fn ffi_guard_records_panic_message() {
+        crate::error::clear_error();
+        let result = ffi_guard(-3i32, || -> i32 { panic!("intentional panic in test") });
+        assert_eq!(result, -3);
+        let ptr = unsafe { crate::error::nodedb_last_error(std::ptr::null_mut()) };
+        assert!(!ptr.is_null(), "panic must leave a retrievable last-error");
+        let got = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert!(
+            got.starts_with("internal panic: intentional panic in test"),
+            "unexpected message: {got}"
+        );
+        unsafe { drop(std::ffi::CString::from_raw(ptr)) };
     }
 }
