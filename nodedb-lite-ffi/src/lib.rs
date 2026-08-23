@@ -23,6 +23,7 @@ pub mod open;
 pub(crate) mod status;
 pub mod sync;
 pub(crate) mod util;
+pub mod version;
 
 pub use ffi_array::*;
 pub use ffi_document::*;
@@ -36,5 +37,6 @@ pub use status::{
     NODEDB_ERR_FAILED, NODEDB_ERR_NOT_FOUND, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK,
 };
 pub use sync::*;
+pub use version::*;
 
 pub(crate) use util::{ffi_guard, handle_ref, ptr_to_str, write_c_string};
