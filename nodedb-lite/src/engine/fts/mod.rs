@@ -31,9 +31,7 @@ pub type LiteFtsIndex = FtsIndex<MemoryBackend>;
 /// matter, the upgrade path is a dirty-term checkpoint, or teaching
 /// `serialize_fts` to persist the backend's segments too; it is not to start
 /// dropping postings again.
-pub(crate) const LITE_MEMTABLE_CONFIG: nodedb_fts::MemtableConfig =
-    nodedb_fts::MemtableConfig {
-        max_postings: usize::MAX,
-        max_terms: usize::MAX,
-    };
-
+pub(crate) const LITE_MEMTABLE_CONFIG: nodedb_fts::MemtableConfig = nodedb_fts::MemtableConfig {
+    max_postings: usize::MAX,
+    max_terms: usize::MAX,
+};

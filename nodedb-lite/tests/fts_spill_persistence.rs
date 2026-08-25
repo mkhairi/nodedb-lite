@@ -15,7 +15,9 @@
 //! so both assertions below fail without the fix.
 
 use nodedb_client::NodeDb;
+use nodedb_lite::storage::engine::StorageEngine;
 use nodedb_lite::{Encryption, NodeDbLite, PagedbStorageDefault};
+use nodedb_types::Namespace;
 use nodedb_types::document::Document;
 use nodedb_types::text_search::TextSearchParams;
 use nodedb_types::value::Value;
@@ -84,6 +86,28 @@ async fn postings_written_before_a_spill_survive_restart() {
 
         db.flush().await.expect("flush");
         db.shutdown().await;
+    }
+
+    // The reopen assertion below is only a checkpoint test while the checkpoint
+    // is what answers it. `open` rebuilds text indices from stored documents
+    // whenever the restored FTS manager comes back empty
+    // (`nodedb/core/open/constructors.rs`), so a serializer that persisted
+    // *nothing* would be silently repaired by that rebuild and the search below
+    // would pass on data the checkpoint never held. Assert the checkpoint is
+    // non-empty first, so that failure mode fails here instead of passing.
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .expect("storage for checkpoint check");
+        let collections = storage
+            .get(Namespace::Fts, b"fts:_collections")
+            .await
+            .expect("read fts:_collections");
+        assert!(
+            collections.is_some_and(|b| !b.is_empty()),
+            "no FTS checkpoint was written — the reopen below would be answered \
+             by the rebuild gate rather than by the checkpoint under test"
+        );
     }
 
     let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
