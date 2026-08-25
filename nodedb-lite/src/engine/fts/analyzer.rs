@@ -81,7 +81,11 @@ impl FtsCollectionManager {
     /// before the first write is not silently lost for indexes materialized
     /// afterwards.
     pub(crate) fn new_index_for(&self, key: &str) -> LiteFtsIndex {
-        let idx = FtsIndex::new(MemoryBackend::new(), std::sync::Arc::clone(&self.governor));
+        let idx = FtsIndex::with_memtable_config(
+            MemoryBackend::new(),
+            super::LITE_MEMTABLE_CONFIG,
+            std::sync::Arc::clone(&self.governor),
+        );
         if let Some(name) = self.analyzer_for_key(key) {
             let _ = idx.set_collection_analyzer(0, 0, key, name);
         }
