@@ -31,7 +31,12 @@
 //! ## Rationale: memtable vs segment storage
 //!
 //! `nodedb-fts` on Lite uses `MemoryBackend` exclusively.  All postings live in
-//! a `Memtable`; the backend's LSM segment layer is unused.  The pagedb segment
+//! a `Memtable`; the backend's LSM segment layer is unused — and that is now
+//! *enforced* by [`super::LITE_MEMTABLE_CONFIG`] rather than assumed. It was
+//! only ever an assumption, and it silently stopped holding at 100k unique
+//! terms, when the memtable spilled into segments this serializer does not
+//! read (NDB-AQL-37). Serializing the memtable alone is correct only while
+//! nothing can drain it.  The pagedb segment
 //! path bundles all per-term posting entries for one index key into a single
 //! segment blob, reducing B+ tree pressure from O(vocab_size) entries to O(1)
 //! per index key.
@@ -337,7 +342,7 @@ where
 
     for index_key in &index_keys {
         let backend = MemoryBackend::new();
-        let idx = FtsIndex::new(backend);
+        let idx = FtsIndex::with_memtable_config(backend, super::LITE_MEMTABLE_CONFIG);
 
         // ── Posting data: try pagedb segment path first, fall back to KV ─────
         // Flipped only by the native segment path, compiled out on wasm32.
