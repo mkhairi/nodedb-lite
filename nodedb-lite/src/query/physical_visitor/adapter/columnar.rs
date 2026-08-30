@@ -9,7 +9,7 @@ use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
 use super::LitePhysicalFut;
-use super::policy::deny_policy;
+use super::policy::{deny_policy, deny_write_check};
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
@@ -37,7 +37,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                         .into(),
                 });
             }
-            let col = collection.clone();
+            let col = collection.to_string();
             let proj = projection.clone();
             let lim = *limit;
             let filt = filters.clone();
@@ -85,12 +85,13 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             returning,
             rls_filters,
         } => {
+            deny_write_check("ColumnarOp::Insert", &[rls_write_check])?;
             deny_policy(
                 "ColumnarOp::Insert",
                 returning.as_ref(),
-                &[rls_filters.as_slice(), rls_write_check.as_slice()],
+                &[rls_filters.as_slice()],
             )?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let pay = payload.clone();
             let fmt = format.clone();
             let int = *intent;
@@ -131,8 +132,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             updates,
             rls_write_check,
         } => {
-            deny_policy("ColumnarOp::Update", None, &[rls_write_check.as_slice()])?;
-            let col = collection.clone();
+            deny_write_check("ColumnarOp::Update", &[rls_write_check])?;
+            let col = collection.to_string();
             let filt = filters.clone();
             let upd = updates.clone();
             Ok(Box::pin(async move {
@@ -145,8 +146,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             filters,
             rls_write_check,
         } => {
-            deny_policy("ColumnarOp::Delete", None, &[rls_write_check.as_slice()])?;
-            let col = collection.clone();
+            deny_write_check("ColumnarOp::Delete", &[rls_write_check])?;
+            let col = collection.to_string();
             let filt = filters.clone();
             Ok(Box::pin(async move {
                 columnar_ops::writes::delete(engine, &col, &filt)
@@ -159,7 +160,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             count,
             system_as_of_ms,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let cur = cursor.clone();
             let cnt = *count;
             let sys_as_of = *system_as_of_ms;
@@ -167,5 +168,26 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                 columnar_ops::reads::materialize_scan(engine, &col, &cur, cnt, sys_as_of).await
             }))
         }
+
+        ColumnarOp::ResolvedUpdate { .. } => Err(LiteError::Unsupported {
+            detail: "ColumnarOp::ResolvedUpdate: the governed resolve/apply write path belongs to \
+                         the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                .to_string(),
+        }),
+
+        ColumnarOp::ResolvedDelete { .. } => Err(LiteError::Unsupported {
+            detail: "ColumnarOp::ResolvedDelete: the governed resolve/apply write path belongs to \
+                         the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                .to_string(),
+        }),
+
+        ColumnarOp::ResolveDml { .. } => Err(LiteError::Unsupported {
+            detail: "ColumnarOp::ResolveDml: the governed resolve/apply write path belongs to \
+                         the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                .to_string(),
+        }),
     }
 }

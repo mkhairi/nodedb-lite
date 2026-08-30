@@ -5,6 +5,7 @@
 //! empty `QueryResult`. `FtsQuery::Not` is rejected — Lite does not support
 //! standalone NOT FTS queries.
 
+use crate::query::qualified::qualify;
 use nodedb_physical::PhysicalTaskVisitor;
 use nodedb_physical::physical_plan::TextOp;
 use nodedb_sql::fts_types::FtsQuery;
@@ -40,7 +41,7 @@ pub(super) fn lower_text_search<'a, S: StorageEngine + 'a>(
                 }));
             }
             TextOp::PhraseSearch {
-                collection: collection.to_string(),
+                collection: qualify(collection),
                 terms: terms.clone(),
                 top_k,
                 prefilter: None,
@@ -76,14 +77,14 @@ pub(super) fn lower_text_search<'a, S: StorageEngine + 'a>(
             };
             if let Some(alias) = score_alias {
                 TextOp::BM25ScoreScan {
-                    collection: collection.to_string(),
+                    collection: qualify(collection),
                     query: plain,
                     score_alias: alias.to_string(),
                     fuzzy,
                 }
             } else {
                 TextOp::Search {
-                    collection: collection.to_string(),
+                    collection: qualify(collection),
                     query: plain,
                     top_k,
                     fuzzy,

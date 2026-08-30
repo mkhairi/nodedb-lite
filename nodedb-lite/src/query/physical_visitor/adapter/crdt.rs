@@ -20,7 +20,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             collection,
             document_id,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             Ok(Box::pin(async move {
                 crdt_ops::read::handle_read(engine, &col, &doc_id).await
@@ -33,7 +33,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             mutation_id,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let delta_bytes = delta.clone();
             let mid = *mutation_id;
             Ok(Box::pin(async move {
@@ -44,7 +44,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         CrdtOp::ImportSnapshot {
             collection, bytes, ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let bytes = bytes.clone();
             Ok(Box::pin(async move {
                 crdt_ops::write::handle_import_snapshot(engine, &col, &bytes).await
@@ -94,7 +94,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             collection,
             policy_json,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let json = policy_json.clone();
             Ok(Box::pin(async move {
                 crdt_ops::write::handle_set_policy(engine, &col, &json).await
@@ -102,7 +102,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }
 
         CrdtOp::GetPolicy { collection } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             Ok(Box::pin(async move {
                 crdt_ops::read::handle_get_policy(engine, &col).await
             }))
@@ -113,7 +113,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             document_id,
             version_vector_json,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let vv_json = version_vector_json.clone();
             Ok(Box::pin(async move {
@@ -129,7 +129,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             collection,
             from_version_json,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let from_json = from_version_json.clone();
             Ok(Box::pin(async move {
                 crdt_ops::version::handle_export_delta(engine, &col, &from_json).await
@@ -142,7 +142,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             target_version_json,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let target_json = target_version_json.clone();
             Ok(Box::pin(async move {
@@ -155,7 +155,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             collection,
             target_version_json,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let target_json = target_version_json.clone();
             Ok(Box::pin(async move {
                 crdt_ops::version::handle_compact_at_version(engine, &col, &target_json).await
@@ -170,7 +170,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             fields_json,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let path = list_path.clone();
             let idx = *index;
@@ -187,7 +187,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             index,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let path = list_path.clone();
             let idx = *index;
@@ -204,7 +204,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             to_index,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let path = list_path.clone();
             let from = *from_index;
@@ -224,7 +224,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             ..
         } => {
             deny_policy("CrdtOp::DocUpsert", None, &[rls_filters.as_slice()])?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let fields = fields_json.clone();
             let partial = *partial;
@@ -250,7 +250,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             ..
         } => {
             deny_policy("CrdtOp::DocDelete", None, &[rls_filters.as_slice()])?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let returning = returning.clone();
             Ok(Box::pin(async move {

@@ -9,7 +9,7 @@ use crate::query::kv_ops;
 use crate::storage::engine::StorageEngine;
 
 use super::LitePhysicalFut;
-use super::policy::deny_policy;
+use super::policy::{deny_policy, deny_write_check};
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
@@ -23,7 +23,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             surrogate_ceiling,
         } => {
             deny_policy("KvOp::Get", None, &[rls_filters.as_slice()])?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let k = key.clone();
             let ceiling = *surrogate_ceiling;
             Ok(Box::pin(async move {
@@ -39,7 +39,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             surrogate_ceiling,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let cur = cursor.clone();
             let cnt = *count;
             let pattern = match_pattern.clone();
@@ -50,7 +50,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }
 
         KvOp::GetTtl { collection, key } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let k = key.clone();
             Ok(Box::pin(async move {
                 kv_ops::reads::kv_get_ttl(engine, &col, &k).await
@@ -63,7 +63,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             rls_filters,
         } => {
             deny_policy("KvOp::BatchGet", None, &[rls_filters.as_slice()])?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let ks = keys.clone();
             Ok(Box::pin(async move {
                 kv_ops::reads::kv_batch_get(engine, &col, &ks).await
@@ -77,7 +77,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             rls_filters,
         } => {
             deny_policy("KvOp::FieldGet", None, &[rls_filters.as_slice()])?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let k = key.clone();
             let flds = fields.clone();
             Ok(Box::pin(async move {
@@ -90,7 +90,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             cursor,
             count,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let cur = cursor.clone();
             let cnt = *count;
             Ok(Box::pin(async move {
@@ -108,7 +108,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             rls_filters,
         } => {
             deny_policy("KvOp::Put", returning.as_ref(), &[rls_filters.as_slice()])?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let k = key.clone();
             let v = value.clone();
             let ttl = *ttl_ms;
@@ -131,7 +131,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                 returning.as_ref(),
                 &[rls_filters.as_slice()],
             )?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let k = key.clone();
             let v = value.clone();
             let ttl = *ttl_ms;
@@ -154,7 +154,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                 returning.as_ref(),
                 &[rls_filters.as_slice()],
             )?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let k = key.clone();
             let v = value.clone();
             let ttl = *ttl_ms;
@@ -174,12 +174,13 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             returning,
             rls_filters,
         } => {
+            deny_write_check("KvOp::InsertOnConflictUpdate", &[rls_write_check])?;
             deny_policy(
                 "KvOp::InsertOnConflictUpdate",
                 returning.as_ref(),
-                &[rls_filters.as_slice(), rls_write_check.as_slice()],
+                &[rls_filters.as_slice()],
             )?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let k = key.clone();
             let v = value.clone();
             let ttl = *ttl_ms;
@@ -194,8 +195,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             keys,
             rls_write_check,
         } => {
-            deny_policy("KvOp::Delete", None, &[rls_write_check.as_slice()])?;
-            let col = collection.clone();
+            deny_write_check("KvOp::Delete", &[rls_write_check])?;
+            let col = collection.to_string();
             let ks = keys.clone();
             Ok(Box::pin(async move {
                 kv_ops::writes::kv_delete(engine, &col, &ks).await
@@ -215,7 +216,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                 returning.as_ref(),
                 &[rls_filters.as_slice()],
             )?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let ents = entries.clone();
             let ttl = *ttl_ms;
             Ok(Box::pin(async move {
@@ -229,8 +230,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             ttl_ms,
             rls_write_check,
         } => {
-            deny_policy("KvOp::Expire", None, &[rls_write_check.as_slice()])?;
-            let col = collection.clone();
+            deny_write_check("KvOp::Expire", &[rls_write_check])?;
+            let col = collection.to_string();
             let k = key.clone();
             let ttl = *ttl_ms;
             Ok(Box::pin(async move {
@@ -243,8 +244,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             key,
             rls_write_check,
         } => {
-            deny_policy("KvOp::Persist", None, &[rls_write_check.as_slice()])?;
-            let col = collection.clone();
+            deny_write_check("KvOp::Persist", &[rls_write_check])?;
+            let col = collection.to_string();
             let k = key.clone();
             Ok(Box::pin(async move {
                 kv_ops::writes::kv_persist(engine, &col, &k).await
@@ -252,7 +253,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }
 
         KvOp::Truncate { collection } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             Ok(Box::pin(async move {
                 kv_ops::writes::kv_truncate(engine, &col).await
             }))
@@ -266,8 +267,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             surrogate: _,
             rls_write_check,
         } => {
-            deny_policy("KvOp::Incr", None, &[rls_write_check.as_slice()])?;
-            let col = collection.clone();
+            deny_write_check("KvOp::Incr", &[rls_write_check])?;
+            let col = collection.to_string();
             let k = key.clone();
             let d = *delta;
             let ttl = *ttl_ms;
@@ -283,8 +284,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             surrogate: _,
             rls_write_check,
         } => {
-            deny_policy("KvOp::IncrFloat", None, &[rls_write_check.as_slice()])?;
-            let col = collection.clone();
+            deny_write_check("KvOp::IncrFloat", &[rls_write_check])?;
+            let col = collection.to_string();
             let k = key.clone();
             let d = *delta;
             Ok(Box::pin(async move {
@@ -300,8 +301,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             surrogate: _,
             rls_write_check,
         } => {
-            deny_policy("KvOp::Cas", None, &[rls_write_check.as_slice()])?;
-            let col = collection.clone();
+            deny_write_check("KvOp::Cas", &[rls_write_check])?;
+            let col = collection.to_string();
             let k = key.clone();
             let exp = expected.clone();
             let nv = new_value.clone();
@@ -318,12 +319,9 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             rls_filters,
             rls_write_check,
         } => {
-            deny_policy(
-                "KvOp::GetSet",
-                None,
-                &[rls_filters.as_slice(), rls_write_check.as_slice()],
-            )?;
-            let col = collection.clone();
+            deny_write_check("KvOp::GetSet", &[rls_write_check])?;
+            deny_policy("KvOp::GetSet", None, &[rls_filters.as_slice()])?;
+            let col = collection.to_string();
             let k = key.clone();
             let nv = new_value.clone();
             Ok(Box::pin(async move {
@@ -338,8 +336,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             surrogate: _,
             rls_write_check,
         } => {
-            deny_policy("KvOp::FieldSet", None, &[rls_write_check.as_slice()])?;
-            let col = collection.clone();
+            deny_write_check("KvOp::FieldSet", &[rls_write_check])?;
+            let col = collection.to_string();
             let k = key.clone();
             let upd = updates.clone();
             Ok(Box::pin(async move {
@@ -357,8 +355,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             credit_surrogate: _,
             rls_write_check,
         } => {
-            deny_policy("KvOp::Transfer", None, &[rls_write_check.as_slice()])?;
-            let col = collection.clone();
+            deny_write_check("KvOp::Transfer", &[rls_write_check])?;
+            let col = collection.to_string();
             let src = source_key.clone();
             let dst = dest_key.clone();
             let fld = field.clone();
@@ -377,16 +375,12 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             source_rls_write_check,
             dest_rls_write_check,
         } => {
-            deny_policy(
+            deny_write_check(
                 "KvOp::TransferItem",
-                None,
-                &[
-                    source_rls_write_check.as_slice(),
-                    dest_rls_write_check.as_slice(),
-                ],
+                &[source_rls_write_check, dest_rls_write_check],
             )?;
-            let src_col = source_collection.clone();
-            let dst_col = dest_collection.clone();
+            let src_col = source_collection.to_string();
+            let dst_col = dest_collection.to_string();
             let ik = item_key.clone();
             let dk = dest_key.clone();
             Ok(Box::pin(async move {
@@ -400,7 +394,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             backfill,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let fld = field.clone();
             let bf = *backfill;
             Ok(Box::pin(async move {
@@ -409,7 +403,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }
 
         KvOp::DropIndex { collection, field } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let fld = field.clone();
             Ok(Box::pin(async move {
                 kv_ops::indexes::kv_drop_index(engine, &col, &fld).await
@@ -496,5 +490,33 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                 kv_ops::sorted::kv_sorted_index_score(engine, &name, &pk).await
             }))
         }
+
+        KvOp::ResolveWrite(_) => Err(LiteError::Unsupported {
+            detail: "KvOp::ResolveWrite: the governed resolve/apply write path belongs \
+                         to the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                .to_string(),
+        }),
+
+        KvOp::ResolvedWrite { .. } => Err(LiteError::Unsupported {
+            detail: "KvOp::ResolvedWrite: the governed resolve/apply write path belongs \
+                         to the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                .to_string(),
+        }),
+
+        KvOp::PredicateUpdate { .. } => Err(LiteError::Unsupported {
+            detail: "KvOp::PredicateUpdate: the governed resolve/apply write path belongs \
+                         to the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                .to_string(),
+        }),
+
+        KvOp::PredicateDelete { .. } => Err(LiteError::Unsupported {
+            detail: "KvOp::PredicateDelete: the governed resolve/apply write path belongs \
+                         to the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                .to_string(),
+        }),
     }
 }

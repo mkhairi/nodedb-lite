@@ -2,6 +2,7 @@
 //! SQL-visitor lowering for recursive SqlPlan variants:
 //! RecursiveScan, RecursiveValue.
 
+use crate::query::qualified::qualify;
 use nodedb_physical::PhysicalTaskVisitor;
 use nodedb_physical::physical_plan::QueryOp;
 use nodedb_sql::types::filter::Filter;
@@ -47,7 +48,7 @@ pub(super) fn lower_recursive_scan<'a, S: StorageEngine + 'a>(
     let rec_bytes = encode_filters(recursive_filters)?;
 
     let op = QueryOp::RecursiveScan {
-        collection: collection.to_string(),
+        collection: qualify(collection),
         base_filters: base_bytes,
         recursive_filters: rec_bytes,
         join_link: join_link.cloned(),

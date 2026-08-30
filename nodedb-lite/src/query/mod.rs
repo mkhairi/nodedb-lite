@@ -14,6 +14,7 @@ pub mod kv_ops;
 pub mod meta_ops;
 pub(crate) mod msgpack_helpers;
 pub(crate) mod physical_visitor;
+pub(crate) mod qualified;
 pub mod query_ops;
 pub mod spatial_ops;
 pub mod strict_dml;

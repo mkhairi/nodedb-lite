@@ -23,7 +23,7 @@ use crate::query::graph_ops::{
 use crate::storage::engine::StorageEngine;
 
 use super::graph_resolve::resolve_collection_for_nodes;
-use super::policy::deny_policy;
+use super::policy::{deny_policy, deny_write_check};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) type GraphFut<'a> =
@@ -48,7 +48,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
         } => {
             let storage = engine.storage.clone();
             let csr_map = engine.csr.clone();
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let src_id = src_id.clone();
             let label = label.clone();
             let dst_id = dst_id.clone();
@@ -82,10 +82,10 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             rls_write_check,
             ..
         } => {
-            deny_policy("GraphOp::EdgeDelete", None, &[rls_write_check.as_slice()])?;
+            deny_write_check("GraphOp::EdgeDelete", &[rls_write_check])?;
             let storage = engine.storage.clone();
             let csr_map = engine.csr.clone();
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let src_id = src_id.clone();
             let label = label.clone();
             let dst_id = dst_id.clone();
@@ -317,7 +317,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             }
             let storage = engine.storage.clone();
             let csr_map = engine.csr.clone();
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let node_id = node_id.clone();
             let edge_label = edge_label.clone();
             let direction = *direction;
@@ -384,7 +384,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
         GraphOp::Stats { collection, as_of } => {
             let storage = engine.storage.clone();
             let csr_map = engine.csr.clone();
-            let collection = collection.clone();
+            let collection = collection.as_ref().map(|c| c.to_string());
             let as_of = *as_of;
             Box::pin(async move {
                 stats::graph_stats(&storage, &csr_map, collection.as_deref(), as_of).await
@@ -410,7 +410,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             let crdt = Arc::clone(&engine.crdt);
             let fts_state = Arc::clone(&engine.fts_state);
             let csr_map = Arc::clone(&engine.csr);
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let query_vector = query_vector.clone();
             let vector_top_k = *vector_top_k;
             let edge_label = edge_label.clone();
@@ -495,6 +495,16 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
                 match_engine::graph_match(&csr_map, &query, frontier_bitmap.as_ref(), Some(&crdt))
                     .await
             })
+        }
+
+        GraphOp::ResolveEdgeDelete(_) => {
+            return Err(LiteError::Unsupported {
+                detail:
+                    "GraphOp::ResolveEdgeDelete: the governed resolve/apply write path belongs \
+                         to the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                        .to_string(),
+            });
         }
     };
 

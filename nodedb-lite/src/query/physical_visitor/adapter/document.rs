@@ -20,7 +20,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             document_id,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             Ok(Box::pin(async move {
                 document_ops::reads::point_get(engine, &col, &doc_id).await
@@ -33,7 +33,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             offset,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let limit = *limit;
             let offset = *offset;
             Ok(Box::pin(async move {
@@ -48,7 +48,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             limit,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let lower = lower.clone();
             let upper = upper.clone();
             let limit = *limit;
@@ -72,7 +72,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             offset,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let path = path.clone();
             let value = value.clone();
             let limit = *limit;
@@ -87,7 +87,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             path,
             value,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let path = path.clone();
             let value = value.clone();
             Ok(Box::pin(async move {
@@ -96,7 +96,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }
 
         DocumentOp::EstimateCount { collection, .. } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             Ok(Box::pin(async move {
                 document_ops::reads::estimate_count(engine, &col).await
             }))
@@ -108,7 +108,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             value,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let val = value.clone();
             Ok(Box::pin(async move {
@@ -123,7 +123,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             if_absent,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let val = value.clone();
             let if_absent = *if_absent;
@@ -138,7 +138,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             updates,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let updates = updates.clone();
             Ok(Box::pin(async move {
@@ -151,7 +151,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             document_id,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             Ok(Box::pin(async move {
                 document_ops::writes::point_delete(engine, &col, &doc_id).await
@@ -163,7 +163,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             documents,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let docs = documents.clone();
             Ok(Box::pin(async move {
                 document_ops::writes::batch_insert(engine, &col, &docs).await
@@ -177,7 +177,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             on_conflict_updates,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let doc_id = document_id.clone();
             let val = value.clone();
             let conflict_updates = on_conflict_updates.clone();
@@ -187,7 +187,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }
 
         DocumentOp::Truncate { collection, .. } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             Ok(Box::pin(async move {
                 document_ops::writes::truncate(engine, &col).await
             }))
@@ -198,7 +198,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             updates,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let updates = updates.clone();
             Ok(Box::pin(async move {
                 document_ops::writes::bulk_update(engine, &col, &updates).await
@@ -206,7 +206,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }
 
         DocumentOp::BulkDelete { collection, .. } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             Ok(Box::pin(async move {
                 document_ops::writes::bulk_delete(engine, &col).await
             }))
@@ -217,7 +217,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             storage_mode,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let mode = storage_mode.clone();
             Ok(Box::pin(async move {
                 document_ops::indexes::register(engine, &col, &mode).await
@@ -225,7 +225,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }
 
         DocumentOp::DropIndex { collection, field } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let field = field.clone();
             Ok(Box::pin(async move {
                 document_ops::indexes::drop_index(engine, &col, &field).await
@@ -235,7 +235,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         DocumentOp::BackfillIndex {
             collection, path, ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let path = path.clone();
             Ok(Box::pin(async move {
                 document_ops::indexes::backfill_index(engine, &col, &path).await
@@ -248,8 +248,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             source_limit,
             ..
         } => {
-            let target = target_collection.clone();
-            let source = source_collection.clone();
+            let target = target_collection.to_string();
+            let source = source_collection.to_string();
             let limit = *source_limit;
             Ok(Box::pin(async move {
                 document_ops::sets::insert_select(engine, &target, &source, limit).await
@@ -265,8 +265,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             updates,
             ..
         } => {
-            let target = target_collection.clone();
-            let source = source_collection.clone();
+            let target = target_collection.to_string();
+            let source = source_collection.to_string();
             let alias = source_alias.clone();
             let target_join = target_join_col.clone();
             let source_join = source_join_col.clone();
@@ -294,8 +294,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             clauses,
             ..
         } => {
-            let target = target_collection.clone();
-            let source = source_collection.clone();
+            let target = target_collection.to_string();
+            let source = source_collection.to_string();
             let alias = source_alias.clone();
             let target_join = target_join_col.clone();
             let source_join = source_join_col.clone();
@@ -320,7 +320,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             count,
             ..
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let cursor = cursor.clone();
             let count = *count;
             Ok(Box::pin(async move {
@@ -340,6 +340,20 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                  bindings are maintained by the Origin data plane and are \
                  unsupported on the Lite engine"
             ),
+        }),
+
+        DocumentOp::ResolveWrite(_) => Err(LiteError::Unsupported {
+            detail: "DocumentOp::ResolveWrite: the governed resolve/apply write path belongs to \
+                         the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                .to_string(),
+        }),
+
+        DocumentOp::ResolvedWrite { .. } => Err(LiteError::Unsupported {
+            detail: "DocumentOp::ResolvedWrite: the governed resolve/apply write path belongs to \
+                         the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                .to_string(),
         }),
     }
 }

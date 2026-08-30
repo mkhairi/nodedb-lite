@@ -2,6 +2,7 @@
 //! SQL-visitor lowering for query-shaped SqlPlan variants:
 //! Aggregate, Join, DocumentIndexLookup, RangeScan, Cte, Subquery.
 
+use crate::query::qualified::qualify;
 use std::collections::HashMap;
 
 use nodedb_physical::PhysicalTaskVisitor;
@@ -298,7 +299,7 @@ pub(super) fn lower_document_index_lookup<'a, S: StorageEngine + 'a>(
     let window_functions = window_functions.to_vec();
 
     let op = DocumentOp::IndexedFetch {
-        collection: col,
+        collection: qualify(&col),
         path,
         value: val_str,
         filters: filter_bytes,
@@ -348,7 +349,7 @@ pub(super) fn lower_range_scan<'a, S: StorageEngine + 'a>(
     let hi_bytes: Option<Vec<u8>> = upper.map(encode_bound).transpose()?;
 
     let op = DocumentOp::RangeScan {
-        collection: col,
+        collection: qualify(&col),
         field: fld,
         lower: lo_bytes,
         upper: hi_bytes,

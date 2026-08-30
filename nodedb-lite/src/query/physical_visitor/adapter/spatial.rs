@@ -22,7 +22,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             geometry,
             provenance: _,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let fld = field.clone();
             let sur = *surrogate;
             let geom = geometry.clone();
@@ -37,7 +37,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             surrogate,
             provenance: _,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let fld = field.clone();
             let sur = *surrogate;
             Ok(Box::pin(async move {
@@ -58,7 +58,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             prefilter,
         } => {
             let params = spatial_ops::reads::ScanParams {
-                collection: collection.clone(),
+                collection: collection.to_string(),
                 field: field.clone(),
                 predicate: *predicate,
                 query_geometry: query_geometry.clone(),

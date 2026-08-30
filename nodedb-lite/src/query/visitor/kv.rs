@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! SQL-visitor lowering for KV SqlPlan variants: KvInsert.
 
+use crate::query::qualified::qualify;
 use nodedb_physical::PhysicalTaskVisitor;
 use nodedb_physical::physical_plan::KvOp;
 use nodedb_sql::types::KvInsertIntent;
@@ -111,7 +112,7 @@ pub(super) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
 
         let op = match intent {
             KvInsertIntent::Insert => KvOp::Insert {
-                collection: collection.clone(),
+                collection: qualify(&collection),
                 key,
                 value,
                 ttl_ms,
@@ -120,7 +121,7 @@ pub(super) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
                 rls_filters: Vec::new(),
             },
             KvInsertIntent::InsertIfAbsent => KvOp::InsertIfAbsent {
-                collection: collection.clone(),
+                collection: qualify(&collection),
                 key,
                 value,
                 ttl_ms,
@@ -129,18 +130,21 @@ pub(super) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
                 rls_filters: Vec::new(),
             },
             KvInsertIntent::Put if !updates.is_empty() => KvOp::InsertOnConflictUpdate {
-                collection: collection.clone(),
+                collection: qualify(&collection),
                 key,
                 value,
                 ttl_ms,
                 updates,
                 surrogate: Surrogate::ZERO,
-                rls_write_check: Vec::new(),
+                // Lite has no policy system, so no write policy can apply to a plan
+                // Lite builds for itself. See `deny_write_check` for plans that
+                // arrive from Origin already carrying one.
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 returning: None,
                 rls_filters: Vec::new(),
             },
             KvInsertIntent::Put => KvOp::Put {
-                collection: collection.clone(),
+                collection: qualify(&collection),
                 key,
                 value,
                 ttl_ms,

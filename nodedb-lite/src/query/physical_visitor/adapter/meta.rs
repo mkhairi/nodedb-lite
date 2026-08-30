@@ -55,8 +55,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             ..
         } => {
             let tid = *tenant_id;
-            let old = old_collection.clone();
-            let new = new_collection.clone();
+            let old = old_collection.to_string();
+            let new = new_collection.to_string();
             Ok(Box::pin(async move {
                 meta_ops::handle_rename_collection(engine, tid, &old, &new).await
             }))
@@ -66,7 +66,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             target_type,
             schema_json,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let tt = target_type.clone();
             let sj = schema_json.clone();
             Ok(Box::pin(async move {
@@ -98,7 +98,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             }))
         }
         MetaOp::QueryLastValues { collection } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             Ok(Box::pin(async move {
                 meta_ops::handle_query_aggregate_last_values(engine, &col).await
             }))
@@ -107,7 +107,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             collection,
             series_id,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let sid = *series_id;
             Ok(Box::pin(async move {
                 meta_ops::handle_query_aggregate_last_value(engine, &col, sid).await
@@ -119,7 +119,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             cutoff_system_ms,
         } => {
             let tid = *tenant_id;
-            let col = collection.clone();
+            let col = collection.to_string();
             let cut = *cutoff_system_ms;
             Ok(Box::pin(async move {
                 meta_ops::handle_temporal_purge_edge_store(engine, tid, &col, cut).await
@@ -131,7 +131,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             cutoff_system_ms,
         } => {
             let tid = *tenant_id;
-            let col = collection.clone();
+            let col = collection.to_string();
             let cut = *cutoff_system_ms;
             Ok(Box::pin(async move {
                 meta_ops::handle_temporal_purge_document_strict(engine, tid, &col, cut).await
@@ -143,7 +143,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             cutoff_system_ms,
         } => {
             let tid = *tenant_id;
-            let col = collection.clone();
+            let col = collection.to_string();
             let cut = *cutoff_system_ms;
             Ok(Box::pin(async move {
                 meta_ops::handle_temporal_purge_columnar(engine, tid, &col, cut).await
@@ -155,7 +155,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             cutoff_system_ms,
         } => {
             let tid = *tenant_id;
-            let col = collection.clone();
+            let col = collection.to_string();
             let cut = *cutoff_system_ms;
             Ok(Box::pin(async move {
                 meta_ops::handle_temporal_purge_crdt(engine, tid, &col, cut).await
@@ -177,7 +177,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             collection,
             max_age_ms,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let age = *max_age_ms;
             Ok(Box::pin(async move {
                 meta_ops::handle_enforce_timeseries_retention(engine, &col, age).await
@@ -217,7 +217,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             index_name,
             concurrent,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let idx = index_name.clone();
             let conc = *concurrent;
             Ok(Box::pin(async move {

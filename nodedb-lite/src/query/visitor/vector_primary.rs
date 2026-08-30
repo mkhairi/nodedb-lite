@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! SQL-visitor lowering for vector-primary SqlPlan variants: VectorPrimaryInsert.
 
+use crate::query::qualified::qualify;
 use nodedb_physical::PhysicalTaskVisitor;
 use nodedb_physical::physical_plan::VectorOp;
 use nodedb_sql::types::plan::VectorPrimaryRow;
@@ -78,7 +79,7 @@ pub(super) fn lower_vector_primary_insert<'a, S: StorageEngine + 'a>(
         let mut rows_affected = 0usize;
         for row in encoded_rows {
             let op = VectorOp::DirectUpsert {
-                collection: collection.clone(),
+                collection: qualify(&*collection),
                 field: field.clone(),
                 surrogate: row.surrogate,
                 vector: row.vector,

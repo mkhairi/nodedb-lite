@@ -5,6 +5,7 @@
 //! `DropIndex`. These dispatch straight to `LiteQueryEngine` methods or the
 //! `LiteDataPlaneVisitor` without intermediate planning helpers.
 
+use crate::query::qualified::qualify;
 use nodedb_physical::PhysicalTaskVisitor;
 use nodedb_sql::temporal::TemporalScope;
 use nodedb_sql::types::SqlValue;
@@ -167,7 +168,7 @@ pub(super) fn lower_create_index<'a, S: StorageEngine + 'a>(
 ) -> Result<LiteFut<'a>, LiteError> {
     use nodedb_physical::physical_plan::document::DocumentOp;
     let op = DocumentOp::BackfillIndex {
-        collection: collection.to_string(),
+        collection: qualify(collection),
         path: field.to_string(),
         is_array: false,
         unique,
@@ -189,7 +190,7 @@ pub(super) fn lower_drop_index<'a, S: StorageEngine + 'a>(
 ) -> Result<LiteFut<'a>, LiteError> {
     use nodedb_physical::physical_plan::document::DocumentOp;
     let op = DocumentOp::DropIndex {
-        collection: collection.unwrap_or("").to_string(),
+        collection: qualify(collection.unwrap_or("")),
         field: index_name.to_string(),
     };
     let mut phys = LiteDataPlaneVisitor { engine };

@@ -43,10 +43,13 @@ tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sonic-rs = "0.5"
-# Fork pending upstream nuskey8/zerompk#61: the derived codecs are
+# Pinned to upstream main, past the 0.7.1 tag. The derived codecs were
 # `inline(always)`, which folds whole codec trees into one function and makes
-# large plan enums cost minutes to compile. Drop the git source once released.
-zerompk = { version = "0.7", git = "https://github.com/farhan-syah/zerompk", rev = "bb3156cf17b399b0dc2dd90895133a169a29cac0", features = [
+# large plan enums cost minutes to compile; the fix is merged upstream but was
+# not in 0.7.1. Must stay byte-identical to the nodedb workspace pin, or a
+# workspace that path-depends on both gets two zerompk copies and the derived
+# traits stop unifying. Drop the git source once a release carries it.
+zerompk = { version = "0.7", git = "https://github.com/nuskey8/zerompk", rev = "75d527ff8930341c859a757866b0e07f03d09ef8", features = [
   "std",
   "derive",
 ] }
@@ -101,3 +104,22 @@ strip = false
 inherits = "dev"
 debug = false
 incremental = false
+
+# TEMPORARY (aql-dev): build against the local nodedb checkout while the
+# published 0.5.0 crates lag main.
+[patch.crates-io]
+pagedb = { path = "../pagedb" }
+nodedb-types = { path = "../nodedb/nodedb-types" }
+nodedb-codec = { path = "../nodedb/nodedb-codec" }
+nodedb-client = { path = "../nodedb/nodedb-client" }
+nodedb-crdt = { path = "../nodedb/nodedb-crdt" }
+nodedb-query = { path = "../nodedb/nodedb-query" }
+nodedb-spatial = { path = "../nodedb/nodedb-spatial" }
+nodedb-graph = { path = "../nodedb/nodedb-graph" }
+nodedb-vector = { path = "../nodedb/nodedb-vector" }
+nodedb-fts = { path = "../nodedb/nodedb-fts" }
+nodedb-strict = { path = "../nodedb/nodedb-strict" }
+nodedb-columnar = { path = "../nodedb/nodedb-columnar" }
+nodedb-array = { path = "../nodedb/nodedb-array" }
+nodedb-sql = { path = "../nodedb/nodedb-sql" }
+nodedb-physical = { path = "../nodedb/nodedb-physical" }

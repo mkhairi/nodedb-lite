@@ -37,7 +37,7 @@ pub(super) fn execute_text_op<'a, S: StorageEngine + 'a>(
             rls_filters,
             ..
         } => {
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let query = query.clone();
             let top_k = *top_k;
             let fuzzy = *fuzzy;
@@ -86,7 +86,7 @@ pub(super) fn execute_text_op<'a, S: StorageEngine + 'a>(
             score_alias,
             fuzzy,
         } => {
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let query = query.clone();
             let score_alias = score_alias.clone();
             let fuzzy = *fuzzy;
@@ -120,7 +120,7 @@ pub(super) fn execute_text_op<'a, S: StorageEngine + 'a>(
             top_k,
             ..
         } => {
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let terms = terms.clone();
             let top_k = *top_k;
             let fts_state = Arc::clone(&engine.fts_state);
@@ -158,7 +158,7 @@ pub(super) fn execute_text_op<'a, S: StorageEngine + 'a>(
             score_alias,
             ..
         } => {
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let query_vector = query_vector.clone();
             let query_text = query_text.clone();
             let top_k = *top_k;
@@ -269,7 +269,7 @@ pub(super) fn execute_text_op<'a, S: StorageEngine + 'a>(
             score_alias,
             ..
         } => {
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let query_vector = query_vector.clone();
             let query_text = query_text.clone();
             let graph_seed_id = graph_seed_id.clone();
@@ -415,7 +415,7 @@ pub(super) fn execute_text_op<'a, S: StorageEngine + 'a>(
             text,
             provenance: _,
         } => {
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let text = text.clone();
             let surrogate = *surrogate;
             let fts_state = Arc::clone(&engine.fts_state);
@@ -451,7 +451,7 @@ pub(super) fn execute_text_op<'a, S: StorageEngine + 'a>(
             surrogate,
             provenance: _,
         } => {
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let surrogate = *surrogate;
             let fts_state = Arc::clone(&engine.fts_state);
             #[cfg(not(target_arch = "wasm32"))]
@@ -483,7 +483,7 @@ pub(super) fn execute_text_op<'a, S: StorageEngine + 'a>(
             fuzzy_default,
         } => text_set_config(
             engine,
-            collection.clone(),
+            collection.to_string(),
             analyzer_name.clone(),
             *fuzzy_default,
         ),

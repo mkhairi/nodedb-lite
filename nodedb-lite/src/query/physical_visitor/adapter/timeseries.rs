@@ -9,7 +9,7 @@ use crate::query::timeseries_ops;
 use crate::storage::engine::StorageEngine;
 
 use super::LitePhysicalFut;
-use super::policy::deny_policy;
+use super::policy::{deny_policy, deny_write_check};
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
@@ -59,7 +59,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                 SystemTimeScope::AsOf(ms) => Some(*ms),
                 _ => None,
             };
-            let col = collection.clone();
+            let col = collection.to_string();
             let tr = *time_range;
             let proj = projection.clone();
             let lim = *limit;
@@ -104,12 +104,13 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             returning,
             rls_filters,
         } => {
+            deny_write_check("TimeseriesOp::Ingest", &[rls_write_check])?;
             deny_policy(
                 "TimeseriesOp::Ingest",
                 returning.as_ref(),
-                &[rls_filters.as_slice(), rls_write_check.as_slice()],
+                &[rls_filters.as_slice()],
             )?;
-            let col = collection.clone();
+            let col = collection.to_string();
             let pay = payload.clone();
             let fmt = format.clone();
             let lsn = *wal_lsn;
@@ -140,5 +141,12 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                 Ok(result)
             }))
         }
+
+        TimeseriesOp::ResolveIngest(_) => Err(LiteError::Unsupported {
+            detail: "TimeseriesOp::ResolveIngest: the governed resolve/apply write path belongs \
+                         to the Origin Control Plane and has no equivalent on the \
+                         single-node Lite engine"
+                .to_string(),
+        }),
     }
 }

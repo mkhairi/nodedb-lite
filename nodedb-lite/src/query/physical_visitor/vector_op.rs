@@ -47,11 +47,11 @@ where
             ..
         } => {
             let index_key = if field_name.is_empty() {
-                collection.clone()
+                collection.to_string()
             } else {
                 format!("{collection}:{field_name}")
             };
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let query = query_vector.clone();
             let k = *top_k;
             let ef = *ef_search;
@@ -121,7 +121,7 @@ where
             }
             Ok(vector_insert(
                 engine,
-                collection.clone(),
+                collection.to_string(),
                 vector.clone(),
                 field_name.clone(),
                 surrogate.to_string(),
@@ -131,7 +131,11 @@ where
         VectorOp::Delete {
             collection,
             vector_id,
-        } => Ok(vector_delete_by_id(engine, collection.clone(), *vector_id)),
+        } => Ok(vector_delete_by_id(
+            engine,
+            collection.to_string(),
+            *vector_id,
+        )),
 
         VectorOp::DeleteBySurrogate {
             collection,
@@ -140,7 +144,7 @@ where
             provenance: _,
         } => Ok(vector_delete_by_surrogate(
             engine,
-            collection.clone(),
+            collection.to_string(),
             *surrogate,
             field_name.clone(),
         )),
@@ -156,7 +160,7 @@ where
             ..
         } => {
             let index_key = if field_name.is_empty() {
-                collection.clone()
+                collection.to_string()
             } else {
                 format!("{collection}:{field_name}")
             };
@@ -168,7 +172,7 @@ where
             field_name,
         } => {
             let index_key = if field_name.is_empty() {
-                collection.clone()
+                collection.to_string()
             } else {
                 format!("{collection}:{field_name}")
             };
@@ -197,7 +201,7 @@ where
             )?;
             Ok(vector_direct_upsert(
                 engine,
-                collection.clone(),
+                collection.to_string(),
                 field.clone(),
                 surrogate.to_string(),
                 vector.clone(),
@@ -211,7 +215,7 @@ where
             field_name,
         } => {
             let index_key = if field_name.is_empty() {
-                collection.clone()
+                collection.to_string()
             } else {
                 format!("{collection}:{field_name}")
             };
@@ -263,7 +267,7 @@ where
                     detail: format!("SparseInsert: {e}"),
                 })?;
             let sparse_state = Arc::clone(&engine.sparse_state);
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let field_name = field_name.clone();
             let doc_id = doc_id.clone();
             Ok(Box::pin(async move {
@@ -293,7 +297,7 @@ where
                 }
             })?;
             let sparse_state = Arc::clone(&engine.sparse_state);
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let field_name = field_name.clone();
             let k = *top_k;
             Ok(Box::pin(async move {
@@ -321,7 +325,7 @@ where
             doc_id,
         } => {
             let sparse_state = Arc::clone(&engine.sparse_state);
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let field_name = field_name.clone();
             let doc_id = doc_id.clone();
             Ok(Box::pin(async move {
@@ -422,7 +426,7 @@ mod tests {
     async fn vector_op_seal_returns_bad_request() {
         let engine = make_engine().await;
         let op = VectorOp::Seal {
-            collection: "col".to_string(),
+            collection: crate::query::qualified::qualify("col"),
             field_name: String::new(),
         };
         match super::execute_vector_op(&engine, &op) {
@@ -446,7 +450,7 @@ mod tests {
 
     fn sparse_insert(doc_id: &str, entries: Vec<(u32, f32)>) -> VectorOp {
         VectorOp::SparseInsert {
-            collection: "col".to_string(),
+            collection: crate::query::qualified::qualify("col"),
             field_name: "sparse".to_string(),
             doc_id: doc_id.to_string(),
             entries,
@@ -468,7 +472,7 @@ mod tests {
         let result = run_op(
             &engine,
             VectorOp::SparseSearch {
-                collection: "col".to_string(),
+                collection: crate::query::qualified::qualify("col"),
                 field_name: "sparse".to_string(),
                 query_entries: vec![(1, 1.0)],
                 top_k: 10,
@@ -488,7 +492,7 @@ mod tests {
         run_op(&engine, sparse_insert("d1", vec![(1, 1.0)])).await;
 
         let delete = VectorOp::SparseDelete {
-            collection: "col".to_string(),
+            collection: crate::query::qualified::qualify("col"),
             field_name: "sparse".to_string(),
             doc_id: "d1".to_string(),
         };
@@ -502,7 +506,7 @@ mod tests {
         let result = run_op(
             &engine,
             VectorOp::SparseSearch {
-                collection: "col".to_string(),
+                collection: crate::query::qualified::qualify("col"),
                 field_name: "sparse".to_string(),
                 query_entries: vec![(1, 1.0)],
                 top_k: 10,
@@ -518,7 +522,7 @@ mod tests {
         let result = run_op(
             &engine,
             VectorOp::SparseSearch {
-                collection: "never_written".to_string(),
+                collection: crate::query::qualified::qualify("never_written"),
                 field_name: "sparse".to_string(),
                 query_entries: vec![(1, 1.0)],
                 top_k: 10,
@@ -544,7 +548,7 @@ mod tests {
     async fn vector_op_multi_vector_score_search_returns_bad_request() {
         let engine = make_engine().await;
         let op = VectorOp::MultiVectorScoreSearch {
-            collection: "col".to_string(),
+            collection: crate::query::qualified::qualify("col"),
             field_name: String::new(),
             query_vector: vec![1.0, 2.0],
             top_k: 5,
@@ -567,7 +571,7 @@ mod tests {
     async fn vector_op_insert_routes_to_vector_insert_impl() {
         let engine = make_engine().await;
         let op = VectorOp::Insert {
-            collection: "col".to_string(),
+            collection: crate::query::qualified::qualify("col"),
             vector: vec![1.0f32, 0.0, 0.0, 0.0],
             dim: 4,
             field_name: String::new(),
@@ -589,7 +593,7 @@ mod tests {
         let engine = make_engine().await;
         // Insert first.
         let insert_op = VectorOp::Insert {
-            collection: "col".to_string(),
+            collection: crate::query::qualified::qualify("col"),
             vector: vec![1.0f32, 0.0, 0.0, 0.0],
             dim: 4,
             field_name: String::new(),
@@ -604,7 +608,7 @@ mod tests {
 
         // The HNSW node id for the first insert is 0.
         let delete_op = VectorOp::Delete {
-            collection: "col".to_string(),
+            collection: crate::query::qualified::qualify("col"),
             vector_id: 0u32,
         };
         let result = super::execute_vector_op(&engine, &delete_op)

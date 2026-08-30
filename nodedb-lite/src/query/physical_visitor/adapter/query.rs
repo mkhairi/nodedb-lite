@@ -44,7 +44,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             grouping_sets,
             ..
         } => {
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let group_by = group_by.clone();
             let aggregates = aggregates.clone();
             let filters = filters.clone();
@@ -71,7 +71,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             aggregates,
             filters,
         } => {
-            let collection = collection.clone();
+            let collection = collection.to_string();
             let group_by = group_by.clone();
             let aggregates = aggregates.clone();
             let filters = filters.clone();
@@ -106,8 +106,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                 None,
                 &[left_rls_filters.as_slice(), right_rls_filters.as_slice()],
             )?;
-            let lc = left_collection.clone();
-            let rc = right_collection.clone();
+            let lc = left_collection.to_string();
+            let rc = right_collection.to_string();
             let la = left_alias.clone();
             let ra = right_alias.clone();
             let on = on.clone();
@@ -183,8 +183,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                         .into(),
                 });
             }
-            let lc = left_collection.clone();
-            let rc = right_collection.clone();
+            let lc = left_collection.to_string();
+            let rc = right_collection.to_string();
             let cond = condition.clone();
             let jt = join_type.clone();
             let lim = *limit;
@@ -212,8 +212,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                         .into(),
                 });
             }
-            let lc = left_collection.clone();
-            let rc = right_collection.clone();
+            let lc = left_collection.to_string();
+            let rc = right_collection.to_string();
             let on = on.clone();
             let jt = join_type.clone();
             let lim = *limit;
@@ -229,7 +229,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             fields,
             limit_per_facet,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let filt = filters.clone();
             let fields = fields.clone();
             let lpf = *limit_per_facet;
@@ -247,7 +247,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             distinct,
             limit,
         } => {
-            let col = collection.clone();
+            let col = collection.to_string();
             let bf = base_filters.clone();
             let rf = recursive_filters.clone();
             let jl = join_link.clone();
@@ -294,7 +294,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         } => {
             let op_clone = outer_plan.as_ref().clone();
             let oa = outer_alias.clone();
-            let ic = inner_collection.clone();
+            let ic = inner_collection.to_string();
             let inf = inner_filters.clone();
             let iob = inner_order_by.clone();
             let il = *inner_limit;
@@ -323,7 +323,7 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         } => {
             let op_clone = outer_plan.as_ref().clone();
             let oa = outer_alias.clone();
-            let ic = inner_collection.clone();
+            let ic = inner_collection.to_string();
             let inf = inner_filters.clone();
             let cp = correlation_predicates.clone();
             let la = lateral_alias.clone();
