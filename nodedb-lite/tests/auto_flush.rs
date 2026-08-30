@@ -52,6 +52,10 @@ async fn auto_flush_persists_without_explicit_flush() {
         // Wait long enough for at least one auto-flush tick (200 ms interval,
         // first tick is immediate on native Tokio; second tick fires at ~200 ms).
         tokio::time::sleep(Duration::from_millis(450)).await;
+        // The auto-flush task holds a strong handle while it flushes, so a bare
+        // drop can return before the store closes and the reopen below then
+        // races the file lock. `shutdown` is the documented way to stop it.
+        db.shutdown().await;
 
         // Drop without explicit flush — the auto-flush task already ran.
     }
@@ -148,6 +152,10 @@ async fn open_with_config_honors_auto_flush_ms() {
 
         // The documented bound elapses several times over.
         tokio::time::sleep(Duration::from_millis(450)).await;
+        // The auto-flush task holds a strong handle while it flushes, so a bare
+        // drop can return before the store closes and the reopen below then
+        // races the file lock. `shutdown` is the documented way to stop it.
+        db.shutdown().await;
 
         // Drop without an explicit flush — this stands in for process death.
     }
@@ -209,6 +217,10 @@ async fn open_with_config_bounds_crdt_state_durability() {
         }
 
         tokio::time::sleep(Duration::from_millis(450)).await;
+        // The auto-flush task holds a strong handle while it flushes, so a bare
+        // drop can return before the store closes and the reopen below then
+        // races the file lock. `shutdown` is the documented way to stop it.
+        db.shutdown().await;
 
         // Drop without an explicit flush.
     }
@@ -264,6 +276,10 @@ async fn open_honors_default_auto_flush_ms() {
 
         // Default interval is 1000 ms.
         tokio::time::sleep(Duration::from_millis(1_500)).await;
+        // The auto-flush task holds a strong handle while it flushes, so a bare
+        // drop can return before the store closes and the reopen below then
+        // races the file lock. `shutdown` is the documented way to stop it.
+        db.shutdown().await;
     }
 
     {
@@ -305,6 +321,10 @@ async fn open_with_budget_honors_default_auto_flush_ms() {
             .expect("kv_put");
 
         tokio::time::sleep(Duration::from_millis(1_500)).await;
+        // The auto-flush task holds a strong handle while it flushes, so a bare
+        // drop can return before the store closes and the reopen below then
+        // races the file lock. `shutdown` is the documented way to stop it.
+        db.shutdown().await;
     }
 
     {
@@ -346,6 +366,10 @@ async fn open_at_path_with_config_honors_auto_flush_ms() {
             .expect("kv_put");
 
         tokio::time::sleep(Duration::from_millis(450)).await;
+        // The auto-flush task holds a strong handle while it flushes, so a bare
+        // drop can return before the store closes and the reopen below then
+        // races the file lock. `shutdown` is the documented way to stop it.
+        db.shutdown().await;
     }
 
     {
@@ -390,6 +414,10 @@ async fn open_with_config_auto_flush_ms_zero_leaves_writes_unflushed() {
 
         // Long enough that any spawned task would have fired repeatedly.
         tokio::time::sleep(Duration::from_millis(450)).await;
+        // The auto-flush task holds a strong handle while it flushes, so a bare
+        // drop can return before the store closes and the reopen below then
+        // races the file lock. `shutdown` is the documented way to stop it.
+        db.shutdown().await;
     }
 
     {
