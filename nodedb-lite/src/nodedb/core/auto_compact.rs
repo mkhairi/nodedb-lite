@@ -86,19 +86,30 @@ impl<S: StorageEngine> NodeDbLite<S> {
                     None => break,
                 };
 
+                // A pass holds the writer for its whole duration, and that
+                // duration grows with the store. Both ends are logged at INFO,
+                // with how long it took, because without them a write that
+                // stalled during a pass is indistinguishable from a write that
+                // stalled for any other reason — the correlation had to be
+                // inferred from the periodicity of the timestamps.
+                tracing::info!("auto-compact starting");
+                let started_ms = crate::runtime::now_millis();
                 match db.compact().await {
                     Ok(outcome) => {
-                        if outcome.reclaimed_pages > 0 || outcome.file_bytes_freed > 0 {
-                            tracing::debug!(
-                                reclaimed_pages = outcome.reclaimed_pages,
-                                segments_repacked = outcome.segments_repacked,
-                                file_bytes_freed = outcome.file_bytes_freed,
-                                "auto-compact reclaimed space"
-                            );
-                        }
+                        tracing::info!(
+                            elapsed_ms = crate::runtime::now_millis().saturating_sub(started_ms),
+                            reclaimed_pages = outcome.reclaimed_pages,
+                            segments_repacked = outcome.segments_repacked,
+                            file_bytes_freed = outcome.file_bytes_freed,
+                            "auto-compact complete"
+                        );
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "auto-compact failed");
+                        tracing::warn!(
+                            elapsed_ms = crate::runtime::now_millis().saturating_sub(started_ms),
+                            error = %e,
+                            "auto-compact failed"
+                        );
                     }
                 }
 
