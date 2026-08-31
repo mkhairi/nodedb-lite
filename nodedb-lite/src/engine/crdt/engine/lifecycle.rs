@@ -96,6 +96,7 @@ impl CrdtEngine {
             delta_bytes: HashMap::new(),
             next_delta_seq: HashMap::new(),
             state_epochs: HashMap::new(),
+            compacted_versions: HashMap::new(),
             delta_writes: 0,
             snapshot_exports: AtomicU64::new(0),
             indexes: None,
