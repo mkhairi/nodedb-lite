@@ -29,12 +29,24 @@ impl From<PagedbError> for LiteError {
                 detail: format!("pagedb quota exceeded: {e}"),
             },
             // `Unsupported` is returned by the OPFS VFS shim when the `opfs`
-            // feature is absent, and also by `OpfsVfs::new` if the worker
-            // spawn fails. Surface it as `WorkerFailed` so callers can
-            // distinguish it from generic I/O failures without string-matching.
+            // feature is absent, and by `OpfsVfs::new` if the worker spawn
+            // fails — but pagedb also returns it from the structural-header,
+            // catalog and segment-footer decoders, which is what a damaged page
+            // produces. Off wasm there is no OPFS anywhere, so blaming the
+            // worker there points the operator at a feature flag when the real
+            // answer is a page that would not decode. Only claim the OPFS cause
+            // on the target that can actually have one.
+            #[cfg(target_arch = "wasm32")]
             PagedbError::Unsupported => LiteError::WorkerFailed {
                 detail: "pagedb OPFS VFS returned Unsupported — ensure the opfs feature is \
                          enabled and the worker URL is correct"
+                    .to_string(),
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            PagedbError::Unsupported => LiteError::Storage {
+                detail: "pagedb returned Unsupported — a page, catalog entry or segment \
+                         footer did not decode. On a native store this is a damaged or \
+                         foreign store, not a build-feature problem"
                     .to_string(),
             },
             other => LiteError::Storage {
