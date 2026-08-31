@@ -110,10 +110,24 @@ where
     }
 
     let Some(meta) = delegate.get_collection_meta(name).await else {
-        tracing::debug!(
-            collection = %name,
-            "no persisted metadata; skipping schema announce (implicit collection)"
-        );
+        // Skipping the announce is not a quiet no-op: Origin has never heard of
+        // the collection, so it cannot materialise it, and every delta for it
+        // is refused with PERMISSION_DENIED and blocks forever. The refusal
+        // surfaces far from here and names a permission rather than a missing
+        // announce, so say it once, at WARN, with the consequence attached.
+        if client
+            .unannounceable_reported()
+            .lock()
+            .await
+            .insert(name.to_string())
+        {
+            tracing::warn!(
+                collection = %name,
+                "no persisted metadata, so this collection cannot be announced to Origin; \
+                 its deltas will be refused (PERMISSION_DENIED) and stay queued — Origin \
+                 cannot materialise a collection it was never told about"
+            );
+        }
         return ControlFlow::Continue(());
     };
     let Some(descriptor) = descriptor_from_meta(&meta) else {
