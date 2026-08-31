@@ -104,6 +104,12 @@ pub struct SyncClient {
     /// session re-announces every collection with pending deltas, mirroring
     /// Origin's per-session announced set in `session_handler/announce.rs`.
     pub(super) announced_collections: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Collections whose announce was skipped for want of a descriptor, and
+    /// which have already been reported. Skipping is silent per attempt and
+    /// retried on every push, so without this the log carries one line per
+    /// attempt — 171 in a five-minute session — while the consequence is
+    /// reported once, much later, as a permission denial from Origin.
+    pub(super) unannounceable_reported: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Highest `RowPushMsg.sequence` applied so far, keyed by
     /// `(peer_id, collection)`.
     ///
@@ -178,6 +184,7 @@ impl SyncClient {
                 crate::sync::client::token::TOKEN_REFRESH_MIN_BACKOFF_MS,
             )),
             announced_collections: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            unannounceable_reported: Arc::new(Mutex::new(std::collections::HashSet::new())),
             row_push_watermark: Arc::new(Mutex::new(std::collections::HashMap::new())),
             delta_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_row_push_rejects: Arc::new(Mutex::new(Vec::new())),
@@ -296,6 +303,10 @@ impl SyncClient {
     /// Access the per-session array push state.
     pub(crate) fn array_push(&self) -> &Arc<Mutex<ArrayPushWindow>> {
         &self.array_push
+    }
+
+    pub(crate) fn unannounceable_reported(&self) -> &Arc<Mutex<std::collections::HashSet<String>>> {
+        &self.unannounceable_reported
     }
 
     /// Returns true when this row push should be applied.
