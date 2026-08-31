@@ -61,6 +61,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
             return;
         }
 
+        // Same replacement rule as auto-flush: two tasks of one kind hold the
+        // database alive between them and it can then never be dropped.
+        self.tasks.stop_nowait(crate::tasks::TaskKind::AutoCompact);
+
         let weak: Weak<Self> = Arc::downgrade(self);
         let period = Duration::from_millis(interval_ms);
 

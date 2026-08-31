@@ -106,6 +106,28 @@ impl TaskRegistry {
         self.lock().iter().any(|task| task.kind == kind)
     }
 
+    /// Signal every task of `kind` to stop, without waiting for it.
+    ///
+    /// For a caller that is replacing a periodic task from a synchronous
+    /// context and cannot await the old one. The outgoing task leaves its loop
+    /// at its next stop check and is dropped from the registry now, so it can
+    /// no longer hold the database alive past its current iteration — which is
+    /// what two overlapping tasks of the same kind do to each other.
+    ///
+    /// Returns `true` when at least one task was signalled.
+    pub fn stop_nowait(&self, kind: TaskKind) -> bool {
+        let taken: Vec<Registered> = {
+            let mut tasks = self.lock();
+            let (matching, rest) = tasks.drain(..).partition(|task| task.kind == kind);
+            *tasks = rest;
+            matching
+        };
+        for task in &taken {
+            let _ = task.stop.send(true);
+        }
+        !taken.is_empty()
+    }
+
     /// Stop every task of `kind` and wait for it to wind down.
     ///
     /// Returns `true` when at least one task was running.
