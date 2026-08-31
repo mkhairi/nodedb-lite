@@ -506,3 +506,28 @@ async fn vector_insert_after_last_vector_deleted_is_searchable() {
         );
     }
 }
+
+/// A re-inserted id that is the only vector in its index still answers
+/// search. Tombstoning the old node before the new one is linked could
+/// strand the entry point with nothing to take over.
+#[tokio::test]
+async fn reinserting_the_only_id_keeps_it_searchable() {
+    let db = open_db().await;
+    db.vector_insert("solo", "x", &[1.0, 0.0, 0.0], None)
+        .await
+        .expect("first x");
+    db.vector_insert("solo", "x", &[0.0, 1.0, 0.0], None)
+        .await
+        .expect("second x");
+
+    let hits = db
+        .vector_search("solo", &[0.0, 1.0, 0.0], 10, None, None)
+        .await
+        .expect("vector_search");
+    assert_eq!(hits.len(), 1, "one id, one result, got {hits:?}");
+    assert_eq!(hits[0].id, "x");
+    assert!(
+        hits[0].distance.abs() < 1e-5,
+        "scored against the latest vector"
+    );
+}
