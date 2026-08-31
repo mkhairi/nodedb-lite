@@ -103,11 +103,10 @@ async fn reset_index<S: StorageEngine>(
             *index = HnswIndex::new(index.dim(), index.params().clone());
         }
     }
-    let prefix = format!("{index_key}:");
     vector_state
         .vector_id_map
         .lock_or_recover()
-        .retain(|k, _| !k.starts_with(&prefix));
+        .clear_index(index_key);
     vector_state.unloadable.lock_or_recover().remove(index_key);
     crate::engine::vector::sidecar::remove_sidecar(vector_state, index_key).await?;
     // The checkpoint describes the old graph; the next flush writes the

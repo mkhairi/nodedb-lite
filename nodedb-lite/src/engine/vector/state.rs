@@ -17,12 +17,15 @@ use nodedb_types::vector_dtype::VectorStorageDtype;
 use nodedb_vector::rerank::CodecSidecar;
 
 use crate::engine::vector::HnswIndex;
+use crate::engine::vector::id_map::VectorIdMap;
 use crate::storage::engine::StorageEngine;
 
 pub struct VectorState<S: StorageEngine> {
     pub(crate) hnsw_indices: Mutex<HashMap<String, HnswIndex>>,
-    /// composite_key → (doc_id, vector_id)
-    pub(crate) vector_id_map: Mutex<HashMap<String, (String, u32)>>,
+    /// Slot ↔ document id, both directions. See [`VectorIdMap`]: the reverse
+    /// direction is what lets an insert replace a document's existing vector
+    /// instead of appending a second one for the same id.
+    pub(crate) vector_id_map: Mutex<VectorIdMap>,
     pub(crate) search_ef: usize,
     pub(crate) storage: Arc<S>,
     /// index_key → trained codec sidecar (populated by S2.a.11).
@@ -88,7 +91,7 @@ impl<S: StorageEngine> VectorState<S> {
     pub fn new(storage: Arc<S>, search_ef: usize, memory: ScopedMemory) -> Self {
         Self {
             hnsw_indices: Mutex::new(HashMap::new()),
-            vector_id_map: Mutex::new(HashMap::new()),
+            vector_id_map: Mutex::new(VectorIdMap::default()),
             search_ef,
             storage,
             codec_sidecars: Arc::new(Mutex::new(HashMap::new())),
@@ -101,7 +104,7 @@ impl<S: StorageEngine> VectorState<S> {
     pub fn from_restored(restored: RestoredVectorState<S>) -> Self {
         Self {
             hnsw_indices: Mutex::new(restored.indices),
-            vector_id_map: Mutex::new(restored.id_map),
+            vector_id_map: Mutex::new(VectorIdMap::from_slots(restored.id_map)),
             search_ef: restored.search_ef,
             storage: restored.storage,
             codec_sidecars: Arc::new(Mutex::new(HashMap::new())),

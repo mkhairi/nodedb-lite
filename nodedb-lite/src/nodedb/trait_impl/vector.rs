@@ -113,19 +113,54 @@ impl<S: StorageEngine> NodeDbLite<S> {
             };
             let mut indices = self.vector_state.hnsw_indices.lock_or_recover();
             let index = ensure_hnsw(&mut indices, collection, embedding.len(), dtype);
+
+            // Replace, don't append. Inserting the same document id twice used
+            // to leave two live slots, and one ANN query then answered with
+            // that document twice — which inflates its contribution to any
+            // fusion downstream and makes a re-embedded document outrank its
+            // peers for no reason. Re-embedding is routine (model change,
+            // backfill), so this is the common path, not an edge case.
+            //
+            // HNSW deletes are tombstones, reclaimed on a later rebuild rather
+            // than in place, so the superseded slot costs index space until
+            // then. That is the same contract `vector_delete` already has.
+            let superseded = self
+                .vector_state
+                .vector_id_map
+                .lock_or_recover()
+                .slot_of(collection, id);
+
             let id_before = index.len() as u32;
             index
                 .insert(embedding.to_vec())
                 .map_err(NodeDbError::bad_request)?;
+
+            // Tombstone the old slot only after the replacement is in. Node ids
+            // are never reused, so the order is free — but tombstoning first
+            // can strand the graph's entry point with nothing yet linked to
+            // take its place.
+            if let Some(slot) = superseded
+                && slot != id_before
+            {
+                index.delete(slot);
+            }
             id_before
         };
 
         {
             let mut id_map = self.vector_state.vector_id_map.lock_or_recover();
-            id_map.insert(
-                format!("{collection}:{internal_id}"),
-                (id.to_string(), internal_id),
-            );
+            // Returns the slot this document used to occupy, now tombstoned
+            // above; its sidecar entry has to go with it, or a rerank reads an
+            // encoding of the vector this write just replaced.
+            if let Some(previous) = id_map.slot_of(collection, id)
+                && previous != internal_id
+            {
+                let mut sidecars = self.vector_state.codec_sidecars.lock_or_recover();
+                if let Some(sidecar) = sidecars.get_mut(collection) {
+                    sidecar.remove(previous);
+                }
+            }
+            id_map.bind(collection, id, internal_id);
         }
 
         // Lazily install a sidecar if the collection config calls for one, then
@@ -312,10 +347,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         {
             let mut id_map = self.vector_state.vector_id_map.lock_or_recover();
-            id_map.insert(
-                format!("{index_key}:{internal_id}"),
-                (id.to_string(), internal_id),
-            );
+            id_map.bind(&index_key, id, internal_id);
         }
 
         // Lazily install a sidecar if the collection config calls for one, then

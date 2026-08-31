@@ -147,10 +147,10 @@ pub(super) async fn insert_node<S: StorageEngine>(
             })?;
         id_before
     };
-    vector_state.vector_id_map.lock_or_recover().insert(
-        format!("{index_key}:{internal_id}"),
-        (doc_id.to_string(), internal_id),
-    );
+    vector_state
+        .vector_id_map
+        .lock_or_recover()
+        .bind(index_key, doc_id, internal_id);
     match crate::engine::vector::sidecar::ensure_sidecar(vector_state, index_key) {
         Ok(true) => {
             let mut sidecars = vector_state.codec_sidecars.lock_or_recover();
