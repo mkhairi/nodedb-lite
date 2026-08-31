@@ -33,8 +33,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// db.start_auto_flush(5_000); // slow the flusher down to five seconds
     /// ```
     ///
-    /// Each call spawns an additional task rather than replacing the running
-    /// one, so opening with `auto_flush_ms: 0` is the way to take full manual
+    /// Each call replaces the auto-flush task already running rather than
+    /// adding a second one. Two tasks of this kind keep the database alive
+    /// between them — each holds a strong handle across its flush, and their
+    /// hold windows overlap — so the store could never be dropped and every
+    /// later reopen failed with "already open".
+    ///
+    /// Opening with `auto_flush_ms: 0` is still the way to take full manual
     /// control of when flushes happen.
     ///
     /// # Task lifecycle
@@ -52,6 +57,21 @@ impl<S: StorageEngine> NodeDbLite<S> {
         if interval_ms == 0 {
             return;
         }
+
+        // Replace any auto-flush task already running, rather than adding a
+        // second one. Each task upgrades its `Weak` to a strong handle and
+        // holds it across the flush; one task's hold window has gaps, and the
+        // database drops in a gap. Two tasks on the same period interleave, so
+        // the strong count never reaches zero, neither `Weak` upgrade ever
+        // fails, and neither task ever takes its exit branch. The store is then
+        // never dropped, its file lock is held for the life of the process, and
+        // every reopen fails with "already open".
+        //
+        // Calling this to change the interval is documented usage, and
+        // `open_with_config` has already started one from
+        // `LiteConfig::auto_flush_ms`, so reaching the two-task state took
+        // nothing more than following the docs.
+        self.tasks.stop_nowait(crate::tasks::TaskKind::AutoFlush);
 
         let weak: Weak<Self> = Arc::downgrade(self);
         let period = Duration::from_millis(interval_ms);
