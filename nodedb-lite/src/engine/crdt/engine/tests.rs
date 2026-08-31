@@ -184,6 +184,45 @@ fn vector_clock_export() {
     );
 }
 
+/// A second compaction with no writes in between must do nothing at all.
+///
+/// Compaction drops a collection's checkpoint marks, which forces the next
+/// flush to rewrite its whole base snapshot — an O(document) export. A
+/// periodic tick that compacts unconditionally therefore rewrites the entire
+/// store's snapshot set on a fixed interval whether or not anything changed,
+/// which is what grew an idle store by ~124 MB every five minutes.
+#[test]
+fn compacting_twice_without_writes_leaves_the_second_pass_with_nothing_to_do() {
+    let mut engine = CrdtEngine::new(1).unwrap();
+    for i in 0..10 {
+        engine
+            .upsert("items", &format!("i{i}"), &[("val", LoroValue::I64(i))])
+            .unwrap();
+    }
+
+    engine.compact_history().unwrap();
+    let epoch_after_first = engine.state_epoch("items");
+
+    // No writes in between.
+    engine.compact_history().unwrap();
+    assert_eq!(
+        engine.state_epoch("items"),
+        epoch_after_first,
+        "an unchanged collection must not be compacted again, or its next \
+         flush rewrites a base snapshot that did not change"
+    );
+
+    // A write makes it due again.
+    engine
+        .upsert("items", "i10", &[("val", LoroValue::I64(10))])
+        .unwrap();
+    engine.compact_history().unwrap();
+    assert!(
+        engine.state_epoch("items") > epoch_after_first,
+        "a collection that took writes must still be compacted"
+    );
+}
+
 #[test]
 fn compact_history_preserves_state() {
     let mut engine = CrdtEngine::new(1).unwrap();
