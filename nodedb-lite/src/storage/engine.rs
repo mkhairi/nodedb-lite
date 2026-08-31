@@ -48,6 +48,13 @@ pub struct CompactionOutcome {
     pub reclaimed_segments: u64,
     /// Bytes freed by deleting tombstoned segment files.
     pub segment_bytes_freed: u64,
+    /// True when compaction declined to run because a reader pinned the page
+    /// range, leaving every count above at zero.
+    ///
+    /// Without this, that outcome is indistinguishable from a pass that ran
+    /// and found the store already dense — and the two call for opposite
+    /// responses: retry with no readers, or stop asking.
+    pub declined_readers_pinned: bool,
 }
 
 /// A write operation for batch writes.
