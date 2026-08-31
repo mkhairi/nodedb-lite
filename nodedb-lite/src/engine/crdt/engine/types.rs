@@ -161,6 +161,15 @@ pub struct CrdtEngine {
     /// describes it. Each write carries the epoch it was planned at and is
     /// applied only while that still matches.
     pub(in crate::engine::crdt) state_epochs: HashMap<String, u64>,
+    /// Each collection's oplog frontier as of its last history compaction.
+    ///
+    /// Compaction discards history behind the frontier, so a collection whose
+    /// frontier has not moved since has no new history to discard and must be
+    /// left alone. Compacting it anyway is not merely wasted work: it drops the
+    /// collection's checkpoint marks, which forces the next flush to rewrite
+    /// its whole base snapshot. On a periodic tick over an idle store that
+    /// rewrites every collection, every tick, forever.
+    pub(in crate::engine::crdt) compacted_versions: HashMap<String, loro::VersionVector>,
     /// Pending deltas whose stored form is not known to match the queue, each
     /// with the revision of the entry that made it dirty.
     ///

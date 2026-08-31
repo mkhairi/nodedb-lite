@@ -85,6 +85,7 @@ impl CrdtEngine {
             delta_bytes: HashMap::new(),
             next_delta_seq: HashMap::new(),
             state_epochs: HashMap::new(),
+            compacted_versions: HashMap::new(),
             delta_writes: 0,
             snapshot_exports: AtomicU64::new(0),
             blocked_deltas: std::collections::HashSet::new(),
@@ -256,11 +257,38 @@ impl CrdtEngine {
     /// Replaces each internal LoroDoc with a shallow snapshot. Historical
     /// operations are discarded. Current state is fully preserved.
     pub fn compact_history(&mut self) -> Result<(), LiteError> {
-        for (collection, state) in &mut self.states {
+        // Only collections whose frontier has moved since their last
+        // compaction. Compaction discards history behind the frontier, so a
+        // collection that has taken no operations since has none to discard.
+        //
+        // Skipping them is the whole point. The bookkeeping below forces the
+        // next flush to rewrite a compacted collection's base snapshot, and a
+        // snapshot export is O(document). Doing that for every collection on
+        // every periodic tick rewrote the entire store's snapshot set on a
+        // fixed interval whether anything had changed or not — measured at
+        // ~124 MB every five minutes on an idle dogfood store, none of which
+        // is reclaimed until a restart.
+        let due: Vec<String> = self
+            .states
+            .iter()
+            .filter(|(collection, state)| {
+                let frontier = state.oplog_version_vector();
+                self.compacted_versions.get(*collection) != Some(&frontier)
+            })
+            .map(|(collection, _)| collection.clone())
+            .collect();
+
+        for collection in &due {
+            let Some(state) = self.states.get_mut(collection) else {
+                continue;
+            };
             state.compact_history().map_err(|e| LiteError::Storage {
                 detail: format!("history compaction for '{collection}' failed: {e}"),
             })?;
+            let frontier = state.oplog_version_vector();
+            self.compacted_versions.insert(collection.clone(), frontier);
         }
+
         // Compaction rewrites the document without advancing its frontier, so
         // neither the persisted base nor the updates on top of it describe the
         // document any more, and the discarded history means an update export
@@ -272,12 +300,15 @@ impl CrdtEngine {
         // Advancing the epoch is what keeps a flush that is committing right
         // now from putting the marks back: its writes were exported from the
         // document this call just replaced.
-        self.flushed_versions.clear();
-        self.checkpoint_bytes.clear();
-        self.delta_bytes.clear();
-        let compacted: Vec<String> = self.states.keys().cloned().collect();
-        for collection in compacted {
-            self.advance_state_epoch(&collection);
+        //
+        // Both are per collection, and only for the ones actually compacted —
+        // clearing the maps wholesale also discarded the marks of collections
+        // this call never touched.
+        for collection in &due {
+            self.flushed_versions.remove(collection);
+            self.checkpoint_bytes.remove(collection);
+            self.delta_bytes.remove(collection);
+            self.advance_state_epoch(collection);
         }
         Ok(())
     }
