@@ -432,3 +432,59 @@ async fn open_with_config_auto_flush_ms_zero_leaves_writes_unflushed() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// changing the interval must not make the store unopenable
+// ---------------------------------------------------------------------------
+
+/// Opening with a config interval and then calling `start_auto_flush` — the
+/// documented way to change the interval — must leave the store reopenable.
+///
+/// It used to leave two auto-flush tasks running on one database. Each upgrades
+/// its `Weak` to a strong handle and holds it across the flush; one task's hold
+/// window has gaps and the database drops in a gap, but two tasks on the same
+/// period interleave, so the strong count never reaches zero. Neither `Weak`
+/// upgrade ever fails, neither task ever exits, and the store's file lock is
+/// held for the life of the process — twenty ticks of waiting did not help,
+/// because the lock was not slow to release, it was never released.
+///
+/// No `shutdown()` here on purpose: the point is that a plain drop suffices.
+#[tokio::test]
+async fn changing_the_flush_interval_leaves_the_store_reopenable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("interval_change.pagedb");
+
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .expect("open storage");
+        let config = LiteConfig {
+            auto_flush_ms: 200,
+            ..LiteConfig::default()
+        };
+        let db = Arc::new(
+            NodeDbLite::open_with_config(storage, config)
+                .await
+                .expect("open db"),
+        );
+        // The documented "change the interval afterwards" call.
+        db.start_auto_flush(200);
+
+        db.kv_put("col", "key", b"interval_change")
+            .await
+            .expect("kv_put");
+        tokio::time::sleep(Duration::from_millis(450)).await;
+    }
+
+    // Give whatever tick was in flight room to finish and let go.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+        .await
+        .expect("the store must be reopenable after a plain drop");
+    let db = NodeDbLite::open(storage).await.expect("reopen db");
+    assert_eq!(
+        db.kv_get("col", "key").await.expect("kv_get").as_deref(),
+        Some(b"interval_change".as_slice()),
+    );
+}
