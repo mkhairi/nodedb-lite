@@ -241,6 +241,7 @@ where
             file_bytes_freed: stats.bytes_truncated,
             reclaimed_segments: gc.reclaimed_segments,
             segment_bytes_freed: gc.reclaimed_bytes,
+            declined_readers_pinned: stats.declined_readers_pinned,
         })
     }
 
