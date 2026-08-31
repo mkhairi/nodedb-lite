@@ -193,10 +193,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
                 {
                     let mut id_map = self.vector_state.vector_id_map.lock_or_recover();
-                    id_map.insert(
-                        format!("{}:{internal_id}", item.vector_collection),
-                        (item.id.to_string(), internal_id),
-                    );
+                    id_map.bind(item.vector_collection, item.id, internal_id);
                 }
 
                 match sidecar::ensure_sidecar(&self.vector_state, item.vector_collection) {

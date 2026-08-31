@@ -94,10 +94,7 @@ where
         };
         {
             let mut id_map = vector_state.vector_id_map.lock_or_recover();
-            id_map.insert(
-                format!("{index_key}:{internal_id}"),
-                (doc_id.clone(), internal_id),
-            );
+            id_map.bind(&index_key, &doc_id, internal_id);
         }
         match crate::engine::vector::sidecar::ensure_sidecar(&vector_state, &index_key) {
             Ok(true) => {
@@ -297,10 +294,7 @@ where
         };
         {
             let mut id_map = vector_state.vector_id_map.lock_or_recover();
-            id_map.insert(
-                format!("{index_key}:{internal_id}"),
-                (doc_id.clone(), internal_id),
-            );
+            id_map.bind(&index_key, &doc_id, internal_id);
         }
         match crate::engine::vector::sidecar::ensure_sidecar(&vector_state, &index_key) {
             Ok(true) => {
@@ -443,8 +437,7 @@ where
 
         {
             let mut map = vector_state.vector_id_map.lock_or_recover();
-            let prefix = format!("{index_key}:");
-            map.retain(|k, _| !k.starts_with(&prefix));
+            map.clear_index(&index_key);
         }
         vector_state
             .per_index_config

@@ -148,9 +148,7 @@ pub(super) async fn ensure_index_loaded<S: StorageEngine>(
                     );
                     {
                         let mut map = vector_state.vector_id_map.lock_or_recover();
-                        let prefix = format!("{index_key}:");
-                        map.retain(|k, _| !k.starts_with(&prefix));
-                        map.extend(id_map);
+                        map.replace_index(index_key, id_map);
                     }
                     index = rebuilt;
                 }

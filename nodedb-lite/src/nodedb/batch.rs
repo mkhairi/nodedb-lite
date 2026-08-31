@@ -72,10 +72,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 index
                     .insert(embedding.to_vec())
                     .map_err(NodeDbError::bad_request)?;
-                id_map.insert(
-                    format!("{collection}:{internal_id}"),
-                    (id.to_string(), internal_id),
-                );
+                id_map.bind(collection, id, internal_id);
             }
         }
 
