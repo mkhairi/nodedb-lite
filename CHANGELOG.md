@@ -16,6 +16,12 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 >
 > Public API and exported FFI symbol signatures stay unfrozen until that tag.
 
+### Fixed
+
+- Shutdown no longer aborts an in-flight auto-flush or auto-compaction after
+  5 s; it waits for the pass to finish, so a stop during a long flush cannot
+  leave a half-written segment in `seg/.staging` (aql#163, NDB-AQL-40).
+
 ---
 
 [Unreleased]: https://github.com/NodeDB-Lab/nodedb-lite/commits/main
