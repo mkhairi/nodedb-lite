@@ -43,16 +43,11 @@ tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sonic-rs = "0.5"
-# Pinned to upstream main, past the 0.7.1 tag. The derived codecs were
-# `inline(always)`, which folds whole codec trees into one function and makes
-# large plan enums cost minutes to compile; the fix is merged upstream but was
-# not in 0.7.1. Must stay byte-identical to the nodedb workspace pin, or a
-# workspace that path-depends on both gets two zerompk copies and the derived
-# traits stop unifying. Drop the git source once a release carries it.
-zerompk = { version = "0.7", git = "https://github.com/nuskey8/zerompk", rev = "75d527ff8930341c859a757866b0e07f03d09ef8", features = [
-  "std",
-  "derive",
-] }
+# Must stay byte-identical to the nodedb workspace pin, or a workspace that
+# path-depends on both gets two zerompk copies and the derived traits stop
+# unifying. 0.8.0 is the first release carrying the non-`inline(always)`
+# derived codecs this used to pin a git rev for.
+zerompk = { version = "0.8", features = ["std", "derive"] }
 
 # Storage
 # A caret requirement never matches a prerelease, so `version = "0"` could not
