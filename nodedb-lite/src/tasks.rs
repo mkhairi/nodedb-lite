@@ -9,10 +9,12 @@
 //!
 //! Every such task is registered here with a stop signal and a handle. Shutdown
 //! is cooperative first: the signal is set, each task leaves its loop at a point
-//! it chose, and only a task that ignores the signal past
-//! [`TASK_STOP_TIMEOUT`] is aborted. Cancelling a database task at an arbitrary
-//! await point can drop it mid-write, so abort is the backstop, never the
-//! mechanism.
+//! it chose, and a cancel-safe task that ignores the signal past
+//! [`TASK_STOP_TIMEOUT`] is aborted. Auto-flush and auto-compact are not
+//! cancel-safe: each is a chain of pagedb commits and segment writes, and
+//! aborting one at an arbitrary await point can tear a segment mid-write. Past
+//! the timeout those are joined to completion instead of aborted — see
+//! [`TaskKind::is_cancel_unsafe`].
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -33,6 +35,21 @@ pub enum TaskKind {
     AutoFlush,
     AutoCompact,
     Sync,
+}
+
+impl TaskKind {
+    /// Whether a task of this kind can be safely aborted mid-await.
+    ///
+    /// Auto-flush and auto-compact are each a chain of pagedb commits and
+    /// segment writes; cancelling one at an arbitrary await point can tear a
+    /// segment mid-write, and a torn store costs more than a slow shutdown.
+    /// Sync has no such chain and stays a normal abort target.
+    pub(crate) fn is_cancel_unsafe(self) -> bool {
+        match self {
+            TaskKind::AutoFlush | TaskKind::AutoCompact => true,
+            TaskKind::Sync => false,
+        }
+    }
 }
 
 /// The stop side of a task's signal, held by the task itself.
@@ -139,7 +156,7 @@ impl TaskRegistry {
             matching
         };
         let stopped = !taken.is_empty();
-        Self::wind_down(taken).await;
+        Self::wind_down_with(taken, TASK_STOP_TIMEOUT).await;
         stopped
     }
 
@@ -148,21 +165,39 @@ impl TaskRegistry {
     /// Idempotent: a second call has nothing left to stop.
     pub async fn shutdown(&self) {
         let taken: Vec<Registered> = self.lock().drain(..).collect();
-        Self::wind_down(taken).await;
+        Self::wind_down_with(taken, TASK_STOP_TIMEOUT).await;
     }
 
-    /// Signal each task, then join it, aborting whatever outlasts the timeout.
-    async fn wind_down(tasks: Vec<Registered>) {
+    /// Signal each task, then join it, aborting whatever cancel-safe task
+    /// outlasts `timeout`.
+    ///
+    /// A cancel-unsafe task (see [`TaskKind::is_cancel_unsafe`]) is never
+    /// aborted: past `timeout` this keeps waiting on it, logging every
+    /// `timeout` that passes, until it finishes on its own.
+    async fn wind_down_with(tasks: Vec<Registered>, timeout: Duration) {
         // Signal every task before joining any of them, so their wind-downs
         // overlap instead of costing the timeout each in turn.
         for task in &tasks {
             let _ = task.stop.send(true);
         }
         for mut task in tasks {
-            if !task.handle.join_within(TASK_STOP_TIMEOUT).await {
+            if task.handle.join_within(timeout).await {
+                continue;
+            }
+            if task.kind.is_cancel_unsafe() {
+                let mut waited = timeout;
+                while !task.handle.join_within(timeout).await {
+                    waited += timeout;
+                    tracing::warn!(
+                        kind = ?task.kind,
+                        waited_ms = waited.as_millis(),
+                        "background task still finishing an in-flight write; waiting, not aborting"
+                    );
+                }
+            } else {
                 tracing::warn!(
                     kind = ?task.kind,
-                    timeout_ms = TASK_STOP_TIMEOUT.as_millis(),
+                    timeout_ms = timeout.as_millis(),
                     "background task ignored its stop signal; aborting"
                 );
                 task.handle.abort();
@@ -240,7 +275,10 @@ mod tests {
         let registry = TaskRegistry::default();
         let (tx, _signal) = TaskRegistry::signal();
         let handle = crate::runtime::spawn(async move {
-            // Never observes the signal; shutdown must abort it.
+            // Never observes the signal; shutdown must abort it. Sync, not
+            // AutoFlush: a flush-shaped task is never aborted (see the tests
+            // below), so this one has to be the cancel-safe kind to exercise
+            // the abort path at all.
             std::future::pending::<()>().await;
         });
         registry.track(TaskKind::Sync, tx, handle);
@@ -249,5 +287,64 @@ mod tests {
         tokio::time::timeout(TASK_STOP_TIMEOUT * 2, registry.shutdown())
             .await
             .expect("shutdown must not outlast the stop timeout");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_flush_task_instead_of_aborting_it() {
+        let short_timeout = Duration::from_millis(50);
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let registry = TaskRegistry::default();
+        let (tx, _signal) = TaskRegistry::signal();
+        let done = finished.clone();
+        let handle = crate::runtime::spawn(async move {
+            // Ignores the signal and outlasts the timeout several times over;
+            // a flush-shaped task must still be joined, not aborted.
+            tokio::time::sleep(short_timeout * 3).await;
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        registry.track(TaskKind::AutoFlush, tx, handle);
+        let taken: Vec<Registered> = registry.lock().drain(..).collect();
+
+        let started = std::time::Instant::now();
+        TaskRegistry::wind_down_with(taken, short_timeout).await;
+
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "flush task must run to completion, not be aborted"
+        );
+        assert!(
+            started.elapsed() >= short_timeout * 3,
+            "wind-down must have waited for the full sleep, not aborted early"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_still_aborts_a_cancel_safe_task_that_ignores_the_signal() {
+        let short_timeout = Duration::from_millis(50);
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let registry = TaskRegistry::default();
+        let (tx, _signal) = TaskRegistry::signal();
+        let done = finished.clone();
+        let handle = crate::runtime::spawn(async move {
+            std::future::pending::<()>().await;
+            // Unreachable: abort must cut this off before it ever runs.
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        registry.track(TaskKind::Sync, tx, handle);
+        let taken: Vec<Registered> = registry.lock().drain(..).collect();
+
+        tokio::time::timeout(
+            short_timeout * 2,
+            TaskRegistry::wind_down_with(taken, short_timeout),
+        )
+        .await
+        .expect("cancel-safe task must still be aborted within the timeout");
+
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "aborted task must never reach its completion marker"
+        );
     }
 }
