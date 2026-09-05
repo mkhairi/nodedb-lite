@@ -20,6 +20,12 @@ First release. Embedded NodeDB for Linux, macOS, Windows, Android and the browse
 - **Vector index:** search found nothing after the last vector was deleted.
 - **Full-text search:** each reopen rebuilt the index on top of the old memory reservation, so the memory budget ran out.
 
+### Fixed
+
+- Shutdown no longer aborts an in-flight auto-flush or auto-compaction after
+  5 s; it waits for the pass to finish, so a stop during a long flush cannot
+  leave a half-written segment in `seg/.staging` (aql#163, NDB-AQL-40).
+
 ---
 
 [Unreleased]: https://github.com/NodeDB-Lab/nodedb-lite/compare/v0.1.0...HEAD
