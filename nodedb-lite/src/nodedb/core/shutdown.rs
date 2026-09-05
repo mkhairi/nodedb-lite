@@ -17,7 +17,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// Each task is signalled first and leaves its loop at a point it chose.
     /// One that ignores the signal past
     /// [`TASK_STOP_TIMEOUT`](crate::tasks::TASK_STOP_TIMEOUT) is aborted, so
-    /// this returns within roughly that bound.
+    /// this returns within roughly that bound — unless a flush or compaction
+    /// is in progress, in which case it waits for that pass to finish instead
+    /// of aborting it, bounded only by the pass itself.
     ///
     /// Idempotent, and safe on a database that started no tasks. It does not
     /// flush: what is in memory at shutdown is still in memory, so call
