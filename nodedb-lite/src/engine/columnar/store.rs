@@ -1122,6 +1122,8 @@ impl<S: StorageEngine> ColumnarEngine<S> {
 /// Extract a single `Value` from a `DecodedColumn` at the given row index.
 ///
 /// Returns `Value::Null` for rows whose validity bit is false.
+/// Every `DecodedColumn` variant is named below, with no `_` arm: a variant
+/// upstream adds should be a compile error here rather than a silent `Null`.
 fn decoded_column_value(col: &nodedb_columnar::reader::DecodedColumn, row_idx: usize) -> Value {
     use nodedb_columnar::reader::DecodedColumn;
     match col {
