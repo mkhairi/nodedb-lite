@@ -82,6 +82,15 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             }))
         }
 
+        // A physical SetOp merges child PhysicalPlans. Lite has no physical
+        // child-plan executor to recurse into here, so the merge cannot run;
+        // refusing keeps a UNION from silently answering with one branch.
+        QueryOp::SetOp { .. } => Err(LiteError::Unsupported {
+            detail: "SetOp (UNION / INTERSECT / EXCEPT) over physical child plans is not \
+                     executable on the single-node Lite engine"
+                .into(),
+        }),
+
         QueryOp::PartialAggregateState { .. } => Err(LiteError::Unsupported {
             detail: "PartialAggregateState is a distributed shuffle-map op; unsupported on the single-node Lite engine".into(),
         }),

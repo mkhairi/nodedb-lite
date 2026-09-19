@@ -65,6 +65,13 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             collection,
             target_type,
             schema_json,
+            // The plan carries the pre-conversion storage mode because a split
+            // Control/Data Plane leaves the Data Plane's `doc_configs` cache
+            // stale at dispatch time. Lite runs both sides in one process and
+            // re-reads the source format from its own live state inside
+            // `handle_convert_*`, so the hint is redundant here rather than
+            // dropped.
+            source_storage_mode: _,
         } => {
             let col = collection.clone();
             let tt = target_type.clone();

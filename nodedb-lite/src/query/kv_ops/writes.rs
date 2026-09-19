@@ -620,6 +620,7 @@ pub async fn kv_field_set<S: StorageEngine>(
     collection: &str,
     key: &[u8],
     field_updates: &[(String, Vec<u8>)],
+    if_present: bool,
 ) -> Result<QueryResult, LiteError> {
     let rkey = kv_key(collection, key);
     let stored = engine
@@ -630,7 +631,18 @@ pub async fn kv_field_set<S: StorageEngine>(
             detail: e.to_string(),
         })?;
 
+    // `if_present` is what separates SQL UPDATE from the RESP hash-set family:
+    // an UPDATE against an absent key affects no rows rather than creating one.
+    // An expired row counts as absent, which is why the check is repeated in
+    // the expiry branch below rather than done once on `stored`.
+    let absent = QueryResult {
+        columns: vec![],
+        rows: vec![],
+        rows_affected: 0,
+    };
+
     let (old_deadline, mut map) = match stored {
+        None if if_present => return Ok(absent),
         None => (
             0u64,
             std::collections::HashMap::<String, nodedb_types::value::Value>::new(),
@@ -640,6 +652,9 @@ pub async fn kv_field_set<S: StorageEngine>(
                 detail: "corrupt KV entry".into(),
             })?;
             if is_expired(deadline) {
+                if if_present {
+                    return Ok(absent);
+                }
                 (
                     0u64,
                     std::collections::HashMap::<String, nodedb_types::value::Value>::new(),

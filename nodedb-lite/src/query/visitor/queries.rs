@@ -411,11 +411,22 @@ pub(super) fn lower_subquery<'a, S: StorageEngine + 'a>(
         input,
         filters,
         projection,
+        window_functions,
         sort_keys,
         offset,
         distinct,
         limit,
     } = args;
+    // The tail reshapes already-materialized rows and has no window evaluator,
+    // for the same reason it has no expression evaluator (see
+    // `subquery_projection_columns`). Refuse rather than return rows with the
+    // window columns missing.
+    if !window_functions.is_empty() {
+        return Err(LiteError::BadRequest {
+            detail: "a window function over an ORDER BY / OFFSET / DISTINCT subquery is not                      supported; compute the window inside the subquery instead"
+                .into(),
+        });
+    }
     let input = input.clone();
     let filters = filters.to_vec();
     let projection = subquery_projection_columns(projection)?;
@@ -460,7 +471,7 @@ fn subquery_projection_columns(projection: &[Projection]) -> Result<Vec<String>,
                 names.push(qname.rsplit('.').next().unwrap_or(qname).to_string());
             }
             Projection::Star | Projection::QualifiedStar(_) => return Ok(Vec::new()),
-            Projection::Computed { .. } => {
+            Projection::Computed { .. } | Projection::CpComputed { .. } => {
                 return Err(LiteError::BadRequest {
                     detail: "a computed projection over an ORDER BY / OFFSET / DISTINCT subquery \
                              is not supported; select the base columns in the subquery and \

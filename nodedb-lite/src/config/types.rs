@@ -9,8 +9,8 @@ use super::defaults::{
     default_auto_compact_ms, default_auto_flush_ms, default_columnar_percent,
     default_crdt_pending_delta_window, default_document_percent, default_fts_percent,
     default_kv_cache_capacity, default_kv_percent, default_outbound_queue_cap,
-    default_sparse_percent, default_spatial_percent, default_strict_percent,
-    default_sync_enabled, default_timeseries_percent,
+    default_sparse_percent, default_spatial_percent, default_strict_percent, default_sync_enabled,
+    default_timeseries_percent,
 };
 use crate::storage::corruption::CorruptionPolicy;
 

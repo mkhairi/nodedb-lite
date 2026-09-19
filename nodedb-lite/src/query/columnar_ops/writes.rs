@@ -86,6 +86,23 @@ pub fn insert<S: StorageEngine>(
                 inserted_rows.push(row_values);
                 affected += 1;
             }
+            ColumnarInsertIntent::InsertUnique => {
+                // PRIMARY KEY on a natural-key column: a duplicate refuses the
+                // row rather than tombstoning the prior one the way `Insert`
+                // does. PK is column 0, as in the `InsertIfAbsent` arm.
+                if let Some(pk) = row_values.first()
+                    && pk_exists(engine, collection, pk)?
+                {
+                    return Err(LiteError::BadRequest {
+                        detail: format!(
+                            "duplicate key value violates the primary key on '{collection}'"
+                        ),
+                    });
+                }
+                engine.columnar.insert(collection, &row_values)?;
+                inserted_rows.push(row_values);
+                affected += 1;
+            }
             ColumnarInsertIntent::InsertIfAbsent => {
                 // PK is column 0; skip if already present.
                 if let Some(pk) = row_values.first()

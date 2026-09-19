@@ -123,8 +123,12 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         let InsertVisitArgs {
             collection,
             engine: engine_type,
+            // The planner's precomputed lowering. It is a pure function of the
+            // engine type (`engine_rules`), which `execute_insert` already
+            // routes on, so Lite re-derives the same answer rather than
+            // ignoring a decision it would have made differently.
+            route: _,
             rows,
-            column_defaults: _column_defaults,
             if_absent,
             column_schema: _column_schema,
             primary_key,
@@ -143,8 +147,9 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         let UpsertVisitArgs {
             collection,
             engine: engine_type,
+            // See `insert`: a pure function of the engine type Lite re-derives.
+            route: _,
             rows,
-            column_defaults: _column_defaults,
             on_conflict_updates: _on_conflict_updates,
             column_schema: _column_schema,
             primary_key,
@@ -291,7 +296,21 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         target: &str,
         source: &nodedb_sql::types::SqlPlan,
         limit: usize,
+        column_map: &[(String, nodedb_sql::types::SqlExpr)],
     ) -> Result<LiteFut<'a>, LiteError> {
+        // Empty is passthrough — copy each source row unchanged, which is what
+        // `lower_insert_select` does. A non-empty map materializes each target
+        // column from an expression over the source row, and Lite's
+        // INSERT...SELECT path has no expression evaluator, so it would write
+        // the source columns under the wrong names. Refuse instead.
+        if !column_map.is_empty() {
+            return Err(LiteError::BadRequest {
+                detail: "INSERT ... SELECT with an explicit target column list or computed \
+                         columns is not supported; use INSERT INTO <target> SELECT * FROM \
+                         <source> and shape the rows in the source SELECT"
+                    .into(),
+            });
+        }
         lower_insert_select(self.engine, target, source, limit)
     }
 
