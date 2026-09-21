@@ -202,6 +202,11 @@ impl From<LiteError> for nodedb_types::error::NodeDbError {
             LiteError::UniqueViolation { collection, detail } => {
                 NodeDbError::constraint_violation(collection, "unique", detail)
             }
+            // A not-null refusal names its constraint too, rather than being
+            // flattened into a storage error with the constraint only in text.
+            ref e @ LiteError::NotNullViolation { ref collection, .. } => {
+                NodeDbError::constraint_violation(collection.clone(), "not_null", e.to_string())
+            }
             e @ (LiteError::TextIndexMissing { .. } | LiteError::FtsQueryInvalid { .. }) => {
                 NodeDbError::bad_request(e)
             }
@@ -221,6 +226,27 @@ mod tests {
             detail: "disk full".into(),
         };
         assert!(e.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn integrity_violations_keep_their_constraint_through_the_conversion() {
+        let unique = LiteError::UniqueViolation {
+            collection: "items".into(),
+            detail: "sku = \"a\"".into(),
+        };
+        let ndb: nodedb_types::error::NodeDbError = unique.into();
+        assert!(
+            ndb.is_constraint_violation(),
+            "must not flatten into a storage error: {ndb}"
+        );
+        assert!(ndb.to_string().contains("items"));
+
+        let not_null = LiteError::NotNullViolation {
+            collection: "items".into(),
+            column: "sku".into(),
+        };
+        let ndb: nodedb_types::error::NodeDbError = not_null.into();
+        assert!(ndb.is_constraint_violation(), "{ndb}");
     }
 
     #[test]
