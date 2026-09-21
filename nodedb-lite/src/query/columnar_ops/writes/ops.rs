@@ -350,6 +350,78 @@ mod tests {
         .map(|(r, _)| r.rows_affected)
     }
 
+    /// The fixtures above declare the key first, so a positional read of
+    /// column 0 passes them. `pk_idx` comes from the schema instead, and
+    /// this is what pins that: with the key declared second, a positional
+    /// read compares `qty` and lets the duplicate through.
+    async fn seed_late_pk(engine: &LiteQueryEngine<crate::PagedbStorageMem>) {
+        let schema = ColumnarSchema::new(vec![
+            ColumnDef::nullable("qty", ColumnType::Int64),
+            ColumnDef::required("sku", ColumnType::String).with_primary_key(),
+        ])
+        .expect("schema");
+        engine
+            .columnar
+            .create_collection("late_pk", schema, ColumnarProfile::Plain, false)
+            .await
+            .expect("create");
+    }
+
+    async fn run_late_pk(
+        engine: &LiteQueryEngine<crate::PagedbStorageMem>,
+        intent: ColumnarInsertIntent,
+        sku: &str,
+        qty: i64,
+    ) -> Result<u64, LiteError> {
+        let bytes = payload(sku, qty);
+        insert(
+            engine,
+            "late_pk",
+            InsertParams {
+                payload: &bytes,
+                format: "msgpack",
+                intent,
+                on_conflict_updates: &[],
+                surrogates: &[],
+                schema_bytes: &[],
+            },
+        )
+        .await
+        .map(|(r, _)| r.rows_affected)
+    }
+
+    #[tokio::test]
+    async fn insert_unique_finds_a_primary_key_that_is_not_column_zero() {
+        let engine = test_engine().await;
+        seed_late_pk(&engine).await;
+        run_late_pk(&engine, ColumnarInsertIntent::InsertUnique, "a", 1)
+            .await
+            .expect("first insert");
+
+        let err = run_late_pk(&engine, ColumnarInsertIntent::InsertUnique, "a", 2)
+            .await
+            .expect_err("a duplicate must be refused wherever the key sits");
+        assert!(matches!(err, LiteError::UniqueViolation { .. }), "{err}");
+
+        let rows = engine.columnar.list_rows("late_pk").await.expect("rows");
+        assert_eq!(rows.len(), 1, "the refused row must not be written");
+    }
+
+    #[tokio::test]
+    async fn insert_if_absent_finds_a_primary_key_that_is_not_column_zero() {
+        let engine = test_engine().await;
+        seed_late_pk(&engine).await;
+        run_late_pk(&engine, ColumnarInsertIntent::InsertIfAbsent, "a", 1)
+            .await
+            .expect("first insert");
+        run_late_pk(&engine, ColumnarInsertIntent::InsertIfAbsent, "a", 2)
+            .await
+            .expect("a duplicate is skipped, not an error");
+
+        let rows = engine.columnar.list_rows("late_pk").await.expect("rows");
+        assert_eq!(rows.len(), 1, "the duplicate must be skipped");
+    }
+
     #[tokio::test]
     async fn insert_unique_duplicate_pk_is_a_unique_violation() {
         let engine = test_engine().await;

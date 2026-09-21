@@ -323,6 +323,36 @@ mod tests {
         assert_eq!(stored.rows.len(), 1);
     }
 
+    /// An expired row counts as absent, which is why the `if_present` check
+    /// is repeated in the expiry branch instead of being done once on the
+    /// stored value. Without it the UPDATE writes a fresh map over the row
+    /// it should have left alone.
+    #[tokio::test]
+    async fn field_set_if_present_treats_an_expired_row_as_absent() {
+        let engine = test_engine().await;
+        crate::query::kv_ops::writes::kv_put(&engine, "kvfs", b"gone", b"old", 1)
+            .await
+            .expect("seed with a 1ms ttl");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let r = kv_field_set(&engine, "kvfs", b"gone", &[update("n", 1)], true)
+            .await
+            .expect("field set");
+        assert_eq!(r.rows_affected, 0, "an expired row counts as absent");
+
+        // Reaping the row on read would be a fair change; writing a fresh map
+        // over it would not. Allow the first, refuse the second.
+        let raw = engine
+            .storage
+            .get(Namespace::Kv, &kv_key("kvfs", b"gone"))
+            .await
+            .expect("storage get");
+        if let Some(bytes) = raw {
+            let (_, user) = decode_value(&bytes).expect("decode");
+            assert_eq!(user, b"old", "UPDATE must not overwrite an expired row");
+        }
+    }
+
     #[tokio::test]
     async fn field_set_if_present_merges_into_an_existing_row() {
         let engine = test_engine().await;

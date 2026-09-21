@@ -105,9 +105,28 @@ impl From<nodedb_types::columnar::SchemaError> for LiteError {
 impl From<LiteError> for nodedb_types::error::NodeDbError {
     fn from(e: LiteError) -> Self {
         if is_corruption(&e) {
-            nodedb_types::error::NodeDbError::segment_corrupted(e.to_string())
-        } else {
-            nodedb_types::error::NodeDbError::storage(e)
+            return nodedb_types::error::NodeDbError::segment_corrupted(e.to_string());
+        }
+        // `NodeDbError::storage` flattens whatever it is handed, which costs a
+        // constraint refusal the one thing a caller can act on: which
+        // constraint refused it. The integrity variants carry that, so they
+        // are converted rather than flattened.
+        match &e {
+            LiteError::UniqueViolation { collection, .. } => {
+                nodedb_types::error::NodeDbError::constraint_violation(
+                    collection.clone(),
+                    "unique",
+                    e.to_string(),
+                )
+            }
+            LiteError::NotNullViolation { collection, .. } => {
+                nodedb_types::error::NodeDbError::constraint_violation(
+                    collection.clone(),
+                    "not_null",
+                    e.to_string(),
+                )
+            }
+            _ => nodedb_types::error::NodeDbError::storage(e),
         }
     }
 }
@@ -122,6 +141,27 @@ mod tests {
             detail: "disk full".into(),
         };
         assert!(e.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn integrity_violations_keep_their_constraint_through_the_conversion() {
+        let unique = LiteError::UniqueViolation {
+            collection: "items".into(),
+            detail: "sku = \"a\"".into(),
+        };
+        let ndb: nodedb_types::error::NodeDbError = unique.into();
+        assert!(
+            ndb.is_constraint_violation(),
+            "must not flatten into a storage error: {ndb}"
+        );
+        assert!(ndb.to_string().contains("items"));
+
+        let not_null = LiteError::NotNullViolation {
+            collection: "items".into(),
+            column: "sku".into(),
+        };
+        let ndb: nodedb_types::error::NodeDbError = not_null.into();
+        assert!(ndb.is_constraint_violation(), "{ndb}");
     }
 
     #[test]
