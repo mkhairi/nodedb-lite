@@ -347,6 +347,27 @@ mod tests {
     }
 
     #[test]
+    fn integrity_violations_keep_their_constraint_through_the_conversion() {
+        let unique = LiteError::UniqueViolation {
+            collection: "items".into(),
+            detail: "sku = \"a\"".into(),
+        };
+        let ndb: nodedb_types::error::NodeDbError = unique.into();
+        assert!(
+            ndb.is_constraint_violation(),
+            "must not flatten into a storage error: {ndb}"
+        );
+        assert!(ndb.to_string().contains("items"));
+
+        let not_null = LiteError::NotNullViolation {
+            collection: "items".into(),
+            column: "sku".into(),
+        };
+        let ndb: nodedb_types::error::NodeDbError = not_null.into();
+        assert!(ndb.is_constraint_violation(), "{ndb}");
+    }
+
+    #[test]
     fn lite_error_converts_to_nodedb_error() {
         let e = LiteError::Storage {
             detail: "test".into(),
