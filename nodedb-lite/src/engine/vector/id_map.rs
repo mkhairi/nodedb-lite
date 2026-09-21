@@ -75,6 +75,23 @@ impl VectorIdMap {
         self.by_slot.get(composite)
     }
 
+    /// Drop the binding for `slot` in `index_key`, both directions, and
+    /// return the document it held.
+    ///
+    /// The reverse entry is cleared only when it still points at `slot`. A
+    /// document that has since been re-bound elsewhere keeps its live
+    /// binding, so tombstoning the slot it vacated cannot unbind it.
+    pub(crate) fn unbind_slot(&mut self, index_key: &str, slot: u32) -> Option<(String, u32)> {
+        let removed = self.by_slot.remove(&format!("{index_key}:{slot}"));
+        if let Some((doc_id, _)) = &removed {
+            let doc_key = format!("{index_key}:{doc_id}");
+            if self.by_doc.get(&doc_key) == Some(&slot) {
+                self.by_doc.remove(&doc_key);
+            }
+        }
+        removed
+    }
+
     /// Drop every binding belonging to `index_key`.
     pub(crate) fn clear_index(&mut self, index_key: &str) {
         let prefix = format!("{index_key}:");

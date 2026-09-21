@@ -98,7 +98,7 @@ pub(in crate::query::physical_visitor) fn remove_live_node<S: StorageEngine>(
     vector_state
         .vector_id_map
         .lock_or_recover()
-        .remove(&format!("{index_key}:{iid}"));
+        .unbind_slot(index_key, iid);
     if let Some(sidecar) = vector_state
         .codec_sidecars
         .lock_or_recover()

@@ -230,6 +230,7 @@ impl RowSink {
             columns: self.columns,
             rows: self.rows,
             rows_affected: 0,
+            command: None,
         }
     }
 }
