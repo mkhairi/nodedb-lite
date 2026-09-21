@@ -237,10 +237,19 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         let internal_id = {
             let id_map = self.vector_state.vector_id_map.lock_or_recover();
-            id_map
-                .iter()
-                .find(|(_, (doc_id, _))| doc_id == id)
-                .map(|(_, (_, iid))| *iid)
+            // Keyed by collection, not by document alone. `iter()` walks the
+            // store-wide slot map and a document embedded under two stamp keys
+            // has a binding in each, so a `find` on `doc_id` returns whichever
+            // collection HashMap iteration reached first — and that slot number
+            // was then tombstoned HERE, in the target collection, where it
+            // belongs to a different document. Measured before this fix: of 12
+            // deletes against a collection whose ids were also bound in a
+            // second one, 7 left their target searchable and removed an
+            // unrelated live vector instead.
+            //
+            // `slot_of` is the reverse index the insert path already uses
+            // (`vector_insert_impl`), so this is the same lookup on both sides.
+            id_map.slot_of(collection, id)
         };
 
         if let Some(iid) = internal_id {
