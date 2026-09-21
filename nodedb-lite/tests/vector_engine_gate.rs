@@ -499,3 +499,54 @@ async fn reinserting_the_only_id_keeps_it_searchable() {
         "scored against the latest vector"
     );
 }
+
+/// Deleting an id from one collection tombstones its node there and leaves
+/// the same id in another collection alone. The two collections bind their
+/// ids in opposite orders, so node numbers differ: a delete that resolved the
+/// node without its collection would tombstone another document.
+#[tokio::test]
+async fn deleting_an_id_bound_in_two_collections_touches_only_the_named_one() {
+    let db = open_db().await;
+    let ids = ["a", "b", "c", "d"];
+    let vector = |i: usize| {
+        let mut v = [0.0f32; 4];
+        v[i] = 1.0;
+        v
+    };
+    for (i, id) in ids.iter().enumerate() {
+        db.vector_insert("left", id, &vector(i), None)
+            .await
+            .expect("left insert");
+    }
+    for (i, id) in ids.iter().enumerate().rev() {
+        db.vector_insert("right", id, &vector(i), None)
+            .await
+            .expect("right insert");
+    }
+
+    db.vector_delete("left", "a").await.expect("vector_delete");
+
+    let ids_in = |hits: Vec<nodedb_types::result::SearchResult>| {
+        let mut ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+        ids.sort();
+        ids
+    };
+    let left = db
+        .vector_search("left", &vector(0), 10, None, None)
+        .await
+        .expect("left search");
+    assert_eq!(
+        ids_in(left),
+        ["b", "c", "d"],
+        "only the named id leaves 'left'"
+    );
+    let right = db
+        .vector_search("right", &vector(0), 10, None, None)
+        .await
+        .expect("right search");
+    assert_eq!(
+        ids_in(right),
+        ["a", "b", "c", "d"],
+        "a delete in 'left' must not touch 'right'"
+    );
+}
