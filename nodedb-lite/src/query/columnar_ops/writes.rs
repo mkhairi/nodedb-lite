@@ -36,7 +36,7 @@ pub struct InsertParams<'a> {
 /// actually written to the memtable. The caller is responsible for calling
 /// `engine.columnar.enqueue_outbound` from an async context to durably queue
 /// those rows for replication to Origin.
-pub fn insert<S: StorageEngine>(
+pub async fn insert<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
     params: InsertParams<'_>,
@@ -69,6 +69,16 @@ pub fn insert<S: StorageEngine>(
         .map(|c| c.name.clone())
         .collect();
 
+    // The incoming row is ordered by `effective_schema`, so its primary key
+    // sits wherever that schema puts it. Column 0 is only the common case,
+    // and `pk_exists`, `find_row` and `columnar.delete` all resolve the key
+    // against the stored schema, so a key elsewhere compared the wrong value.
+    let pk_idx = effective_schema
+        .columns
+        .iter()
+        .position(|c| c.primary_key)
+        .unwrap_or(0);
+
     let rows = decode_payload(payload, format, &col_names)?;
 
     let mut affected: u64 = 0;
@@ -89,11 +99,13 @@ pub fn insert<S: StorageEngine>(
             ColumnarInsertIntent::InsertUnique => {
                 // PRIMARY KEY on a natural-key column: a duplicate refuses the
                 // row rather than tombstoning the prior one the way `Insert`
-                // does. PK is column 0, as in the `InsertIfAbsent` arm.
-                if let Some(pk) = row_values.first()
-                    && pk_exists(engine, collection, pk)?
+                // does.
+                if let Some(pk) = row_values.get(pk_idx)
+                    && pk_exists(engine, collection, pk).await?
                 {
-                    return Err(LiteError::BadRequest {
+                    return Err(LiteError::ConstraintViolation {
+                        collection: collection.to_string(),
+                        constraint: "unique".into(),
                         detail: format!(
                             "duplicate key value violates the primary key on '{collection}'"
                         ),
@@ -104,9 +116,9 @@ pub fn insert<S: StorageEngine>(
                 affected += 1;
             }
             ColumnarInsertIntent::InsertIfAbsent => {
-                // PK is column 0; skip if already present.
-                if let Some(pk) = row_values.first()
-                    && pk_exists(engine, collection, pk)?
+                // Skip if the key is already present.
+                if let Some(pk) = row_values.get(pk_idx)
+                    && pk_exists(engine, collection, pk).await?
                 {
                     continue;
                 }
@@ -117,7 +129,7 @@ pub fn insert<S: StorageEngine>(
             ColumnarInsertIntent::Put => {
                 if on_conflict_updates.is_empty() {
                     // Plain upsert: delete-then-insert (whole-row overwrite).
-                    if let Some(pk) = row_values.first() {
+                    if let Some(pk) = row_values.get(pk_idx) {
                         let _ = engine.columnar.delete(collection, pk);
                     }
                     engine.columnar.insert(collection, &row_values)?;
@@ -125,9 +137,9 @@ pub fn insert<S: StorageEngine>(
                     affected += 1;
                 } else {
                     // Merge: read existing row, apply conflict updates, write merged.
-                    let merged = if let Some(pk) = row_values.first() {
-                        if pk_exists(engine, collection, pk)? {
-                            let existing = find_row(engine, collection, pk)?;
+                    let merged = if let Some(pk) = row_values.get(pk_idx) {
+                        if pk_exists(engine, collection, pk).await? {
+                            let existing = find_row(engine, collection, pk).await?;
                             let incoming_obj = row_to_object(&col_names, &row_values);
                             apply_conflict_updates(
                                 existing,
@@ -141,7 +153,7 @@ pub fn insert<S: StorageEngine>(
                     } else {
                         row_values.clone()
                     };
-                    if let Some(pk) = merged.first() {
+                    if let Some(pk) = merged.get(pk_idx) {
                         let _ = engine.columnar.delete(collection, pk);
                     }
                     engine.columnar.insert(collection, &merged)?;
@@ -163,7 +175,7 @@ pub fn insert<S: StorageEngine>(
 }
 
 /// Update rows matching filter predicates.
-pub fn update<S: StorageEngine>(
+pub async fn update<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
     filters_bytes: &[u8],
@@ -201,22 +213,7 @@ pub fn update<S: StorageEngine>(
         .collect();
 
     // Read current rows, apply filters, build modified rows.
-    // collect PKs and new rows first, then mutate (borrow separation).
-    let all_rows = {
-        let rt = tokio::runtime::Handle::try_current();
-        match rt {
-            Ok(handle) => {
-                let col = collection.to_string();
-                let eng = engine.columnar.clone();
-                handle.block_on(async move { eng.list_rows(&col).await })?
-            }
-            Err(_) => {
-                return Err(LiteError::Storage {
-                    detail: "columnar update requires async context".into(),
-                });
-            }
-        }
-    };
+    let all_rows = engine.columnar.list_rows(collection).await?;
 
     let mut affected: u64 = 0;
 
@@ -251,7 +248,7 @@ pub fn update<S: StorageEngine>(
 }
 
 /// Delete rows matching filter predicates.
-pub fn delete<S: StorageEngine>(
+pub async fn delete<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
     filters_bytes: &[u8],
@@ -278,21 +275,7 @@ pub fn delete<S: StorageEngine>(
         })?
     };
 
-    let all_rows = {
-        let rt = tokio::runtime::Handle::try_current();
-        match rt {
-            Ok(handle) => {
-                let col = collection.to_string();
-                let eng = engine.columnar.clone();
-                handle.block_on(async move { eng.list_rows(&col).await })?
-            }
-            Err(_) => {
-                return Err(LiteError::Storage {
-                    detail: "columnar delete requires async context".into(),
-                });
-            }
-        }
-    };
+    let all_rows = engine.columnar.list_rows(collection).await?;
 
     let mut pks_to_delete: Vec<Value> = Vec::new();
     for row in all_rows {
@@ -532,9 +515,8 @@ fn value_object_to_row(obj: Value, col_names: &[String]) -> Result<Vec<Value>, L
 
 /// Check whether a PK value currently exists in the columnar collection.
 ///
-/// Uses `list_rows` synchronously via the current tokio handle. Lite's columnar
-/// engine is in-memory so this is cheap.
-fn pk_exists<S: StorageEngine>(
+/// Scans `list_rows`. Lite's columnar engine is in-memory so this is cheap.
+async fn pk_exists<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
     pk: &Value,
@@ -549,13 +531,7 @@ fn pk_exists<S: StorageEngine>(
         .position(|c| c.primary_key)
         .unwrap_or(0);
 
-    let rt = tokio::runtime::Handle::try_current().map_err(|_| LiteError::Storage {
-        detail: "pk_exists requires async runtime context".into(),
-    })?;
-
-    let col = collection.to_string();
-    let eng = engine.columnar.clone();
-    let rows = rt.block_on(async move { eng.list_rows(&col).await })?;
+    let rows = engine.columnar.list_rows(collection).await?;
 
     Ok(rows
         .iter()
@@ -563,7 +539,7 @@ fn pk_exists<S: StorageEngine>(
 }
 
 /// Find a specific row by PK.
-fn find_row<S: StorageEngine>(
+async fn find_row<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
     pk: &Value,
@@ -580,13 +556,7 @@ fn find_row<S: StorageEngine>(
         .position(|c| c.primary_key)
         .unwrap_or(0);
 
-    let rt = tokio::runtime::Handle::try_current().map_err(|_| LiteError::Storage {
-        detail: "find_row requires async runtime context".into(),
-    })?;
-
-    let col = collection.to_string();
-    let eng = engine.columnar.clone();
-    let rows = rt.block_on(async move { eng.list_rows(&col).await })?;
+    let rows = engine.columnar.list_rows(collection).await?;
 
     rows.into_iter()
         .find(|row| row.get(pk_idx).map(|v| v == pk).unwrap_or(false))
@@ -701,20 +671,14 @@ mod tests {
         }
     }
 
-    /// `pk_exists` resolves the current rows with `Handle::block_on`, so an
-    /// intent that consults the primary key has to be driven off the async
-    /// worker thread.
-    async fn insert_off_worker(
+    async fn insert_unique(
         db: &std::sync::Arc<crate::NodeDbLite<crate::PagedbStorageMem>>,
-        collection: &'static str,
-        payload: &'static [u8],
+        collection: &str,
+        payload: &[u8],
     ) -> Result<(), LiteError> {
-        let db = std::sync::Arc::clone(db);
-        tokio::task::spawn_blocking(move || {
-            insert(&db.query_engine, collection, unique_params(payload)).map(|_| ())
-        })
-        .await
-        .expect("join insert")
+        insert(&db.query_engine, collection, unique_params(payload))
+            .await
+            .map(|_| ())
     }
 
     /// A declared PRIMARY KEY means uniqueness: `InsertUnique` refuses a
@@ -731,23 +695,111 @@ mod tests {
         .await
         .unwrap();
 
-        insert_off_worker(&db, "iu_dup", br#"[{"id":"a","n":1}]"#)
+        insert_unique(&db, "iu_dup", br#"[{"id":"a","n":1}]"#)
             .await
             .expect("first insert");
 
-        let err = insert_off_worker(&db, "iu_dup", br#"[{"id":"a","n":2}]"#)
+        let err = insert_unique(&db, "iu_dup", br#"[{"id":"a","n":2}]"#)
             .await
             .expect_err("a duplicate primary key must be refused");
-        // `BadRequest` is also what an unknown collection returns, so the
-        // variant alone does not discriminate. Pin both.
         assert!(
-            matches!(err, LiteError::BadRequest { ref detail } if detail.contains("duplicate key")),
+            matches!(
+                err,
+                LiteError::ConstraintViolation {
+                    ref constraint,
+                    ref detail,
+                    ..
+                } if constraint == "unique" && detail.contains("duplicate key")
+            ),
             "unexpected error: {err}"
         );
 
         let rows = db.query_engine.columnar.list_rows("iu_dup").await.unwrap();
         assert_eq!(rows.len(), 1, "the refused row must not be written");
         assert_eq!(rows[0][1], Value::Integer(1), "the prior row survives");
+    }
+
+    /// The primary key is read from the schema, not assumed to be column 0.
+    /// With the key declared second, resolving it positionally compared the
+    /// wrong column and let a duplicate through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_unique_finds_a_primary_key_that_is_not_column_zero() {
+        let db = make_db().await;
+        db.execute_sql(
+            "CREATE COLLECTION iu_late_pk (n INTEGER, id TEXT NOT NULL PRIMARY KEY) \
+             WITH storage = 'columnar'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        insert_unique(&db, "iu_late_pk", br#"[{"n":1,"id":"a"}]"#)
+            .await
+            .expect("first insert");
+
+        // Same key, different leading column: positional resolution would
+        // compare `n` and see 1 vs 2, admitting the duplicate.
+        let err = insert_unique(&db, "iu_late_pk", br#"[{"n":2,"id":"a"}]"#)
+            .await
+            .expect_err("a duplicate primary key must be refused wherever it sits");
+        assert!(
+            matches!(
+                err,
+                LiteError::ConstraintViolation {
+                    ref constraint,
+                    ref detail,
+                    ..
+                } if constraint == "unique" && detail.contains("duplicate key")
+            ),
+            "unexpected error: {err}"
+        );
+
+        let rows = db
+            .query_engine
+            .columnar
+            .list_rows("iu_late_pk")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the refused row must not be written");
+    }
+
+    /// `InsertIfAbsent` shares the same `pk_idx`, and skips rather than
+    /// refusing. With the key declared second, positional resolution made it
+    /// re-insert a row it should have left alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_if_absent_finds_a_primary_key_that_is_not_column_zero() {
+        let db = make_db().await;
+        db.execute_sql(
+            "CREATE COLLECTION iia_late_pk (n INTEGER, id TEXT NOT NULL PRIMARY KEY) \
+             WITH storage = 'columnar'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let params = |payload: &'static [u8]| InsertParams {
+            payload,
+            format: "json",
+            intent: ColumnarInsertIntent::InsertIfAbsent,
+            on_conflict_updates: &[],
+            surrogates: &[],
+            schema_bytes: &[],
+        };
+        let engine = &db.query_engine;
+        insert(engine, "iia_late_pk", params(br#"[{"n":1,"id":"a"}]"#))
+            .await
+            .expect("first insert");
+        insert(engine, "iia_late_pk", params(br#"[{"n":2,"id":"a"}]"#))
+            .await
+            .expect("a duplicate is skipped, not an error");
+
+        let rows = engine.columnar.list_rows("iia_late_pk").await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the duplicate must be skipped wherever the key sits"
+        );
+        assert_eq!(rows[0][0], Value::Integer(1), "the prior row survives");
     }
 
     /// The refusal is keyed on the PK, not on the insert itself: a fresh key
@@ -763,10 +815,10 @@ mod tests {
         .await
         .unwrap();
 
-        insert_off_worker(&db, "iu_fresh", br#"[{"id":"a","n":1}]"#)
+        insert_unique(&db, "iu_fresh", br#"[{"id":"a","n":1}]"#)
             .await
             .expect("first insert");
-        insert_off_worker(&db, "iu_fresh", br#"[{"id":"b","n":2}]"#)
+        insert_unique(&db, "iu_fresh", br#"[{"id":"b","n":2}]"#)
             .await
             .expect("second insert");
 

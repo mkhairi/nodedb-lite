@@ -28,7 +28,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
         self.query_engine
             .execute_sql_with_params(query, params)
             .await
-            .map_err(NodeDbError::storage)
+            // `From<LiteError>`, not `NodeDbError::storage`: the blanket
+            // constructor flattens every variant into a storage error, which
+            // costs the caller the constraint kind and the corruption signal
+            // the conversion exists to preserve.
+            .map_err(NodeDbError::from)
     }
 
     /// Run a BM25 text query against the in-memory FTS index for `collection`

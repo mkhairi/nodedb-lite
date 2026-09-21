@@ -66,6 +66,23 @@ pub enum LiteError {
     /// leaves the document permanently missing from (or stale in) the index.
     #[error("full-text index update failed for {collection}: {detail}")]
     FtsIndex { collection: String, detail: String },
+
+    /// An integrity constraint refused the write.
+    ///
+    /// Kept distinct from [`LiteError::BadRequest`], which is also what an
+    /// unknown collection or a malformed payload returns, so a caller can
+    /// tell a duplicate key from a client mistake. The conversion below hands
+    /// it to `NodeDbError::constraint_violation` rather than flattening it
+    /// into a storage error, which sets `ErrorCode::CONSTRAINT_VIOLATION` —
+    /// and that numeric code is what Origin's pgwire layer maps to SQLSTATE
+    /// 23505. `constraint` (`"unique"`, `"not_null"`, ...) rides along in the
+    /// details for a caller to read; nothing upstream branches on it.
+    #[error("constraint violation on {collection}: {detail}")]
+    ConstraintViolation {
+        collection: String,
+        constraint: String,
+        detail: String,
+    },
 }
 
 /// Returns `true` when `e` is the corruption-class variant that should drive
@@ -95,9 +112,19 @@ impl From<nodedb_types::columnar::SchemaError> for LiteError {
 impl From<LiteError> for nodedb_types::error::NodeDbError {
     fn from(e: LiteError) -> Self {
         if is_corruption(&e) {
-            nodedb_types::error::NodeDbError::segment_corrupted(e.to_string())
-        } else {
-            nodedb_types::error::NodeDbError::storage(e)
+            return nodedb_types::error::NodeDbError::segment_corrupted(e.to_string());
+        }
+        match e {
+            LiteError::ConstraintViolation {
+                ref collection,
+                ref constraint,
+                ref detail,
+            } => nodedb_types::error::NodeDbError::constraint_violation(
+                collection.clone(),
+                constraint.clone(),
+                detail.clone(),
+            ),
+            _ => nodedb_types::error::NodeDbError::storage(e),
         }
     }
 }
@@ -112,6 +139,21 @@ mod tests {
             detail: "disk full".into(),
         };
         assert!(e.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn constraint_violation_keeps_its_kind_through_the_conversion() {
+        let e = LiteError::ConstraintViolation {
+            collection: "users".into(),
+            constraint: "unique".into(),
+            detail: "duplicate key value violates the primary key on 'users'".into(),
+        };
+        let ndb: nodedb_types::error::NodeDbError = e.into();
+        assert!(
+            ndb.is_constraint_violation(),
+            "must not flatten into a storage error: {ndb}"
+        );
+        assert!(ndb.to_string().contains("users"));
     }
 
     #[test]
