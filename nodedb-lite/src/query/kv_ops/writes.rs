@@ -892,3 +892,103 @@ fn extract_f64(
         None => Ok(0.0),
     }
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use crate::NodeDbLite;
+    use crate::PagedbStorageMem;
+    use crate::storage::engine::StorageEngine;
+
+    async fn make_db() -> std::sync::Arc<NodeDbLite<PagedbStorageMem>> {
+        let storage = PagedbStorageMem::open_in_memory().await.unwrap();
+        NodeDbLite::open(storage).await.unwrap()
+    }
+
+    fn one_field() -> Vec<(String, Vec<u8>)> {
+        let v = zerompk::to_msgpack_vec(&nodedb_types::value::Value::Integer(7)).unwrap();
+        vec![("n".to_string(), v)]
+    }
+
+    /// `if_present` is what separates SQL UPDATE from RESP HSET: an UPDATE
+    /// against an absent key affects no rows and creates nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn field_set_if_present_skips_an_absent_key() {
+        let db = make_db().await;
+        let engine = &db.query_engine;
+
+        let out = super::kv_field_set(engine, "fs_absent", b"k", &one_field(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.rows_affected, 0,
+            "UPDATE on an absent key affects no rows"
+        );
+        let stored = engine
+            .storage
+            .get(
+                nodedb_types::Namespace::Kv,
+                &super::kv_key("fs_absent", b"k"),
+            )
+            .await
+            .unwrap();
+        assert!(stored.is_none(), "UPDATE must not create the key");
+    }
+
+    /// An expired row counts as absent, which is why the `if_present` check is
+    /// repeated in the expiry branch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn field_set_if_present_skips_an_expired_key() {
+        let db = make_db().await;
+        let engine = &db.query_engine;
+
+        super::kv_put(engine, "fs_expired", b"k", b"old", 1)
+            .await
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let out = super::kv_field_set(engine, "fs_expired", b"k", &one_field(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(out.rows_affected, 0, "an expired row counts as absent");
+        let stored = engine
+            .storage
+            .get(
+                nodedb_types::Namespace::Kv,
+                &super::kv_key("fs_expired", b"k"),
+            )
+            .await
+            .unwrap();
+        // Reaping an expired row on read would be a fair change; writing a
+        // fresh map over it would not. Allow the first, refuse the second.
+        if let Some(raw) = stored {
+            let (_, user) = super::decode_value(&raw).unwrap();
+            assert_eq!(user, b"old", "UPDATE must not overwrite with a fresh map");
+        }
+    }
+
+    /// Without `if_present` the same call is HSET: it creates the key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn field_set_without_if_present_creates_an_absent_key() {
+        let db = make_db().await;
+        let engine = &db.query_engine;
+
+        let out = super::kv_field_set(engine, "fs_create", b"k", &one_field(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(out.rows_affected, 1, "HSET creates the key");
+        let stored = engine
+            .storage
+            .get(
+                nodedb_types::Namespace::Kv,
+                &super::kv_key("fs_create", b"k"),
+            )
+            .await
+            .unwrap();
+        assert!(stored.is_some(), "HSET must create the key");
+    }
+}

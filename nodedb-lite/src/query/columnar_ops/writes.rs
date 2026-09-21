@@ -634,6 +634,8 @@ fn apply_conflict_updates(
 
 #[cfg(test)]
 mod tests {
+    use nodedb_client::NodeDb;
+
     use super::*;
 
     #[test]
@@ -681,5 +683,99 @@ mod tests {
         assert_eq!(row[0], Value::Integer(1));
         assert_eq!(row[1], Value::String("hello".into()));
         assert_eq!(row[2], Value::Null);
+    }
+
+    async fn make_db() -> std::sync::Arc<crate::NodeDbLite<crate::PagedbStorageMem>> {
+        let storage = crate::PagedbStorageMem::open_in_memory().await.unwrap();
+        crate::NodeDbLite::open(storage).await.unwrap()
+    }
+
+    fn unique_params(payload: &[u8]) -> InsertParams<'_> {
+        InsertParams {
+            payload,
+            format: "json",
+            intent: ColumnarInsertIntent::InsertUnique,
+            on_conflict_updates: &[],
+            surrogates: &[],
+            schema_bytes: &[],
+        }
+    }
+
+    /// `pk_exists` resolves the current rows with `Handle::block_on`, so an
+    /// intent that consults the primary key has to be driven off the async
+    /// worker thread.
+    async fn insert_off_worker(
+        db: &std::sync::Arc<crate::NodeDbLite<crate::PagedbStorageMem>>,
+        collection: &'static str,
+        payload: &'static [u8],
+    ) -> Result<(), LiteError> {
+        let db = std::sync::Arc::clone(db);
+        tokio::task::spawn_blocking(move || {
+            insert(&db.query_engine, collection, unique_params(payload)).map(|_| ())
+        })
+        .await
+        .expect("join insert")
+    }
+
+    /// A declared PRIMARY KEY means uniqueness: `InsertUnique` refuses a
+    /// duplicate natural key rather than tombstoning the prior row the way
+    /// `Insert` does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_unique_refuses_a_duplicate_primary_key() {
+        let db = make_db().await;
+        db.execute_sql(
+            "CREATE COLLECTION iu_dup (id TEXT NOT NULL PRIMARY KEY, n INTEGER) \
+             WITH storage = 'columnar'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        insert_off_worker(&db, "iu_dup", br#"[{"id":"a","n":1}]"#)
+            .await
+            .expect("first insert");
+
+        let err = insert_off_worker(&db, "iu_dup", br#"[{"id":"a","n":2}]"#)
+            .await
+            .expect_err("a duplicate primary key must be refused");
+        // `BadRequest` is also what an unknown collection returns, so the
+        // variant alone does not discriminate. Pin both.
+        assert!(
+            matches!(err, LiteError::BadRequest { ref detail } if detail.contains("duplicate key")),
+            "unexpected error: {err}"
+        );
+
+        let rows = db.query_engine.columnar.list_rows("iu_dup").await.unwrap();
+        assert_eq!(rows.len(), 1, "the refused row must not be written");
+        assert_eq!(rows[0][1], Value::Integer(1), "the prior row survives");
+    }
+
+    /// The refusal is keyed on the PK, not on the insert itself: a fresh key
+    /// still goes in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_unique_admits_a_fresh_primary_key() {
+        let db = make_db().await;
+        db.execute_sql(
+            "CREATE COLLECTION iu_fresh (id TEXT NOT NULL PRIMARY KEY, n INTEGER) \
+             WITH storage = 'columnar'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        insert_off_worker(&db, "iu_fresh", br#"[{"id":"a","n":1}]"#)
+            .await
+            .expect("first insert");
+        insert_off_worker(&db, "iu_fresh", br#"[{"id":"b","n":2}]"#)
+            .await
+            .expect("second insert");
+
+        let rows = db
+            .query_engine
+            .columnar
+            .list_rows("iu_fresh")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "distinct keys both insert");
     }
 }
