@@ -129,9 +129,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
     /// Upsert a document and insert its embedding vector under one CRDT lock.
     ///
-    /// Performs two logical writes (document upsert + vector metadata upsert) via
-    /// a single `batch_upsert` call so Loro exports one oplog delta instead of two.
-    /// The HNSW insert and sidecar encoding run after the CRDT lock is released.
+    /// Performs two logical writes in one `batch_write` call: the document is a
+    /// full-row upsert, the vector metadata a field merge into the row with the
+    /// vector's id. When both name the same row, the document fields survive
+    /// the vector write. Re-inserting an id replaces its vector. The HNSW
+    /// insert and sidecar encoding run after the CRDT lock is released.
     ///
     /// `embedding` being empty is a no-op for the vector path; the document write
     /// proceeds normally.
@@ -143,9 +145,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
         id: &str,
         embedding: &[f32],
     ) -> NodeDbResult<()> {
-        use crate::engine::crdt::engine::CrdtBatchOp;
-        use crate::engine::vector::resident::{check_insert_widths, lock_resident_or_create};
-        use crate::engine::vector::sidecar;
+        use crate::engine::crdt::{CrdtRowOp, CrdtRowWrite};
+        use crate::engine::vector::nodes::{encode_sidecar, upsert_node};
+        use crate::engine::vector::resident::check_insert_widths;
+        use crate::engine::vector::row::EMBEDDING_DIM_FIELD;
 
         let doc_id = if doc.id.is_empty() {
             nodedb_types::id_gen::uuid_v7()
@@ -162,29 +165,37 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         let vec_meta_field = loro::LoroValue::I64(embedding.len() as i64);
         let vec_fields: Vec<(&str, loro::LoroValue)> = if !embedding.is_empty() {
-            vec![("embedding_dim", vec_meta_field)]
+            vec![(EMBEDDING_DIM_FIELD, vec_meta_field)]
         } else {
             vec![]
         };
 
         let sync_doc = self.should_sync_doc(doc_collection, &doc.fields);
 
-        // One CRDT lock — one batch_upsert — one Loro oplog export.
+        // One CRDT lock — one batch_write — one delta per row.
         {
             let mut crdt = self.crdt.lock_or_recover();
-            let mutation_id = if !embedding.is_empty() {
-                let ops: &[CrdtBatchOp<'_>] = &[
-                    (doc_collection, &doc_id, doc_fields.as_slice()),
-                    (vector_collection, id, vec_fields.as_slice()),
-                ];
-                crdt.batch_upsert(ops).map_err(NodeDbError::storage)?
-            } else {
-                crdt.upsert(doc_collection, &doc_id, &doc_fields)
-                    .map_err(NodeDbError::storage)?
-            };
+            let mut ops: Vec<CrdtRowOp<'_>> = Vec::with_capacity(2);
+            ops.push((
+                CrdtRowWrite::Upsert,
+                doc_collection,
+                doc_id.as_str(),
+                doc_fields.as_slice(),
+            ));
+            if !embedding.is_empty() {
+                ops.push((
+                    CrdtRowWrite::SetFields,
+                    vector_collection,
+                    id,
+                    vec_fields.as_slice(),
+                ));
+            }
+            let mutation_ids = crdt.batch_write(&ops).map_err(NodeDbError::storage)?;
             // Keep local-only documents out of the outbound CRDT delta stream.
             if !sync_doc {
-                crdt.drop_pending(mutation_id);
+                for mutation_id in mutation_ids {
+                    crdt.drop_pending(mutation_id);
+                }
             }
         }
 
@@ -233,44 +244,17 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         // HNSW insert (no CRDT lock needed — vector_state uses its own locks).
         if !embedding.is_empty() {
-            let internal_id = {
-                let mut resident =
-                    lock_resident_or_create(&self.vector_state, vector_collection, embedding.len())
-                        .await
-                        .map_err(NodeDbError::from)?;
-                let index = resident.index();
-                let id_before = index.len() as u32;
-                index
-                    .insert(embedding.to_vec())
-                    .map_err(|e| NodeDbError::from(crate::error::LiteError::from(e)))?;
-                id_before
-            };
-
-            {
-                let mut id_map = self.vector_state.vector_id_map.lock_or_recover();
-                id_map.insert(
-                    format!("{vector_collection}:{internal_id}"),
-                    (id.to_string(), internal_id),
-                );
-            }
-
-            match sidecar::ensure_sidecar(&self.vector_state, vector_collection) {
-                Ok(true) => {
-                    let mut sidecars = self.vector_state.codec_sidecars.lock_or_recover();
-                    if let Some(s) = sidecars.get_mut(vector_collection)
-                        && let Err(e) = s.encode_and_insert(internal_id, embedding)
-                    {
-                        tracing::warn!(
-                            index_key = vector_collection,
-                            id = internal_id,
-                            error = %e,
-                            "sidecar encode_and_insert failed; row falls back to FP32 rerank"
-                        );
-                    }
-                }
-                Ok(false) => {}
-                Err(e) => return Err(NodeDbError::bad_request(e.to_string())),
-            }
+            // Replaces the node `id` held before, so the id stays one node.
+            let internal_id = upsert_node(&self.vector_state, vector_collection, id, embedding)
+                .await
+                .map_err(NodeDbError::from)?;
+            encode_sidecar(
+                &self.vector_state,
+                vector_collection,
+                internal_id,
+                embedding,
+            )
+            .map_err(|e| NodeDbError::bad_request(e.to_string()))?;
 
             #[cfg(not(target_arch = "wasm32"))]
             if sync_doc && let Some(q) = &self.vector_outbound {

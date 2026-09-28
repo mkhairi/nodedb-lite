@@ -29,4 +29,4 @@ mod flush_ack_tests;
 mod tests;
 
 pub use checkpoint::{CrdtPersisted, CrdtWrite, CrdtWriteKind};
-pub use types::{CrdtBatchOp, CrdtEngine, CrdtField, PendingDelta};
+pub use types::{CrdtBatchOp, CrdtEngine, CrdtField, CrdtRowOp, CrdtRowWrite, PendingDelta};

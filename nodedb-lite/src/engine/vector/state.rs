@@ -15,12 +15,14 @@ use nodedb_types::collection_config::VectorPrimaryConfig;
 use nodedb_vector::rerank::CodecSidecar;
 
 use crate::engine::vector::HnswIndex;
+use crate::engine::vector::id_map::VectorIdMap;
 use crate::storage::engine::StorageEngine;
 
 pub struct VectorState<S: StorageEngine> {
     pub(crate) hnsw_indices: Mutex<HashMap<String, HnswIndex>>,
-    /// composite_key → (doc_id, vector_id)
-    pub(crate) vector_id_map: Mutex<HashMap<String, (String, u32)>>,
+    /// Per-index node ↔ document id bindings. Lock order: `hnsw_indices`
+    /// first, then this.
+    pub(crate) vector_id_map: Mutex<VectorIdMap>,
     pub(crate) search_ef: usize,
     pub(crate) storage: Arc<S>,
     /// index_key → trained codec sidecar (populated by S2.a.11).
@@ -64,7 +66,7 @@ pub struct RestoredVectorState<S: StorageEngine> {
     pub storage: Arc<S>,
     pub search_ef: usize,
     pub indices: HashMap<String, HnswIndex>,
-    pub id_map: HashMap<String, (String, u32)>,
+    pub id_map: VectorIdMap,
     pub memory: ScopedMemory,
 }
 
@@ -72,7 +74,7 @@ impl<S: StorageEngine> VectorState<S> {
     pub fn new(storage: Arc<S>, search_ef: usize, memory: ScopedMemory) -> Self {
         Self {
             hnsw_indices: Mutex::new(HashMap::new()),
-            vector_id_map: Mutex::new(HashMap::new()),
+            vector_id_map: Mutex::new(VectorIdMap::new()),
             search_ef,
             storage,
             codec_sidecars: Arc::new(Mutex::new(HashMap::new())),

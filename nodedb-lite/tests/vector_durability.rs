@@ -269,3 +269,51 @@ async fn deleted_vector_does_not_resurrect_on_rebuild() {
         "a deleted vector must not be resurrected by the rebuild; got {hits:?}"
     );
 }
+
+/// A database whose durable vector rows use the earlier `v:<index>:<id>`
+/// key layout opens with those rows rewritten to the current layout, and
+/// its vectors stay searchable across further reopens.
+#[tokio::test]
+async fn earlier_row_layout_is_rewritten_on_open() {
+    use nodedb_lite::{Encryption, PagedbStorageDefault, StorageEngine};
+    use nodedb_types::Namespace;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let vector: [f32; 2] = [0.6, 0.8];
+    let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    {
+        let storage = PagedbStorageDefault::open(path, Encryption::Plaintext)
+            .await
+            .unwrap();
+        storage
+            .put(Namespace::Vector, b"v:legacy:a", &bytes)
+            .await
+            .unwrap();
+        let db = NodeDbLite::open(storage).await.unwrap();
+        let hits = db
+            .vector_search("legacy", &vector, 5, None, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.first().map(|h| h.id.as_str()), Some("a"));
+    }
+
+    let storage = PagedbStorageDefault::open(path, Encryption::Plaintext)
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .scan_prefix(Namespace::Vector, b"v:")
+            .await
+            .unwrap()
+            .is_empty(),
+        "no row keeps the earlier layout"
+    );
+    let db = NodeDbLite::open(storage).await.unwrap();
+    let hits = db
+        .vector_search("legacy", &vector, 5, None, None)
+        .await
+        .unwrap();
+    assert_eq!(hits.first().map(|h| h.id.as_str()), Some("a"));
+}

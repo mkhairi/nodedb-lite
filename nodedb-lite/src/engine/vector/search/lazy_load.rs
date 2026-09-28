@@ -100,11 +100,19 @@ pub(crate) async fn ensure_index_loaded<S: StorageEngine>(
     if let Some(ext) = vector_state.storage.as_vector_segment_ext() {
         let attached = match ext.open_vector_segment(index_key).await {
             Ok(Some(backing)) => {
-                use std::sync::Arc;
-                // A segment that reads but cannot serve this index's nodes is
-                // refused by `with_backing` — otherwise the graph would look
-                // healthy and every query would score a vectorless node.
-                match index.with_backing(Arc::new(backing)) {
+                // A segment that reads but cannot serve this index's nodes —
+                // too few slots, or slots in another node order — is refused;
+                // otherwise the graph would look healthy and every query would
+                // score a vectorless node or another node's vector.
+                let attached = {
+                    let id_map = vector_state.vector_id_map.lock_or_recover();
+                    crate::engine::vector::segment::attach_verified(
+                        &mut index,
+                        backing,
+                        id_map.index(index_key),
+                    )
+                };
+                match attached {
                     Ok(_) => {
                         tracing::debug!(
                             index_key,
@@ -117,7 +125,7 @@ pub(crate) async fn ensure_index_loaded<S: StorageEngine>(
                             index_key,
                             error = %e,
                             "lazy-load: vector segment cannot serve this index \
-                             (empty or short payload); rebuilding from durable vectors"
+                             (short payload or other node order); rebuilding from durable vectors"
                         );
                         false
                     }
@@ -152,12 +160,10 @@ pub(crate) async fn ensure_index_loaded<S: StorageEngine>(
                         vectors = rebuilt.len(),
                         "lazy-load: HNSW rebuilt from durable vectors"
                     );
-                    {
-                        let mut map = vector_state.vector_id_map.lock_or_recover();
-                        let prefix = format!("{index_key}:");
-                        map.retain(|k, _| !k.starts_with(&prefix));
-                        map.extend(id_map);
-                    }
+                    vector_state
+                        .vector_id_map
+                        .lock_or_recover()
+                        .replace_index(index_key, id_map);
                     index = rebuilt;
                 }
                 Err(e) => return Err(e),

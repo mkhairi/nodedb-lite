@@ -11,8 +11,11 @@ use nodedb_types::error::{NodeDbError, NodeDbResult};
 use nodedb_types::filter::MetadataFilter;
 use nodedb_types::result::SearchResult;
 
-use crate::engine::vector::resident::{
-    check_insert_widths, lock_resident, lock_resident_or_create,
+use crate::engine::vector::nodes::{encode_sidecar, unbind_node, upsert_node};
+use crate::engine::vector::resident::{check_insert_widths, lock_resident};
+use crate::engine::vector::row::{
+    EMBEDDING_DIM_FIELD, VECTOR_FIELD_TAG, VECTOR_ROW_FIELDS, VectorSlot, detach_vector_row,
+    is_vector_primary,
 };
 use crate::nodedb::LockExt;
 use crate::nodedb::NodeDbLite;
@@ -20,17 +23,18 @@ use crate::nodedb::convert::value_to_loro;
 use crate::storage::engine::StorageEngine;
 
 /// Internal fields stripped from search-result metadata for a single-vector collection.
-pub(super) const INTERNAL_FIELDS_BASE: &[&str] = &["embedding_dim"];
+pub(super) const INTERNAL_FIELDS_BASE: &[&str] = &[EMBEDDING_DIM_FIELD];
 /// Internal fields stripped from search-result metadata for a named-vector collection
 /// (adds `__field` which records which named vector the row belongs to).
-pub(super) const INTERNAL_FIELDS_NAMED: &[&str] = &["embedding_dim", "__field"];
+pub(super) const INTERNAL_FIELDS_NAMED: &[&str] = VECTOR_ROW_FIELDS;
 
 impl<S: StorageEngine> NodeDbLite<S> {
     /// Shared vector search implementation.
     ///
     /// When `allowed_ids` is `Some`, translates the set of string doc-IDs to a
-    /// `RoaringBitmap` of u32 HNSW surrogates and passes it as the
-    /// `prefilter_bitmap` so only documents from the allowed set are returned.
+    /// `RoaringBitmap` of the nodes they hold in `index_key`'s index and
+    /// passes it as the `prefilter_bitmap`, so only documents from the allowed
+    /// set are returned. Nodes of any other index never enter the bitmap.
     // Cohesive set of search parameters mirroring `run_vector_search`, which
     // carries the same allow for the same reason.
     #[allow(clippy::too_many_arguments)]
@@ -47,10 +51,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
         let prefilter = allowed_ids.map(|ids| {
             let id_map = self.vector_state.vector_id_map.lock_or_recover();
             let mut bm = roaring::RoaringBitmap::new();
-            for (composite_key, (doc_id, internal_id)) in id_map.iter() {
-                if composite_key.starts_with(index_key) && ids.contains(doc_id) {
-                    bm.insert(*internal_id);
-                }
+            if let Some(index_ids) = id_map.index(index_key) {
+                bm.extend(ids.iter().filter_map(|doc_id| index_ids.node(doc_id)));
             }
             bm
         });
@@ -73,8 +75,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
     }
 
     /// Insert a single embedding into the collection's default HNSW index and
-    /// persist its document fields (including the embedding dimension) to CRDT
-    /// storage. Lazily creates the HNSW index on first insert.
+    /// merge its metadata (including the embedding dimension) into the CRDT
+    /// row with the same id. Other row fields are kept. Re-inserting an id
+    /// replaces its vector. Lazily creates the HNSW index on first insert.
     pub(super) async fn vector_insert_impl(
         &self,
         collection: &str,
@@ -110,59 +113,24 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .map_err(NodeDbError::storage)?;
         }
 
-        let internal_id = {
-            let mut resident =
-                lock_resident_or_create(&self.vector_state, collection, embedding.len())
-                    .await
-                    .map_err(NodeDbError::from)?;
-            let index = resident.index();
-            let id_before = index.len() as u32;
-            index
-                .insert(embedding.to_vec())
-                .map_err(|e| NodeDbError::from(crate::error::LiteError::from(e)))?;
-            id_before
-        };
-
-        {
-            let mut id_map = self.vector_state.vector_id_map.lock_or_recover();
-            id_map.insert(
-                format!("{collection}:{internal_id}"),
-                (id.to_string(), internal_id),
-            );
-        }
-
-        // Lazily install a sidecar if the collection config calls for one, then
-        // encode the just-inserted vector.  Sidecar install errors surface as
-        // BadRequest (e.g. unsupported codec).  Encode failures warn-and-continue
-        // so a single bad vector does not abort the insert; affected rows degrade
-        // to FP32 rerank at search time.
-        match crate::engine::vector::sidecar::ensure_sidecar(&self.vector_state, collection) {
-            Ok(true) => {
-                let mut sidecars = self.vector_state.codec_sidecars.lock_or_recover();
-                if let Some(sidecar) = sidecars.get_mut(collection)
-                    && let Err(e) = sidecar.encode_and_insert(internal_id, embedding)
-                {
-                    tracing::warn!(
-                        index_key = collection,
-                        id = internal_id,
-                        error = %e,
-                        "sidecar encode_and_insert failed; row falls back to FP32 rerank"
-                    );
-                }
-            }
-            Ok(false) => {}
-            Err(e) => return Err(NodeDbError::bad_request(e.to_string())),
-        }
+        // Replaces the node `id` held before, so the id stays one node.
+        let internal_id = upsert_node(&self.vector_state, collection, id, embedding)
+            .await
+            .map_err(NodeDbError::from)?;
+        // A sidecar install error is a bad request (e.g. unsupported codec).
+        encode_sidecar(&self.vector_state, collection, internal_id, embedding)
+            .map_err(|e| NodeDbError::bad_request(e.to_string()))?;
 
         {
             let mut crdt = self.crdt.lock_or_recover();
-            let mut fields = vec![("embedding_dim", LoroValue::I64(embedding.len() as i64))];
+            let mut fields = vec![(EMBEDDING_DIM_FIELD, LoroValue::I64(embedding.len() as i64))];
             if let Some(meta) = &metadata {
                 for (k, v) in &meta.fields {
                     fields.push((k.as_str(), value_to_loro(v)));
                 }
             }
-            crdt.upsert(collection, id, &fields)
+            // A merge: the vector attaches to the row and keeps its fields.
+            crdt.set_fields(collection, id, &fields)
                 .map_err(NodeDbError::storage)?;
         }
 
@@ -183,78 +151,107 @@ impl<S: StorageEngine> NodeDbLite<S> {
         Ok(())
     }
 
-    /// Tombstone an embedding in the HNSW index (by external id → internal id
-    /// lookup) and delete its CRDT document. The HNSW slot is reclaimed lazily
-    /// on later inserts; no compaction is performed here.
+    /// Tombstone the base embedding of `id` and detach it from its CRDT row.
+    /// See [`Self::vector_delete_slot`].
     pub(super) async fn vector_delete_impl(&self, collection: &str, id: &str) -> NodeDbResult<()> {
+        self.vector_delete_slot(collection, "", id).await
+    }
+
+    /// Delete the named vector `field_name` of `id` in `collection`, keeping
+    /// the row's document fields and any other vector attached to it. An
+    /// empty `field_name` names the base vector, as `vector_delete` does.
+    pub async fn vector_delete_field(
+        &self,
+        collection: &str,
+        field_name: &str,
+        id: &str,
+    ) -> NodeDbResult<()> {
+        self.vector_delete_slot(collection, field_name, id).await
+    }
+
+    /// Tombstone one embedding of `id` in its HNSW index and detach it from
+    /// its CRDT row: only the fields that vector owns alone go, and document
+    /// fields stay. The whole row goes once no vector remains attached and
+    /// the collection is vector-primary or no document field remains. The
+    /// HNSW slot is reclaimed lazily on later inserts; no compaction is
+    /// performed here.
+    async fn vector_delete_slot(
+        &self,
+        collection: &str,
+        field_name: &str,
+        id: &str,
+    ) -> NodeDbResult<()> {
+        let (index_key, slot) = if field_name.is_empty() {
+            (collection.to_string(), VectorSlot::Base)
+        } else {
+            (
+                format!("{collection}:{field_name}"),
+                VectorSlot::Named(field_name),
+            )
+        };
+
         // Drop the durable row FIRST. It is the source of truth the index is
         // rebuilt from, so leaving it behind would resurrect a deleted vector
         // on the next rebuild — the in-memory tombstone below does not survive
         // one. Ordering also matters: if the process dies between the two, a
         // surviving durable row would come back, whereas a removed row simply
         // leaves the tombstoned slot to be rebuilt away.
-        crate::engine::vector::durable::remove(&*self.storage, collection, id)
+        crate::engine::vector::durable::remove(&*self.storage, &index_key, id)
             .await
             .map_err(NodeDbError::from)?;
 
         // The index, loaded back if it was evicted, takes the tombstone:
         // an evicted index that missed it would bring the vector back.
-        let internal_id = {
-            let mut indices = lock_resident(&self.vector_state, collection)
+        let (internal_id, remaining) = {
+            let mut indices = lock_resident(&self.vector_state, &index_key)
                 .await
                 .map_err(NodeDbError::from)?;
-            let prefix = format!("{collection}:");
-            let internal_id = self
+            let node = unbind_node(
+                &self.vector_state,
+                indices.get_mut(&index_key),
+                &index_key,
+                id,
+            );
+            let remaining = self
                 .vector_state
                 .vector_id_map
                 .lock_or_recover()
-                .iter()
-                .filter(|(key, _)| key.starts_with(&prefix))
-                .find(|(_, (doc_id, _))| doc_id == id)
-                .map(|(_, (_, iid))| *iid);
-            if let (Some(iid), Some(index)) = (internal_id, indices.get_mut(collection)) {
-                index.delete(iid);
-            }
-            internal_id
+                .attached_vectors(collection, id);
+            (node, remaining)
         };
 
-        if let Some(iid) = internal_id {
-            // Remove the encoded entry from any installed sidecar so it
-            // doesn't carry stale data after the HNSW slot is tombstoned.
-            {
-                let mut sidecars = self.vector_state.codec_sidecars.lock_or_recover();
-                if let Some(sidecar) = sidecars.get_mut(collection) {
-                    sidecar.remove(iid);
-                }
-            }
-
+        if internal_id.is_some() {
             // Persist the updated sidecar after every delete. Deletes change
             // the sidecar's encoded-vector set in a way that cannot be
             // reconstructed cheaply from HNSW vectors alone (a deleted slot
             // is tombstoned and has no live vector to re-encode). Persisting
             // here ensures restarts don't re-surface deleted entries.
             if let Err(e) =
-                crate::engine::vector::sidecar::persist_sidecar(&self.vector_state, collection)
+                crate::engine::vector::sidecar::persist_sidecar(&self.vector_state, &index_key)
                     .await
             {
                 tracing::warn!(
                     error = %e,
-                    collection,
+                    index_key,
                     "sidecar persist after delete failed; in-memory sidecar still valid"
                 );
             }
         }
 
+        let vector_primary = is_vector_primary(&*self.storage, collection)
+            .await
+            .map_err(NodeDbError::from)?;
         {
             let mut crdt = self.crdt.lock_or_recover();
-            crdt.delete(collection, id).map_err(NodeDbError::storage)?;
+            detach_vector_row(&mut crdt, collection, id, slot, &remaining, vector_primary)
+                .map_err(NodeDbError::storage)?;
         }
 
         // Enqueue for sync to Origin (no-op when sync is disabled).
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(q) = &self.vector_outbound {
             crate::sync::reconcile_outbound_enqueue(
-                q.enqueue_delete(collection, id, "").await,
+                q.enqueue_delete(collection, id, field_name).await,
                 "vector delete",
                 collection,
                 id,
@@ -270,7 +267,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// Each named field gets its own HNSW index keyed by `"{collection}:{field_name}"`
     /// so a single document can carry multiple independent embeddings. The CRDT row
     /// records the `__field` tag so search results can be re-associated with the
-    /// originating field. When `field_name` is empty, this is equivalent to
+    /// originating field; the row's other fields are kept. Re-inserting an id
+    /// replaces its vector. When `field_name` is empty, this is equivalent to
     /// [`Self::vector_insert_impl`] (no `__field` tag, index keyed by collection).
     pub(super) async fn vector_insert_field_impl(
         &self,
@@ -300,62 +298,26 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .map_err(NodeDbError::storage)?;
         }
 
-        let internal_id = {
-            let mut resident =
-                lock_resident_or_create(&self.vector_state, &index_key, embedding.len())
-                    .await
-                    .map_err(NodeDbError::from)?;
-            let index = resident.index();
-            let id_before = index.len() as u32;
-            index
-                .insert(embedding.to_vec())
-                .map_err(|e| NodeDbError::from(crate::error::LiteError::from(e)))?;
-            id_before
-        };
-
-        {
-            let mut id_map = self.vector_state.vector_id_map.lock_or_recover();
-            id_map.insert(
-                format!("{index_key}:{internal_id}"),
-                (id.to_string(), internal_id),
-            );
-        }
-
-        // Lazily install a sidecar if the collection config calls for one, then
-        // encode the just-inserted vector.  Encode failures warn-and-continue.
-        match crate::engine::vector::sidecar::ensure_sidecar(&self.vector_state, &index_key) {
-            Ok(true) => {
-                let mut sidecars = self.vector_state.codec_sidecars.lock_or_recover();
-                if let Some(sidecar) = sidecars.get_mut(&index_key)
-                    && let Err(e) = sidecar.encode_and_insert(internal_id, embedding)
-                {
-                    tracing::warn!(
-                        index_key = %index_key,
-                        id = internal_id,
-                        error = %e,
-                        "sidecar encode_and_insert failed; row falls back to FP32 rerank"
-                    );
-                }
-            }
-            Ok(false) => {}
-            Err(e) => return Err(NodeDbError::bad_request(e.to_string())),
-        }
+        // Replaces the node `id` held before, so the id stays one node.
+        let internal_id = upsert_node(&self.vector_state, &index_key, id, embedding)
+            .await
+            .map_err(NodeDbError::from)?;
+        encode_sidecar(&self.vector_state, &index_key, internal_id, embedding)
+            .map_err(|e| NodeDbError::bad_request(e.to_string()))?;
 
         {
             let mut crdt = self.crdt.lock_or_recover();
             let mut fields = vec![
-                (
-                    "embedding_dim",
-                    loro::LoroValue::I64(embedding.len() as i64),
-                ),
-                ("__field", loro::LoroValue::String(field_name.into())),
+                (EMBEDDING_DIM_FIELD, LoroValue::I64(embedding.len() as i64)),
+                (VECTOR_FIELD_TAG, LoroValue::String(field_name.into())),
             ];
             if let Some(meta) = &metadata {
                 for (k, v) in &meta.fields {
                     fields.push((k.as_str(), value_to_loro(v)));
                 }
             }
-            crdt.upsert(collection, id, &fields)
+            // A merge: the vector attaches to the row and keeps its fields.
+            crdt.set_fields(collection, id, &fields)
                 .map_err(NodeDbError::storage)?;
         }
 

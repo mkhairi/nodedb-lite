@@ -15,6 +15,18 @@ pub type CrdtField<'a> = (&'a str, LoroValue);
 /// A batch CRDT operation: `(collection, doc_id, fields)`.
 pub type CrdtBatchOp<'a> = (&'a str, &'a str, &'a [CrdtField<'a>]);
 
+/// How one row write in a mixed batch applies its fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrdtRowWrite {
+    /// Replace the row's scalar fields with exactly these, as `upsert` does.
+    Upsert,
+    /// Merge these fields into the row and keep the rest, as `set_fields` does.
+    SetFields,
+}
+
+/// One row write in a mixed batch: `(mode, collection, doc_id, fields)`.
+pub type CrdtRowOp<'a> = (CrdtRowWrite, &'a str, &'a str, &'a [CrdtField<'a>]);
+
 /// Key prefix for delta blobs in the `Crdt` namespace.
 pub(super) const DELTA_KEY_PREFIX: &[u8] = b"delta:";
 /// Key prefix for per-collection Loro snapshots in the `LoroState` namespace.

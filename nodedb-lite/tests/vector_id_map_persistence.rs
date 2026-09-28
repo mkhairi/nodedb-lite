@@ -131,3 +131,162 @@ async fn vector_search_multiple_collections_preserve_ids_after_reopen() {
         );
     }
 }
+
+/// A re-inserted id comes back from a reopen as one node, scored against
+/// its latest vector.
+#[tokio::test]
+async fn reinserted_id_appears_once_after_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .unwrap();
+        let db = NodeDbLite::open(storage).await.unwrap();
+        db.vector_insert("embeds", "bg", &[0.0, 0.0, 1.0], None)
+            .await
+            .unwrap();
+        db.vector_insert("embeds", "x", &[1.0, 0.0, 0.0], None)
+            .await
+            .unwrap();
+        db.vector_insert("embeds", "x", &[0.0, 1.0, 0.0], None)
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+    }
+
+    let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+        .await
+        .unwrap();
+    let db = NodeDbLite::open(storage).await.unwrap();
+    let results = db
+        .vector_search("embeds", &[0.0, 1.0, 0.0], 10, None, None)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids.len(), 2, "one result per id, got {ids:?}");
+    assert_eq!(ids[0], "x", "the latest vector of x is the nearest");
+    assert!(results[0].distance.abs() < 1e-5);
+}
+
+/// Collections whose names share a prefix keep separate bindings across a
+/// reopen: an `allowed_ids` search never resolves another collection's id.
+#[tokio::test]
+async fn prefix_colliding_collections_stay_separate_after_reopen() {
+    use std::collections::HashSet;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .unwrap();
+        let db = NodeDbLite::open(storage).await.unwrap();
+        db.vector_insert("chat", "a", &[1.0, 0.0], None)
+            .await
+            .unwrap();
+        db.vector_insert("chat2", "b", &[1.0, 0.0], None)
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+    }
+
+    let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+        .await
+        .unwrap();
+    let db = NodeDbLite::open(storage).await.unwrap();
+
+    let allowed: HashSet<String> = std::iter::once("b".to_owned()).collect();
+    let restricted = db
+        .vector_search("chat", &[1.0, 0.0], 10, None, Some(&allowed))
+        .await
+        .unwrap();
+    assert!(restricted.is_empty(), "got {restricted:?}");
+
+    let all = db
+        .vector_search("chat", &[1.0, 0.0], 10, None, None)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec!["a"]);
+}
+
+/// A segment backs its index positionally, so ids inserted out of key
+/// order must each come back from a reopen scored against their own vector.
+#[tokio::test]
+async fn ids_inserted_out_of_key_order_keep_their_vectors_after_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+    let rows: [(&str, [f32; 3]); 3] = [
+        ("c", [1.0, 0.0, 0.0]),
+        ("a", [0.0, 1.0, 0.0]),
+        ("b", [0.0, 0.0, 1.0]),
+    ];
+
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .unwrap();
+        let db = NodeDbLite::open(storage).await.unwrap();
+        for (id, v) in &rows {
+            db.vector_insert("ordered", id, v, None).await.unwrap();
+        }
+        db.flush().await.unwrap();
+    }
+
+    let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+        .await
+        .unwrap();
+    let db = NodeDbLite::open(storage).await.unwrap();
+    for (id, v) in &rows {
+        let hits = db.vector_search("ordered", v, 1, None, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, *id, "exact query for {id} returns {id}");
+        assert!(
+            hits[0].distance.abs() < 1e-5,
+            "{id} is scored against its own vector, got {}",
+            hits[0].distance
+        );
+    }
+}
+
+/// A base index rebuilt from durable rows on reopen holds only base
+/// vectors; the named index is rebuilt from its own rows.
+#[tokio::test]
+async fn base_rebuild_after_reopen_excludes_named_field_vectors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .unwrap();
+        let db = NodeDbLite::open(storage).await.unwrap();
+        db.vector_insert("chat", "a", &[1.0, 0.0], None)
+            .await
+            .unwrap();
+        db.vector_insert_field("chat", "emb", "b", &[1.0, 0.0], None)
+            .await
+            .unwrap();
+        // No flush: the reopen rebuilds both indexes from durable rows.
+    }
+
+    let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+        .await
+        .unwrap();
+    let db = NodeDbLite::open(storage).await.unwrap();
+    let base = db
+        .vector_search("chat", &[1.0, 0.0], 10, None, None)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = base.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec!["a"]);
+    let named = db
+        .vector_search_field("chat", "emb", &[1.0, 0.0], 10, None)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = named.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec!["b"]);
+}

@@ -211,3 +211,79 @@ async fn batch_without_embeddings() {
         );
     }
 }
+
+/// An id repeated within one batch keeps one HNSW node: the latest vector.
+#[tokio::test]
+async fn batch_with_duplicate_ids_keeps_one_node_per_id() {
+    let db = open_db().await;
+
+    let first = make_doc("d1", "first");
+    let second = make_doc("d1", "second");
+    let other = make_doc("d2", "other");
+    let items = vec![
+        BatchItem {
+            doc_collection: "docs",
+            doc: first,
+            vector_collection: "vecs",
+            id: "d1",
+            embedding: Some(&[1.0, 0.0, 0.0]),
+        },
+        BatchItem {
+            doc_collection: "docs",
+            doc: second,
+            vector_collection: "vecs",
+            id: "d1",
+            embedding: Some(&[0.0, 1.0, 0.0]),
+        },
+        BatchItem {
+            doc_collection: "docs",
+            doc: other,
+            vector_collection: "vecs",
+            id: "d2",
+            embedding: Some(&[0.0, 0.0, 1.0]),
+        },
+    ];
+    db.document_put_with_vector_batch_impl(&items)
+        .await
+        .expect("batch put");
+
+    let hits = db
+        .vector_search("vecs", &[0.0, 1.0, 0.0], 10, None, None)
+        .await
+        .expect("vector_search");
+    let d1: Vec<_> = hits.iter().filter(|h| h.id == "d1").collect();
+    assert_eq!(d1.len(), 1, "one result per id, got {hits:?}");
+    assert!(
+        d1[0].distance.abs() < 1e-5,
+        "scored against the latest vector"
+    );
+    assert_eq!(hits.len(), 2, "two ids, two results");
+}
+
+/// A batch whose documents and vectors share a collection and id keeps
+/// every document field on the row.
+#[tokio::test]
+async fn batch_same_collection_keeps_document_fields() {
+    let db = open_db().await;
+
+    let items = vec![BatchItem {
+        doc_collection: "notes",
+        doc: make_doc("n1", "body text"),
+        vector_collection: "notes",
+        id: "n1",
+        embedding: Some(&[1.0, 0.0]),
+    }];
+    db.document_put_with_vector_batch_impl(&items)
+        .await
+        .expect("batch put");
+
+    let row = db
+        .document_get("notes", "n1")
+        .await
+        .expect("document_get")
+        .expect("row exists");
+    assert_eq!(
+        row.fields.get("content"),
+        Some(&nodedb_types::value::Value::String("body text".to_owned()))
+    );
+}

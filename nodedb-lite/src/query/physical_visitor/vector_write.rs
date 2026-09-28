@@ -13,8 +13,10 @@ use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 use nodedb_types::vector_distance::DistanceMetric;
 
-use crate::engine::vector::resident::{
-    check_insert_widths, lock_resident, lock_resident_or_create,
+use crate::engine::vector::nodes::{encode_sidecar, unbind_node, upsert_node};
+use crate::engine::vector::resident::{check_insert_widths, lock_resident};
+use crate::engine::vector::row::{
+    EMBEDDING_DIM_FIELD, VectorSlot, detach_vector_row, is_vector_primary,
 };
 use crate::error::LiteError;
 use crate::nodedb::LockExt;
@@ -44,7 +46,9 @@ pub(super) fn parse_metric(s: &str) -> Result<DistanceMetric, LiteError> {
     }
 }
 
-/// Insert a vector into the HNSW index and persist its doc_id to CRDT.
+/// Insert a vector into the HNSW index and merge its dimension into the CRDT
+/// row with the same id, keeping the row's other fields. Re-inserting an id
+/// replaces its vector.
 pub(super) fn vector_insert<'a, S>(
     engine: &'a LiteQueryEngine<S>,
     collection: String,
@@ -80,52 +84,25 @@ where
                     detail: format!("Insert: durable vector write failed: {e}"),
                 })?;
         }
-        let internal_id = {
-            let mut resident =
-                lock_resident_or_create(&vector_state, &index_key, embedding.len()).await?;
-            let index = resident.index();
-            let id_before = index.len() as u32;
-            index.insert(embedding.clone()).map_err(LiteError::from)?;
-            id_before
-        };
-        {
-            let mut id_map = vector_state.vector_id_map.lock_or_recover();
-            id_map.insert(
-                format!("{index_key}:{internal_id}"),
-                (doc_id.clone(), internal_id),
-            );
-        }
-        match crate::engine::vector::sidecar::ensure_sidecar(&vector_state, &index_key) {
-            Ok(true) => {
-                let mut sidecars = vector_state.codec_sidecars.lock_or_recover();
-                if let Some(sidecar) = sidecars.get_mut(&index_key)
-                    && let Err(e) = sidecar.encode_and_insert(internal_id, &embedding)
-                {
-                    tracing::warn!(
-                        index_key = %index_key, id = internal_id, error = %e,
-                        "Insert: sidecar encode failed; row falls back to FP32 rerank"
-                    );
-                }
+        // Replaces the node `doc_id` held before, so the id stays one node.
+        let internal_id = upsert_node(&vector_state, &index_key, &doc_id, &embedding).await?;
+        encode_sidecar(&vector_state, &index_key, internal_id, &embedding).map_err(|e| {
+            LiteError::BadRequest {
+                detail: format!("Insert: sidecar install failed: {e}"),
             }
-            Ok(false) => {}
-            Err(e) => {
-                return Err(LiteError::BadRequest {
-                    detail: format!("Insert: sidecar install failed: {e}"),
-                });
-            }
-        }
+        })?;
         {
             let mut crdt = crdt.lock_or_recover();
-            crdt.upsert(
+            crdt.set_fields(
                 &collection,
                 &doc_id,
                 &[(
-                    "embedding_dim",
+                    EMBEDDING_DIM_FIELD,
                     loro::LoroValue::I64(embedding.len() as i64),
                 )],
             )
             .map_err(|e| LiteError::Storage {
-                detail: format!("Insert: CRDT upsert failed: {e}"),
+                detail: format!("Insert: CRDT field merge failed: {e}"),
             })?;
         }
         Ok(QueryResult {
@@ -137,7 +114,9 @@ where
     })
 }
 
-/// Delete a vector by internal node id; reverse-scans `vector_id_map`.
+/// Delete a vector by internal node id and detach it from its CRDT row.
+/// The whole row goes when the collection is vector-primary or no document
+/// field remains.
 pub(super) fn vector_delete_by_id<'a, S>(
     engine: &'a LiteQueryEngine<S>,
     collection: String,
@@ -152,8 +131,8 @@ where
         let doc_id = vector_state
             .vector_id_map
             .lock_or_recover()
-            .get(&format!("{collection}:{vector_id}"))
-            .map(|(did, _)| did.clone())
+            .doc_id(&collection, vector_id)
+            .map(str::to_owned)
             .ok_or_else(|| LiteError::BadRequest {
                 detail: format!(
                     "Delete: vector_id {vector_id} not found in collection '{collection}'"
@@ -163,23 +142,34 @@ where
         // the next rebuild.
         crate::engine::vector::durable::remove(&*vector_state.storage, &collection, &doc_id)
             .await?;
-        {
+        let remaining = {
             // The index, loaded back if it was evicted, takes the tombstone.
             let mut indices = lock_resident(&vector_state, &collection).await?;
-            if let Some(index) = indices.get_mut(&collection) {
-                index.delete(vector_id);
-            }
-        }
-        vector_state
-            .vector_id_map
-            .lock_or_recover()
-            .remove(&format!("{collection}:{vector_id}"));
+            unbind_node(
+                &vector_state,
+                indices.get_mut(&collection),
+                &collection,
+                &doc_id,
+            );
+            vector_state
+                .vector_id_map
+                .lock_or_recover()
+                .attached_vectors(&collection, &doc_id)
+        };
+        let vector_primary = is_vector_primary(&*vector_state.storage, &collection).await?;
         {
             let mut crdt = crdt.lock_or_recover();
-            crdt.delete(&collection, &doc_id)
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("Delete: CRDT delete failed: {e}"),
-                })?;
+            detach_vector_row(
+                &mut crdt,
+                &collection,
+                &doc_id,
+                VectorSlot::Base,
+                &remaining,
+                vector_primary,
+            )
+            .map_err(|e| LiteError::Storage {
+                detail: format!("Delete: CRDT detach failed: {e}"),
+            })?;
         }
         Ok(QueryResult {
             columns: vec![],
@@ -190,8 +180,9 @@ where
     })
 }
 
-/// Delete a vector by surrogate: tombstone its live node and remove its
-/// payload row. Reports 1 when a row or node existed, else 0.
+/// Delete a vector by surrogate: tombstone its live node and detach it from
+/// its payload row, as a delete by id does. Reports 1 when a row or node
+/// existed, else 0.
 pub(super) fn vector_delete_by_surrogate<'a, S>(
     engine: &'a LiteQueryEngine<S>,
     collection: String,
@@ -211,17 +202,31 @@ where
             format!("{collection}:{field_name}")
         };
         let had_node = remove_live_node(&vector_state, &index_key, &doc_id).await?;
+        let remaining = vector_state
+            .vector_id_map
+            .lock_or_recover()
+            .attached_vectors(&collection, &doc_id);
+        let slot = if field_name.is_empty() {
+            VectorSlot::Base
+        } else {
+            VectorSlot::Named(&field_name)
+        };
+        let vector_primary = is_vector_primary(&*vector_state.storage, &collection).await?;
         let had_row = {
             let mut crdt = crdt.lock_or_recover();
-            if crdt.exists(&collection, &doc_id) {
-                crdt.delete(&collection, &doc_id)
-                    .map_err(|e| LiteError::Storage {
-                        detail: format!("DeleteBySurrogate: CRDT delete failed: {e}"),
-                    })?;
-                true
-            } else {
-                false
-            }
+            let had_row = crdt.exists(&collection, &doc_id);
+            detach_vector_row(
+                &mut crdt,
+                &collection,
+                &doc_id,
+                slot,
+                &remaining,
+                vector_primary,
+            )
+            .map_err(|e| LiteError::Storage {
+                detail: format!("DeleteBySurrogate: CRDT detach failed: {e}"),
+            })?;
+            had_row
         };
         Ok(QueryResult {
             columns: vec![],
@@ -337,11 +342,10 @@ where
             indices.remove(&index_key).is_some() || evicted
         };
 
-        {
-            let mut map = vector_state.vector_id_map.lock_or_recover();
-            let prefix = format!("{index_key}:");
-            map.retain(|k, _| !k.starts_with(&prefix));
-        }
+        vector_state
+            .vector_id_map
+            .lock_or_recover()
+            .remove_index(&index_key);
         vector_state
             .per_index_config
             .lock_or_recover()

@@ -14,9 +14,8 @@ use nodedb_types::value::Value;
 
 use crate::engine::crdt::CrdtEngine;
 use crate::engine::vector::VectorState;
-use crate::engine::vector::resident::{
-    check_insert_widths, lock_resident, lock_resident_or_create,
-};
+use crate::engine::vector::nodes::{encode_sidecar, unbind_node, upsert_node};
+use crate::engine::vector::resident::{check_insert_widths, lock_resident};
 use crate::error::LiteError;
 use crate::nodedb::LockExt;
 use crate::nodedb::convert::{loro_value_to_document, value_to_loro};
@@ -28,7 +27,7 @@ pub(super) use crate::query::on_conflict::apply_patch;
 pub(super) type StoredRow = (String, HashMap<String, Value>);
 
 /// The sidecar field that records the vector's dimension.
-pub(super) const EMBEDDING_DIM_FIELD: &str = "embedding_dim";
+pub(super) use crate::engine::vector::row::EMBEDDING_DIM_FIELD;
 
 /// The HNSW bucket a `(collection, field)` pair writes into.
 pub(super) fn index_key(collection: &str, field: &str) -> String {
@@ -70,44 +69,18 @@ pub(in crate::query::physical_visitor) async fn remove_live_node<S: StorageEngin
     index_key: &str,
     doc_id: &str,
 ) -> Result<bool, LiteError> {
-    let iid = {
-        // Lock order matches the search path: indices, then the id map.
-        let mut indices = lock_resident(vector_state, index_key).await?;
-        let Some(index) = indices.get_mut(index_key) else {
-            return Ok(false);
-        };
-        let prefix = format!("{index_key}:");
-        let live = vector_state
-            .vector_id_map
-            .lock_or_recover()
-            .iter()
-            .filter(|(key, _)| key.starts_with(&prefix))
-            .filter(|(_, (did, _))| did == doc_id)
-            .map(|(_, (_, iid))| *iid)
-            .find(|iid| !index.is_deleted(*iid));
-        let Some(iid) = live else {
-            return Ok(false);
-        };
-        index.delete(iid);
-        iid
+    // Lock order matches the search path: indices, then the id map.
+    let mut indices = lock_resident(vector_state, index_key).await?;
+    let Some(index) = indices.get_mut(index_key) else {
+        return Ok(false);
     };
-    vector_state
-        .vector_id_map
-        .lock_or_recover()
-        .remove(&format!("{index_key}:{iid}"));
-    if let Some(sidecar) = vector_state
-        .codec_sidecars
-        .lock_or_recover()
-        .get_mut(index_key)
-    {
-        sidecar.remove(iid);
-    }
-    Ok(true)
+    Ok(unbind_node(vector_state, Some(index), index_key, doc_id).is_some())
 }
 
 /// Make `embedding` durable for `doc_id`, insert it into the HNSW index,
 /// bind the node in the id map, and encode it into the codec sidecar when
-/// one is installed. Returns the internal node id.
+/// one is installed. The node `doc_id` held before is tombstoned, so the id
+/// keeps one live node. Returns the internal node id.
 pub(super) async fn insert_node<S: StorageEngine>(
     vector_state: &Arc<VectorState<S>>,
     index_key: &str,
@@ -128,37 +101,12 @@ pub(super) async fn insert_node<S: StorageEngine>(
         .map_err(|e| LiteError::Storage {
             detail: format!("{op_name}: durable vector write failed: {e}"),
         })?;
-    let internal_id = {
-        let mut resident =
-            lock_resident_or_create(vector_state, index_key, embedding.len()).await?;
-        let index = resident.index();
-        let id_before = index.len() as u32;
-        index.insert(embedding.to_vec()).map_err(LiteError::from)?;
-        id_before
-    };
-    vector_state.vector_id_map.lock_or_recover().insert(
-        format!("{index_key}:{internal_id}"),
-        (doc_id.to_string(), internal_id),
-    );
-    match crate::engine::vector::sidecar::ensure_sidecar(vector_state, index_key) {
-        Ok(true) => {
-            let mut sidecars = vector_state.codec_sidecars.lock_or_recover();
-            if let Some(sidecar) = sidecars.get_mut(index_key)
-                && let Err(e) = sidecar.encode_and_insert(internal_id, embedding)
-            {
-                tracing::warn!(
-                    index_key, id = internal_id, error = %e,
-                    "{op_name}: sidecar encode failed; row falls back to FP32 rerank"
-                );
-            }
+    let internal_id = upsert_node(vector_state, index_key, doc_id, embedding).await?;
+    encode_sidecar(vector_state, index_key, internal_id, embedding).map_err(|e| {
+        LiteError::BadRequest {
+            detail: format!("{op_name}: sidecar install failed: {e}"),
         }
-        Ok(false) => {}
-        Err(e) => {
-            return Err(LiteError::BadRequest {
-                detail: format!("{op_name}: sidecar install failed: {e}"),
-            });
-        }
-    }
+    })?;
     Ok(internal_id)
 }
 

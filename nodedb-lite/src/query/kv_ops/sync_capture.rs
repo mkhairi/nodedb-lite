@@ -29,7 +29,9 @@ use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
-use super::reads::{decode_value, is_expired, kv_key, split_kv_key};
+#[cfg(not(target_arch = "wasm32"))]
+use super::reads::{decode_value, is_expired};
+use super::reads::{kv_key, split_kv_key};
 use super::writes::kv_truncate;
 
 /// One key a SQL KV write touches: `(collection, key)`.

@@ -237,19 +237,18 @@ impl<S: StorageEngine> NodeDbLite<S> {
         };
 
         // ── Persist HNSW vector_id_map ──
-        // The id_map is a flat HashMap<composite_key, (doc_id, internal_id)>
-        // serialized as one MessagePack blob. It must be written before any restart
-        // so that vector_search can return real doc_ids (not HNSW integer strings).
-        // Vector search with an empty id_map after restart is the bug this fixes.
+        // The id_map is serialized as one MessagePack blob of
+        // `("{index_key}:{node}", doc_id, node)` entries. It must be written before any restart
+        // so that vector_search can return real doc_ids (not HNSW integer strings)
+        // instead of an empty id_map after restart.
         // Vectors are flush-only (no per-insert durability path); the id_map
         // follows the same durability contract — flush required.
         {
-            let id_map = self.vector_state.vector_id_map.lock_or_recover();
-            // Serialize as Vec<(composite_key, doc_id, internal_id)> for stable msgpack encoding.
-            let entries: Vec<(&str, &str, u32)> = id_map
-                .iter()
-                .map(|(k, (doc_id, iid))| (k.as_str(), doc_id.as_str(), *iid))
-                .collect();
+            let entries = self
+                .vector_state
+                .vector_id_map
+                .lock_or_recover()
+                .to_entries();
             match zerompk::to_msgpack_vec(&entries) {
                 Ok(bytes) => {
                     ops.push(WriteOp::Put {
@@ -276,12 +275,14 @@ impl<S: StorageEngine> NodeDbLite<S> {
         //   - full checkpoint blob → B+ tree (checkpoint_to_bytes)
         #[cfg(not(target_arch = "wasm32"))]
         let seg_ext = self.storage.as_vector_segment_ext();
-        #[cfg_attr(
-            target_arch = "wasm32",
-            allow(unused_variables, clippy::type_complexity)
-        )]
-        #[allow(clippy::type_complexity)]
-        let hnsw_segment_names: Vec<String> = {
+        // Per segment-backed index: where each node's segment vector comes
+        // from, in node-id order, read under the index lock.
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut segment_jobs: Vec<(
+            String,
+            Vec<crate::engine::vector::segment::NodeSource>,
+        )> = Vec::new();
+        {
             let indices = self.vector_state.hnsw_indices.lock_or_recover();
             let names: Vec<String> = indices.keys().cloned().collect();
             let names_bytes = zerompk::to_msgpack_vec(&names)
@@ -292,9 +293,6 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 value: names_bytes,
             });
 
-            // Mutated only via the native segment-ext path, compiled out on wasm32.
-            #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-            let mut segment_names: Vec<String> = Vec::new();
             for (name, index) in indices.iter() {
                 let key = format!("hnsw:{name}");
 
@@ -310,12 +308,20 @@ impl<S: StorageEngine> NodeDbLite<S> {
                             key: key.into_bytes(),
                             value: crate::storage::checksum::wrap(&graph_bytes),
                         });
-                        // The segment payload is sourced from the DURABLE vectors
-                        // after this lock is released, NOT from `index` — see
-                        // `engine::vector::durable::segment_payload`. Reading it
-                        // from the index would serialize empty vectors whenever
-                        // the index was restored from a graph-only checkpoint.
-                        segment_names.push(name.clone());
+                        // The segment payload is laid out in node-id order. Bound
+                        // nodes read the DURABLE vectors after this lock is
+                        // released — see `engine::vector::segment::segment_payload`.
+                        let id_map = self.vector_state.vector_id_map.lock_or_recover();
+                        match crate::engine::vector::segment::node_sources(
+                            index,
+                            id_map.index(name),
+                        ) {
+                            Some(sources) => segment_jobs.push((name.clone(), sources)),
+                            None => tracing::warn!(
+                                collection = %name,
+                                "an unbound node has no readable vector; segment not written"
+                            ),
+                        }
                     } else {
                         // Non-pagedb native backend: full checkpoint blob path.
                         let checkpoint = index
@@ -341,8 +347,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                     });
                 }
             }
-            segment_names
-        };
+        }
 
         self.storage
             .batch_write(&ops)
@@ -362,26 +367,30 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // ── Write HNSW vector segments to pagedb (native PagedbStorage only) ──
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ext) = seg_ext {
-            for name in &hnsw_segment_names {
-                let payload =
-                    match crate::engine::vector::durable::segment_payload(&*self.storage, name)
-                        .await
-                    {
-                        Ok(Some(p)) => p,
-                        // No durable vectors: nothing to publish. Leaving the
-                        // existing segment untouched is deliberate — replacing it
-                        // with an empty one is exactly the corruption this fixes.
-                        Ok(None) => continue,
-                        Err(e) => {
-                            tracing::error!(
-                                collection = %name,
-                                error = %e,
-                                "reading durable vectors for the segment write failed; \
-                                 leaving the existing segment in place"
-                            );
-                            continue;
-                        }
-                    };
+            for (name, sources) in segment_jobs {
+                let name = name.as_str();
+                let payload = match crate::engine::vector::segment::segment_payload(
+                    &*self.storage,
+                    name,
+                    sources,
+                )
+                .await
+                {
+                    Ok(Some(p)) => p,
+                    // No durable vectors: nothing to publish. Leaving the
+                    // existing segment untouched is deliberate — replacing it
+                    // with an empty one would corrupt it.
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::error!(
+                            collection = %name,
+                            error = %e,
+                            "reading durable vectors for the segment write failed; \
+                             leaving the existing segment in place"
+                        );
+                        continue;
+                    }
+                };
                 let (dim, vectors, surrogates) = payload;
                 if let Err(e) = ext
                     .write_vector_segment(name, dim, &vectors, &surrogates)

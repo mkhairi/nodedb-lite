@@ -10,7 +10,7 @@ use nodedb_crdt::CrdtState;
 
 use crate::error::LiteError;
 
-use super::types::{CrdtBatchOp, CrdtEngine, DeferredOp, PendingDelta};
+use super::types::{CrdtBatchOp, CrdtEngine, CrdtRowOp, CrdtRowWrite, DeferredOp, PendingDelta};
 
 impl CrdtEngine {
     // ─── Mutations ───────────────────────────────────────────────────
@@ -57,6 +57,26 @@ impl CrdtEngine {
         Ok(mutation_id)
     }
 
+    /// Delete the named scalar fields from a row, leaving every other key
+    /// intact. An absent row or field authors nothing.
+    ///
+    /// Returns `(fields removed, mutation id)`. The mutation ID is 0 when
+    /// nothing was removed and no delta was enqueued.
+    pub fn remove_fields(
+        &mut self,
+        collection: &str,
+        doc_id: &str,
+        fields: &[&str],
+    ) -> Result<(usize, u64), LiteError> {
+        self.with_delta_capture(collection, doc_id, "remove_fields", |state| {
+            state
+                .remove_fields(collection, doc_id, fields)
+                .map_err(|e| LiteError::Storage {
+                    detail: format!("CRDT remove_fields failed: {e}"),
+                })
+        })
+    }
+
     /// Delete a document/row.
     pub fn delete(&mut self, collection: &str, doc_id: &str) -> Result<u64, LiteError> {
         let (_, mutation_id) = self.with_delta_capture(collection, doc_id, "delete", |state| {
@@ -94,6 +114,32 @@ impl CrdtEngine {
             }
         }
         Ok(last_mutation_id)
+    }
+
+    /// Batch of mixed row writes: each op is a full-row `upsert` or a
+    /// field-merging `set_fields`, applied in order under one engine borrow.
+    ///
+    /// Emits one delta per row, as [`Self::batch_upsert`] does. Returns the
+    /// mutation ID of every delta enqueued, in op order. A row write that
+    /// authored nothing enqueues no delta and contributes no ID.
+    pub fn batch_write(&mut self, ops: &[CrdtRowOp<'_>]) -> Result<Vec<u64>, LiteError> {
+        let mut mutation_ids = Vec::with_capacity(ops.len());
+        for &(mode, collection, doc_id, fields) in ops {
+            let (_, mutation_id) =
+                self.with_delta_capture(collection, doc_id, "batch write", |state| {
+                    match mode {
+                        CrdtRowWrite::Upsert => state.upsert(collection, doc_id, fields),
+                        CrdtRowWrite::SetFields => state.set_fields(collection, doc_id, fields),
+                    }
+                    .map_err(|e| LiteError::Storage {
+                        detail: format!("CRDT batch write failed: {e}"),
+                    })
+                })?;
+            if mutation_id != 0 {
+                mutation_ids.push(mutation_id);
+            }
+        }
+        Ok(mutation_ids)
     }
 
     /// Upsert without generating a delta. Use `flush_deltas()` later

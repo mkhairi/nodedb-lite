@@ -7,13 +7,18 @@
 //! acquires the CRDT lock exactly **once** for the whole batch — that is the
 //! win over the single-item path, which takes and releases the lock per item.
 //!
-//! The batch does **not** collapse into one delta: `CrdtEngine::batch_upsert`
+//! The batch does **not** collapse into one delta: `CrdtEngine::batch_write`
 //! emits one `PendingDelta` per CRDT row, tagged with that row's real
 //! collection and document ID. A delta spanning several rows (or several
 //! collections) is not independently applicable by a receiver, which commits
 //! per row and stores documents per collection. So a batch of N items emits
 //! N document deltas plus one vector-metadata delta per item that carries a
-//! non-empty embedding. See `CrdtEngine::batch_upsert` for the contract.
+//! non-empty embedding. See `CrdtEngine::batch_write` for the contract.
+//!
+//! Each document is a full-row upsert; each vector-metadata write is a field
+//! merge, so a vector attached to its own document's row keeps that
+//! document's fields. An id repeated within the batch, or already indexed,
+//! keeps one HNSW node: the latest vector.
 //!
 //! FTS indexing, bitemporal history writes, and HNSW inserts run after
 //! the CRDT lock is released — matching the ordering of the single-item path.
@@ -21,10 +26,11 @@
 use nodedb_types::document::Document;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
-use crate::engine::crdt::engine::CrdtBatchOp;
+use crate::engine::crdt::{CrdtRowOp, CrdtRowWrite};
 use crate::engine::document::history::ops::{is_bitemporal, versioned_put};
-use crate::engine::vector::resident::{check_insert_widths, lock_resident_or_create};
-use crate::engine::vector::sidecar;
+use crate::engine::vector::nodes::{encode_sidecar, upsert_node};
+use crate::engine::vector::resident::check_insert_widths;
+use crate::engine::vector::row::EMBEDDING_DIM_FIELD;
 use crate::nodedb::LockExt;
 use crate::nodedb::NodeDbLite;
 use crate::nodedb::convert::{document_to_msgpack, value_to_loro};
@@ -51,7 +57,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// Batch upsert of documents with optional embeddings.
     ///
     /// Acquires the CRDT lock once and runs every per-item Loro mutation
-    /// under that single hold. Per `CrdtEngine::batch_upsert`, each CRDT row
+    /// under that single hold. Per `CrdtEngine::batch_write`, each CRDT row
     /// still exports its own delta — one per document, plus one per item with
     /// a non-empty embedding for the vector-metadata row — because a delta
     /// covering several rows or collections is not independently applicable by
@@ -122,7 +128,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
             let vec_fields: Vec<(&str, loro::LoroValue)> = match item.embedding {
                 Some(emb) if !emb.is_empty() => {
-                    vec![("embedding_dim", loro::LoroValue::I64(emb.len() as i64))]
+                    vec![(EMBEDDING_DIM_FIELD, loro::LoroValue::I64(emb.len() as i64))]
                 }
                 _ => vec![],
             };
@@ -130,21 +136,31 @@ impl<S: StorageEngine> NodeDbLite<S> {
             resolved.push((doc_id, doc_fields, vec_fields));
         }
 
-        // Build the ops slice for batch_upsert — one CRDT lock hold, one
-        // exported delta per row.
+        // Build the ops slice for batch_write — one CRDT lock hold, one
+        // exported delta per row. Documents replace their row; vector
+        // metadata merges into its row.
         {
             let mut crdt = self.crdt.lock_or_recover();
 
-            let mut ops: Vec<CrdtBatchOp<'_>> = Vec::with_capacity(items.len() * 2);
-            for (i, item) in items.iter().enumerate() {
-                let (ref doc_id, ref doc_fields, ref vec_fields) = resolved[i];
-                ops.push((item.doc_collection, doc_id.as_str(), doc_fields.as_slice()));
+            let mut ops: Vec<CrdtRowOp<'_>> = Vec::with_capacity(items.len() * 2);
+            for (item, (doc_id, doc_fields, vec_fields)) in items.iter().zip(&resolved) {
+                ops.push((
+                    CrdtRowWrite::Upsert,
+                    item.doc_collection,
+                    doc_id.as_str(),
+                    doc_fields.as_slice(),
+                ));
                 if !vec_fields.is_empty() {
-                    ops.push((item.vector_collection, item.id, vec_fields.as_slice()));
+                    ops.push((
+                        CrdtRowWrite::SetFields,
+                        item.vector_collection,
+                        item.id,
+                        vec_fields.as_slice(),
+                    ));
                 }
             }
 
-            crdt.batch_upsert(&ops).map_err(NodeDbError::storage)?;
+            crdt.batch_write(&ops).map_err(NodeDbError::storage)?;
         }
 
         // Post-lock work: bitemporal history + FTS + HNSW (matches single-item ordering).
@@ -194,47 +210,23 @@ impl<S: StorageEngine> NodeDbLite<S> {
             if let Some(embedding) = item.embedding
                 && !embedding.is_empty()
             {
-                let internal_id = {
-                    let mut resident = lock_resident_or_create(
-                        &self.vector_state,
-                        item.vector_collection,
-                        embedding.len(),
-                    )
-                    .await
-                    .map_err(NodeDbError::from)?;
-                    let index = resident.index();
-                    let id_before = index.len() as u32;
-                    index
-                        .insert(embedding.to_vec())
-                        .map_err(|e| NodeDbError::from(crate::error::LiteError::from(e)))?;
-                    id_before
-                };
-
-                {
-                    let mut id_map = self.vector_state.vector_id_map.lock_or_recover();
-                    id_map.insert(
-                        format!("{}:{internal_id}", item.vector_collection),
-                        (item.id.to_string(), internal_id),
-                    );
-                }
-
-                match sidecar::ensure_sidecar(&self.vector_state, item.vector_collection) {
-                    Ok(true) => {
-                        let mut sidecars = self.vector_state.codec_sidecars.lock_or_recover();
-                        if let Some(s) = sidecars.get_mut(item.vector_collection)
-                            && let Err(e) = s.encode_and_insert(internal_id, embedding)
-                        {
-                            tracing::warn!(
-                                index_key = item.vector_collection,
-                                id = internal_id,
-                                error = %e,
-                                "sidecar encode_and_insert failed; row falls back to FP32 rerank"
-                            );
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(e) => return Err(NodeDbError::bad_request(e.to_string())),
-                }
+                // Replaces the node the id held before, including one bound
+                // earlier in this batch, so the id stays one node.
+                let internal_id = upsert_node(
+                    &self.vector_state,
+                    item.vector_collection,
+                    item.id,
+                    embedding,
+                )
+                .await
+                .map_err(NodeDbError::from)?;
+                encode_sidecar(
+                    &self.vector_state,
+                    item.vector_collection,
+                    internal_id,
+                    embedding,
+                )
+                .map_err(|e| NodeDbError::bad_request(e.to_string()))?;
 
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(q) = &self.vector_outbound {

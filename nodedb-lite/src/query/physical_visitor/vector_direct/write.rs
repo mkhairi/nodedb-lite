@@ -17,8 +17,7 @@ use crate::storage::engine::StorageEngine;
 
 use super::super::adapter::LitePhysicalFut;
 use super::common::{
-    apply_patch, decode_payload, doc_id_for, index_key, insert_node, read_row, remove_live_node,
-    write_row,
+    apply_patch, decode_payload, doc_id_for, index_key, insert_node, read_row, write_row,
 };
 
 /// One row of the insert family, as the three ops carry it.
@@ -120,9 +119,8 @@ where
             (VectorDirectWriteIntent::Upsert, None) => (incoming, "UPSERT"),
         };
 
-        // A stored row keeps exactly one live node: the old one goes before
-        // the new vector is bound under the same identity.
-        remove_live_node(&vector_state, &key, &doc_id).await?;
+        // A stored row keeps exactly one live node: binding the new vector
+        // tombstones the old one under the same lock.
         insert_node(&vector_state, &key, &doc_id, &vector, op_name).await?;
         write_row(&crdt, &collection, &doc_id, dim, &row, op_name)?;
 

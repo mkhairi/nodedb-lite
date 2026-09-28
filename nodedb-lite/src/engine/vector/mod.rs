@@ -9,11 +9,17 @@ pub use nodedb_vector::hnsw::search as hnsw_search;
 pub use nodedb_vector::{DistanceMetric, HnswIndex, HnswParams, SearchResult};
 
 pub mod durable;
+pub mod id_map;
+pub mod nodes;
 pub mod resident;
+pub mod row;
 pub mod search;
 pub mod sidecar;
 pub mod state;
+pub use id_map::{AttachedVectors, IndexIdMap, VectorIdMap};
 pub use state::{RestoredVectorState, VectorState};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pagedb_backing;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod segment;

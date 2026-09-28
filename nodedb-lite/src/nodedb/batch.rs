@@ -3,7 +3,9 @@
 use nodedb_types::Namespace;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
+use crate::engine::vector::nodes::{bind_node, encode_sidecar};
 use crate::engine::vector::resident::{check_insert_widths, lock_resident_or_create};
+use crate::engine::vector::row::EMBEDDING_DIM_FIELD;
 
 use super::{LockExt, NodeDbLite};
 use crate::storage::engine::StorageEngine;
@@ -12,8 +14,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// Batch insert vectors — O(1) CRDT delta export instead of O(N).
     ///
     /// Use this for bulk loading (cold-start hydration, benchmark setup, imports).
-    /// Each vector is inserted into HNSW and tracked in the ID map, but only one
-    /// Loro delta is generated for the entire batch.
+    /// Each vector is inserted into HNSW and tracked in the ID map. An id
+    /// repeated in the batch, or already indexed, keeps one node: the latest
+    /// vector. Each id's embedding dimension merges into its CRDT row, whose
+    /// other fields are kept.
     pub async fn batch_vector_insert(
         &self,
         collection: &str,
@@ -66,42 +70,54 @@ impl<S: StorageEngine> NodeDbLite<S> {
             }
         }
 
+        // Each id's final node, for the codec sidecar: a node an id held
+        // earlier in the batch is already tombstoned.
+        let mut bound: std::collections::HashMap<&str, (u32, &[f32])> =
+            std::collections::HashMap::with_capacity(vectors.len());
         {
             let mut resident = lock_resident_or_create(&self.vector_state, collection, dim)
                 .await
                 .map_err(NodeDbError::from)?;
             let index = resident.index();
-            let mut id_map = self.vector_state.vector_id_map.lock_or_recover();
-
             for &(id, embedding) in vectors {
-                let internal_id = index.len() as u32;
-                index
-                    .insert(embedding.to_vec())
-                    .map_err(|e| NodeDbError::from(crate::error::LiteError::from(e)))?;
-                id_map.insert(
-                    format!("{collection}:{internal_id}"),
-                    (id.to_string(), internal_id),
-                );
+                let node = bind_node(
+                    &self.vector_state,
+                    index,
+                    collection,
+                    id,
+                    embedding.to_vec(),
+                )
+                .map_err(NodeDbError::from)?;
+                bound.insert(id, (node, embedding));
             }
+        }
+        // Encoded after the index lock is released: installing a sidecar
+        // trains on the index.
+        for (node, embedding) in bound.into_values() {
+            encode_sidecar(&self.vector_state, collection, node, embedding)
+                .map_err(|e| NodeDbError::bad_request(e.to_string()))?;
         }
 
         {
             let mut crdt = self.crdt.lock_or_recover();
 
-            use crate::engine::crdt::engine::{CrdtBatchOp, CrdtField};
+            use crate::engine::crdt::{CrdtField, CrdtRowOp, CrdtRowWrite};
 
             let fields: Vec<Vec<CrdtField<'_>>> = vectors
                 .iter()
-                .map(|&(_, emb)| vec![("embedding_dim", loro::LoroValue::I64(emb.len() as i64))])
+                .map(|&(_, emb)| {
+                    vec![(EMBEDDING_DIM_FIELD, loro::LoroValue::I64(emb.len() as i64))]
+                })
                 .collect();
 
-            let ops: Vec<CrdtBatchOp<'_>> = vectors
+            // A merge: each vector attaches to its row and keeps its fields.
+            let ops: Vec<CrdtRowOp<'_>> = vectors
                 .iter()
                 .zip(fields.iter())
-                .map(|(&(id, _), f)| (collection, id, f.as_slice()))
+                .map(|(&(id, _), f)| (CrdtRowWrite::SetFields, collection, id, f.as_slice()))
                 .collect();
 
-            crdt.batch_upsert(&ops).map_err(NodeDbError::storage)?;
+            crdt.batch_write(&ops).map_err(NodeDbError::storage)?;
         }
 
         self.update_memory_stats();
@@ -207,7 +223,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             // changes it, and the index then stays resident: dropping it would
             // lose that write from the stored copy.
             #[cfg(not(target_arch = "wasm32"))]
-            let (blob, write_segment, snapshot) = {
+            let (blob, segment_sources, snapshot) = {
                 let indices = self.vector_state.hnsw_indices.lock_or_recover();
                 match indices.get(&name) {
                     Some(idx) => {
@@ -216,12 +232,19 @@ impl<S: StorageEngine> NodeDbLite<S> {
                             let graph_bytes = idx.graph_checkpoint_to_bytes().map_err(|e| {
                                 NodeDbError::serialization("hnsw-graph-checkpoint", e)
                             })?;
-                            (graph_bytes, true, snapshot)
+                            // Segment slots follow node-id order; see
+                            // `engine::vector::segment`.
+                            let id_map = self.vector_state.vector_id_map.lock_or_recover();
+                            let sources = crate::engine::vector::segment::node_sources(
+                                idx,
+                                id_map.index(&name),
+                            );
+                            (graph_bytes, sources, snapshot)
                         } else {
                             let blob = idx
                                 .checkpoint_to_bytes()
                                 .map_err(|e| NodeDbError::serialization("hnsw-checkpoint", e))?;
-                            (blob, false, snapshot)
+                            (blob, None, snapshot)
                         }
                     }
                     None => continue,
@@ -252,8 +275,16 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
             // Write vector segment on native targets when segment ext is available.
             #[cfg(not(target_arch = "wasm32"))]
-            if write_segment && let Some(ext) = seg_ext {
-                match crate::engine::vector::durable::segment_payload(&*self.storage, &name).await {
+            if let Some(sources) = segment_sources
+                && let Some(ext) = seg_ext
+            {
+                match crate::engine::vector::segment::segment_payload(
+                    &*self.storage,
+                    &name,
+                    sources,
+                )
+                .await
+                {
                     Ok(Some((dim, vectors, surrogates))) => {
                         if let Err(e) = ext
                             .write_vector_segment(&name, dim, &vectors, &surrogates)

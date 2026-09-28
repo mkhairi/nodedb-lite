@@ -25,7 +25,8 @@ use nodedb_types::value::Value;
 use crate::engine::fts::FtsCollectionManager;
 use crate::engine::spatial::SpatialIndexManager;
 use crate::engine::vector::VectorState;
-use crate::engine::vector::resident::{lock_resident, lock_resident_or_create};
+use crate::engine::vector::nodes::{encode_sidecar, unbind_node, upsert_node};
+use crate::engine::vector::resident::lock_resident;
 use crate::error::LiteError;
 use crate::nodedb::lock_ext::LockExt;
 use crate::storage::engine::StorageEngine;
@@ -110,9 +111,10 @@ fn index_geometry(
 }
 
 /// Index a row's VECTOR columns into their HNSW indexes, keyed
-/// `"{collection}:{column}"`, and bind each node to `row_id`. The vector is
-/// made durable first, as every other vector insert does. A NULL value
-/// indexes nothing.
+/// `"{collection}:{column}"`, and bind each node to `row_id`, replacing the
+/// node `row_id` held before, and encode it into the codec sidecar when the
+/// index config calls for one. The vector is made durable first, as every
+/// other vector insert does. A NULL value indexes nothing.
 ///
 /// Fails with `DataException` for a value that is not a vector of the
 /// column's width, and propagates a storage or index error.
@@ -136,18 +138,8 @@ pub(crate) async fn index_row_vectors<S: StorageEngine>(
             .storage
             .batch_write(std::slice::from_ref(&op))
             .await?;
-        let internal_id = {
-            let mut resident =
-                lock_resident_or_create(vector_state, &index_key, vector.len()).await?;
-            let index = resident.index();
-            let id_before = index.len() as u32;
-            index.insert(vector)?;
-            id_before
-        };
-        vector_state.vector_id_map.lock_or_recover().insert(
-            format!("{index_key}:{internal_id}"),
-            (row_id.to_string(), internal_id),
-        );
+        let node = upsert_node(vector_state, &index_key, row_id, &vector).await?;
+        encode_sidecar(vector_state, &index_key, node, &vector)?;
     }
     Ok(())
 }
@@ -168,20 +160,12 @@ pub(crate) async fn deindex_row_vectors<S: StorageEngine>(
         let index_key = format!("{collection}:{}", col.name);
         crate::engine::vector::durable::remove(&*vector_state.storage, &index_key, row_id).await?;
         let mut indices = lock_resident(vector_state, &index_key).await?;
-        let Some(index) = indices.get_mut(&index_key) else {
-            continue;
-        };
-        let prefix = format!("{index_key}:");
-        let mut id_map = vector_state.vector_id_map.lock_or_recover();
-        let bound: Vec<(String, u32)> = id_map
-            .iter()
-            .filter(|(key, (doc_id, _))| key.starts_with(&prefix) && doc_id == row_id)
-            .map(|(key, (_, iid))| (key.clone(), *iid))
-            .collect();
-        for (key, iid) in bound {
-            index.delete(iid);
-            id_map.remove(&key);
-        }
+        unbind_node(
+            vector_state,
+            indices.get_mut(&index_key),
+            &index_key,
+            row_id,
+        );
     }
     Ok(())
 }
@@ -358,8 +342,12 @@ mod tests {
             assert_eq!(hnsw.get("test:emb").map(|i| i.live_count()), Some(1));
         }
         assert_eq!(
-            state.vector_id_map.lock().expect("lock").get("test:emb:0"),
-            Some(&("1".to_string(), 0))
+            state
+                .vector_id_map
+                .lock()
+                .expect("lock")
+                .doc_id("test:emb", 0),
+            Some("1")
         );
 
         deindex_row_vectors(&state, "test", "1", &vector_columns())

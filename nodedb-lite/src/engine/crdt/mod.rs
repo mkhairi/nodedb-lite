@@ -3,4 +3,7 @@
 pub mod engine;
 mod policy;
 
-pub use engine::{CrdtBatchOp, CrdtEngine, CrdtField, CrdtPersisted, CrdtWrite, CrdtWriteKind};
+pub use engine::{
+    CrdtBatchOp, CrdtEngine, CrdtField, CrdtPersisted, CrdtRowOp, CrdtRowWrite, CrdtWrite,
+    CrdtWriteKind,
+};

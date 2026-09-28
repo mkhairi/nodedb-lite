@@ -114,6 +114,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// descriptor before their overlay (vector/FTS) or document data arrives.
     /// Equivalent to the meta an explicit `create_collection` would persist
     /// (`collection_type = "document"`, no `descriptor_json`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn implicit_collection_meta(&self, name: &str) -> Option<CollectionMeta> {
         if name.starts_with("__") {
             return None;

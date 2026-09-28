@@ -130,7 +130,7 @@ where
         for (doc_id, mut row) in hits {
             let dim = match &new_vector {
                 Some(vector) => {
-                    remove_live_node(&vector_state, &key, &doc_id).await?;
+                    // Binding the new vector tombstones the old node.
                     insert_node(&vector_state, &key, &doc_id, vector, "DirectUpdate").await?;
                     vector.len()
                 }

@@ -63,10 +63,9 @@ pub(crate) async fn clear_index<S: StorageEngine>(
 }
 
 /// Clear every index bucket `collection` owns: its base key and each
-/// `collection:<field>` key that is live, evicted or configured. The base key is
-/// always cleared: its durable prefix `v:<collection>:` covers the rows of
-/// every named bucket too, so no durable row survives for a bucket that is
-/// not in memory.
+/// `collection:<field>` key that is live, evicted, configured, or holds
+/// durable rows. Each bucket's durable rows are keyed by that bucket alone,
+/// so a named bucket that is not in memory is found through its rows.
 pub(crate) async fn clear_collection_indexes<S: StorageEngine>(
     vector_state: &Arc<VectorState<S>>,
     collection: &str,
@@ -86,6 +85,8 @@ pub(crate) async fn clear_collection_indexes<S: StorageEngine>(
         let configs = vector_state.per_index_config.lock_or_recover();
         keys.extend(configs.keys().filter(|k| owned(k)).cloned());
     }
+    let durable = crate::engine::vector::durable::list_collections(&*vector_state.storage).await?;
+    keys.extend(durable.into_iter().filter(|k| owned(k)));
     keys.sort();
     keys.dedup();
     for key in &keys {
@@ -107,11 +108,10 @@ async fn reset_index<S: StorageEngine>(
             *index = HnswIndex::new(index.dim(), index.params().clone());
         }
     }
-    let prefix = format!("{index_key}:");
     vector_state
         .vector_id_map
         .lock_or_recover()
-        .retain(|k, _| !k.starts_with(&prefix));
+        .remove_index(index_key);
     vector_state.unloadable.lock_or_recover().remove(index_key);
     crate::engine::vector::sidecar::remove_sidecar(vector_state, index_key).await?;
     // The checkpoint describes the old graph; the next flush writes the
@@ -196,8 +196,8 @@ mod tests {
                 .vector_state
                 .vector_id_map
                 .lock_or_recover()
-                .keys()
-                .all(|k| !k.starts_with(&format!("{key}:")))
+                .index(&key)
+                .is_none()
         );
 
         insert(&engine, "d", vec![9.0, 9.0]).await;

@@ -15,6 +15,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
     }
 
     /// This instance's durable producer identity, as sent in a sync handshake.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn sync_identity(&self) -> crate::identity::LiteIdentity {
         self.identity.lock_or_recover().clone()
     }

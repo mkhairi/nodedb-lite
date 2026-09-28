@@ -13,5 +13,7 @@ mod document_batch;
 mod graph;
 mod sql_lifecycle;
 mod vector;
+#[cfg(test)]
+mod vector_tests;
 
 pub use document_batch::BatchItem;
