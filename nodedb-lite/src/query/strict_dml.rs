@@ -3,16 +3,19 @@
 //! INSERT, UPDATE, and DELETE for strict collections convert SQL values to
 //! `nodedb_types::Value` according to the collection schema, then delegate
 //! to `StrictEngine` which validates types and encodes as Binary Tuples.
+//! Every write then brings the rows' text-index entries up to date.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
+use nodedb_sql::types::filter::Filter;
 use nodedb_sql::types::{SqlExpr, SqlValue};
 use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
-use crate::engine::strict::StrictEngine;
 use crate::error::LiteError;
+use crate::query::dml_targets::strict_targets;
+use crate::query::engine::LiteQueryEngine;
+use crate::query::text_index::{index_strict_rows, reindex_strict_rows};
 use crate::storage::engine::StorageEngine;
 
 use super::coerce::{build_row, coerce_sql_value, sql_value_to_string, sql_value_to_value};
@@ -23,11 +26,12 @@ use super::engine_read::parse_pk_value;
 /// Each `row` is a list of `(column_name, SqlValue)` pairs. Values are
 /// coerced to match the schema column type.
 pub async fn insert_strict<S: StorageEngine>(
-    strict: &Arc<StrictEngine<S>>,
+    engine: &LiteQueryEngine<S>,
     collection: &str,
     rows: &[Vec<(String, SqlValue)>],
     if_absent: bool,
 ) -> Result<QueryResult, LiteError> {
+    let strict = &engine.strict;
     let schema = strict
         .schema(collection)
         .ok_or_else(|| LiteError::BadRequest {
@@ -78,6 +82,7 @@ pub async fn insert_strict<S: StorageEngine>(
                 }
                 other => other,
             })?;
+        index_strict_rows(engine, collection, [values.as_slice()])?;
         affected += 1;
     }
     Ok(QueryResult {
@@ -88,22 +93,26 @@ pub async fn insert_strict<S: StorageEngine>(
     })
 }
 
-/// Update rows in a strict collection by primary key.
+/// Update the rows of a strict collection the WHERE targets: the named
+/// primary keys, or else every row the WHERE matches.
 pub async fn update_strict<S: StorageEngine>(
-    strict: &Arc<StrictEngine<S>>,
+    engine: &LiteQueryEngine<S>,
     collection: &str,
     assignments: &[(String, SqlExpr)],
+    filters: &[Filter],
     target_keys: &[SqlValue],
 ) -> Result<QueryResult, LiteError> {
+    let strict = &engine.strict;
     let schema = strict
         .schema(collection)
         .ok_or_else(|| LiteError::BadRequest {
             detail: format!("strict collection '{collection}' does not exist"),
         })?;
-    let pk_col = schema
+    let (pk_idx, pk_col) = schema
         .columns
         .iter()
-        .find(|c| c.primary_key)
+        .enumerate()
+        .find(|(_, c)| c.primary_key)
         .ok_or_else(|| LiteError::BadRequest {
             detail: format!("strict collection '{collection}' has no primary key column"),
         })?;
@@ -121,14 +130,18 @@ pub async fn update_strict<S: StorageEngine>(
         updates.insert(field.clone(), typed);
     }
 
+    let named: Vec<Value> = target_keys
+        .iter()
+        .map(|key| parse_pk_value(&sql_value_to_string(key), &pk_col.column_type))
+        .collect();
+    let pks = strict_targets(engine, collection, filters, named, pk_idx).await?;
     let mut affected: u64 = 0;
-    for key in target_keys {
-        let key_str = sql_value_to_string(key);
-        let pk_value = parse_pk_value(&key_str, &pk_col.column_type);
-        if strict.update(collection, &pk_value, &updates).await? {
+    for pk_value in &pks {
+        if strict.update(collection, pk_value, &updates).await? {
             affected += 1;
         }
     }
+    reindex_strict_rows(engine, collection, &pks).await?;
     Ok(QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
@@ -137,33 +150,41 @@ pub async fn update_strict<S: StorageEngine>(
     })
 }
 
-/// Delete rows from a strict collection by primary key.
+/// Delete the rows of a strict collection the WHERE targets: the named
+/// primary keys, or else every row the WHERE matches.
 pub async fn delete_strict<S: StorageEngine>(
-    strict: &Arc<StrictEngine<S>>,
+    engine: &LiteQueryEngine<S>,
     collection: &str,
+    filters: &[Filter],
     target_keys: &[SqlValue],
 ) -> Result<QueryResult, LiteError> {
+    let strict = &engine.strict;
     let schema = strict
         .schema(collection)
         .ok_or_else(|| LiteError::BadRequest {
             detail: format!("strict collection '{collection}' does not exist"),
         })?;
-    let pk_col = schema
+    let (pk_idx, pk_col) = schema
         .columns
         .iter()
-        .find(|c| c.primary_key)
+        .enumerate()
+        .find(|(_, c)| c.primary_key)
         .ok_or_else(|| LiteError::BadRequest {
             detail: format!("strict collection '{collection}' has no primary key column"),
         })?;
 
+    let named: Vec<Value> = target_keys
+        .iter()
+        .map(|key| parse_pk_value(&sql_value_to_string(key), &pk_col.column_type))
+        .collect();
+    let pks = strict_targets(engine, collection, filters, named, pk_idx).await?;
     let mut affected: u64 = 0;
-    for key in target_keys {
-        let key_str = sql_value_to_string(key);
-        let pk_value = parse_pk_value(&key_str, &pk_col.column_type);
-        if strict.delete(collection, &pk_value).await? {
+    for pk_value in &pks {
+        if strict.delete(collection, pk_value).await? {
             affected += 1;
         }
     }
+    reindex_strict_rows(engine, collection, &pks).await?;
     Ok(QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),

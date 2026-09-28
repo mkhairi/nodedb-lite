@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Text search lowering: converts an `FtsQuery` to a `TextOp` and dispatches
-//! through the data-plane visitor. Empty phrase queries short-circuit to an
-//! empty `QueryResult`. `FtsQuery::Not` is rejected — Lite does not support
-//! standalone NOT FTS queries.
+//! Text search lowering: converts an `FtsQuery` to a `TextOp` and runs it
+//! against the index of the field the SQL names (`text_match(field, q)`,
+//! `bm25_score(field, q)`). No field searches the whole-document index.
+//! Empty phrase queries short-circuit to an empty `QueryResult`.
+//! `FtsQuery::Not` is rejected — Lite does not support standalone NOT FTS
+//! queries.
 
-use nodedb_physical::PhysicalTaskVisitor;
 use nodedb_physical::physical_plan::TextOp;
 use nodedb_sql::fts_types::FtsQuery;
 use nodedb_sql::types::filter::Filter;
@@ -14,7 +15,7 @@ use nodedb_types::result::QueryResult;
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::filter_convert::sql_filters_to_metadata;
-use crate::query::physical_visitor::LiteDataPlaneVisitor;
+use crate::query::physical_visitor::execute_text_op_on_field;
 use crate::storage::engine::StorageEngine;
 
 use super::visitor::LiteFut;
@@ -22,6 +23,7 @@ use super::visitor::LiteFut;
 pub(super) fn lower_text_search<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     collection: &str,
+    field: Option<&str>,
     query: &FtsQuery,
     top_k: usize,
     filters: &[Filter],
@@ -107,6 +109,6 @@ pub(super) fn lower_text_search<'a, S: StorageEngine + 'a>(
         }
     };
 
-    let mut phys = LiteDataPlaneVisitor { engine };
-    phys.text(&text_op).map(|fut| Box::pin(fut) as LiteFut<'a>)
+    execute_text_op_on_field(engine, &text_op, field.unwrap_or(""))
+        .map(|fut| Box::pin(fut) as LiteFut<'a>)
 }

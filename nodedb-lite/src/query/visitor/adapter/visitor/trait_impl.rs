@@ -133,12 +133,21 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
     fn text_search(
         &mut self,
         collection: &str,
+        field: Option<&str>,
         query: &FtsQuery,
         top_k: usize,
         filters: &[Filter],
         score_alias: Option<&str>,
     ) -> Result<LiteFut<'a>, LiteError> {
-        reads_search::text_search(self.engine, collection, query, top_k, filters, score_alias)
+        reads_search::text_search(
+            self.engine,
+            collection,
+            field,
+            query,
+            top_k,
+            filters,
+            score_alias,
+        )
     }
 
     fn document_index_lookup(

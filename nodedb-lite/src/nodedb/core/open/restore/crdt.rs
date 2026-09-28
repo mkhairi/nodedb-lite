@@ -8,6 +8,11 @@ use nodedb_types::Namespace;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
 use crate::engine::crdt::CrdtEngine;
+
+/// Rows per collection that updates replayed on top of their snapshot
+/// changed. Those updates can postdate every derived-index checkpoint.
+pub(in crate::nodedb::core::open) type ReplayedRows =
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
 use crate::storage::engine::StorageEngine;
 
 use crate::nodedb::core::types::{
@@ -25,7 +30,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
     pub(in crate::nodedb::core::open) async fn restore_identity_and_crdt(
         storage: &Arc<S>,
         policy: crate::storage::corruption::CorruptionPolicy,
-    ) -> NodeDbResult<(CrdtEngine, crate::identity::LiteIdentity)> {
+    ) -> NodeDbResult<(CrdtEngine, crate::identity::LiteIdentity, ReplayedRows)> {
         // ── Load or create Lite identity (lite_id + epoch + peer id) ──
         //
         // This must happen before any outbound sync so the handshake carries a
@@ -136,6 +141,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .scan_prefix(Namespace::LoroState, CrdtEngine::state_delta_key_prefix())
             .await?;
         let mut orphaned_keys: Vec<Vec<u8>> = Vec::new();
+        let mut replayed = ReplayedRows::new();
         for (key, envelope) in &delta_entries {
             let Some((collection, seq)) = CrdtEngine::state_delta_from_key(key) else {
                 tracing::error!(
@@ -176,11 +182,17 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .and_modify(|n| *n += update.len())
                 .or_insert(update.len());
             next_delta_seq.insert(collection.to_string(), seq + 1);
-            crdt.import_snapshot(collection, &update).map_err(|e| {
-                NodeDbError::storage(format!(
-                    "CRDT update replay for '{collection}' #{seq} failed: {e}"
-                ))
-            })?;
+            let imported = crdt
+                .import_local_tracked(collection, &update)
+                .map_err(|e| {
+                    NodeDbError::storage(format!(
+                        "CRDT update replay for '{collection}' #{seq} failed: {e}"
+                    ))
+                })?;
+            replayed
+                .entry(collection.to_string())
+                .or_default()
+                .extend(imported.changed_rows);
         }
         for key in orphaned_keys {
             // A failed delete is recoverable — the entry is skipped by the same
@@ -301,6 +313,6 @@ impl<S: StorageEngine> NodeDbLite<S> {
             let _ = storage.delete(Namespace::Graph, META_CSR_LEGACY).await;
         }
 
-        Ok((crdt, lite_identity))
+        Ok((crdt, lite_identity, replayed))
     }
 }

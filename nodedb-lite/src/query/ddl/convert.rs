@@ -33,26 +33,25 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
     /// Convert the schemaless collection `source_name` to strict under
     /// `target_schema`. Rows come from the CRDT store, the only schemaless
     /// store Lite keeps, so the source format needs no plan-level hint.
+    ///
+    /// All or nothing: a document the strict engine refuses rolls the new
+    /// strict collection back and leaves the schemaless collection as it was.
     pub(in crate::query) async fn convert_to_strict(
         &self,
         source_name: &str,
         target_schema: StrictSchema,
     ) -> Result<QueryResult, LiteError> {
         // Read all documents from the source (CRDT/schemaless).
-        let docs = {
-            let crdt = match self.crdt.lock() {
-                Ok(c) => c,
-                Err(p) => p.into_inner(),
-            };
-            let ids = crdt.list_ids(source_name);
-            let mut docs = Vec::with_capacity(ids.len());
-            for id in &ids {
-                if let Some(loro_val) = crdt.read(source_name, id) {
-                    let doc = crate::nodedb::convert::loro_value_to_document(id, &loro_val);
-                    docs.push(doc);
-                }
-            }
-            docs
+        let docs: Vec<nodedb_types::document::Document> = {
+            let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
+            crdt.list_ids(source_name)
+                .iter()
+                .filter_map(|id| {
+                    crdt.read(source_name, id).map(|loro_val| {
+                        crate::nodedb::convert::loro_value_to_document(id, &loro_val)
+                    })
+                })
+                .collect()
         };
 
         if docs.is_empty() {
@@ -67,30 +66,43 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             .await?;
 
         // Convert each document to a row and insert.
-        let mut converted = 0u64;
+        let mut inserted: Vec<Vec<Value>> = Vec::with_capacity(docs.len());
         for doc in &docs {
             let values = document_to_row(&doc.fields, &target_schema.columns);
-            match self.strict.insert(source_name, &values).await {
-                Ok(()) => converted += 1,
-                Err(e) => {
-                    tracing::warn!(doc_id = %doc.id, error = %e, "conversion insert failed")
-                }
+            if let Err(e) = self.strict.insert(source_name, &values).await {
+                self.strict.drop_collection(source_name).await?;
+                return Err(conversion_refused(source_name, "strict", &doc.id, e));
             }
+            inserted.push(values);
         }
 
-        // Drop the old schemaless collection from CRDT.
-        {
-            let mut crdt = match self.crdt.lock() {
-                Ok(c) => c,
-                Err(p) => p.into_inner(),
-            };
-            for doc in &docs {
-                let _ = crdt.delete(source_name, &doc.id);
-            }
+        // Drop the old schemaless collection from CRDT in one step, so the
+        // documents are either all rows now or all still documents.
+        let cleared = self
+            .crdt
+            .lock()
+            .map_err(|_| LiteError::LockPoisoned)?
+            .clear_collection(source_name);
+        if let Err(e) = cleared {
+            self.strict.drop_collection(source_name).await?;
+            return Err(e);
         }
+
+        // The documents are rows now: their text is indexed under row ids.
+        self.fts_state
+            .manager
+            .lock()
+            .map_err(|_| LiteError::LockPoisoned)?
+            .drop_collection(source_name);
+        crate::query::text_index::index_strict_rows(
+            self,
+            source_name,
+            inserted.iter().map(Vec::as_slice),
+        )?;
 
         self.register_strict_collection(source_name);
 
+        let converted = inserted.len() as u64;
         Ok(QueryResult {
             columns: vec!["result".into()],
             rows: vec![vec![Value::String(format!(
@@ -113,6 +125,9 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
     /// Convert `source_name` (CRDT or strict) to a plain columnar collection
     /// under `target_schema`. The source store is detected by probing the
     /// CRDT store first, then the strict store.
+    ///
+    /// All or nothing: a row the columnar engine refuses rolls the new
+    /// columnar collection back.
     pub(in crate::query) async fn convert_to_columnar(
         &self,
         source_name: &str,
@@ -132,15 +147,21 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             .await?;
 
         // Insert rows.
-        let mut converted = 0u64;
-        for row in &rows {
-            if self.columnar.insert(source_name, row).is_ok() {
-                converted += 1;
+        for (n, row) in rows.iter().enumerate() {
+            if let Err(e) = self.columnar.insert(source_name, row) {
+                self.columnar.drop_collection(source_name).await?;
+                return Err(conversion_refused(
+                    source_name,
+                    "columnar",
+                    &format!("#{n}"),
+                    e,
+                ));
             }
         }
 
         self.register_columnar_collection(source_name);
 
+        let converted = rows.len() as u64;
         Ok(QueryResult {
             columns: vec!["result".into()],
             rows: vec![vec![Value::String(format!(
@@ -169,45 +190,64 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
     /// Convert the strict collection `source_name` to schemaless documents.
     /// The strict store's own schema drives tuple decoding, so the source
     /// format needs no plan-level hint.
+    ///
+    /// All or nothing: every tuple is decoded before any document is
+    /// written, and a document write that fails removes the documents
+    /// already written and leaves the strict collection in place.
     pub(in crate::query) async fn convert_to_document(
         &self,
         source_name: &str,
     ) -> Result<QueryResult, LiteError> {
-        // Read from strict or columnar.
-        let mut converted = 0u64;
+        let mut written: Vec<String> = Vec::new();
 
         if let Some(schema) = self.strict.schema(source_name) {
-            let raw = self.strict.scan_raw(source_name).await?;
-
-            let decoder = nodedb_strict::TupleDecoder::new(&schema);
-            {
-                let mut crdt = match self.crdt.lock() {
-                    Ok(c) => c,
-                    Err(p) => p.into_inner(),
-                };
-
-                for tuple_bytes in &raw {
-                    if let Ok(values) = decoder.extract_all(tuple_bytes) {
-                        let doc_id = nodedb_types::id_gen::uuid_v7();
-                        let fields: Vec<(&str, loro::LoroValue)> = schema
-                            .columns
-                            .iter()
-                            .zip(values.iter())
-                            .map(|(col, val)| (col.name.as_str(), value_to_loro(val)))
-                            .collect();
-                        if crdt.upsert(source_name, &doc_id, &fields).is_ok() {
-                            converted += 1;
-                        }
+            let rows = self.decode_strict_rows(source_name, &schema).await?;
+            let upserted = {
+                let mut crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
+                let mut result = Ok(());
+                for values in &rows {
+                    let doc_id = nodedb_types::id_gen::uuid_v7();
+                    let fields: Vec<(&str, loro::LoroValue)> = schema
+                        .columns
+                        .iter()
+                        .zip(values.iter())
+                        .map(|(col, val)| (col.name.as_str(), value_to_loro(val)))
+                        .collect();
+                    if let Err(e) = crdt.upsert(source_name, &doc_id, &fields) {
+                        result = Err(conversion_refused(source_name, "document", &doc_id, e));
+                        break;
+                    }
+                    written.push(doc_id);
+                }
+                if result.is_err() {
+                    for doc_id in &written {
+                        crdt.delete(source_name, doc_id)?;
                     }
                 }
-            }
+                result
+            };
+            upserted?;
 
             // Drop the strict collection.
             self.strict.drop_collection(source_name).await?;
+
+            // The rows are documents now: their text is indexed under the
+            // new document ids.
+            self.fts_state
+                .manager
+                .lock()
+                .map_err(|_| LiteError::LockPoisoned)?
+                .drop_collection(source_name);
+            crate::query::text_index::reindex_documents(
+                self,
+                source_name,
+                written.iter().map(String::as_str),
+            )?;
         }
 
         self.register_collection(source_name);
 
+        let converted = written.len() as u64;
         Ok(QueryResult {
             columns: vec!["result".into()],
             rows: vec![vec![Value::String(format!(
@@ -218,6 +258,27 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         })
     }
 
+    /// Decode every stored tuple of the strict collection `collection`.
+    /// A tuple that does not decode fails the read: skipping it would lose
+    /// the row.
+    async fn decode_strict_rows(
+        &self,
+        collection: &str,
+        schema: &StrictSchema,
+    ) -> Result<Vec<Vec<Value>>, LiteError> {
+        let raw = self.strict.scan_raw(collection).await?;
+        let decoder = nodedb_strict::TupleDecoder::new(schema);
+        raw.iter()
+            .map(|tuple_bytes| {
+                decoder
+                    .extract_all(tuple_bytes)
+                    .map_err(|e| LiteError::Corrupted {
+                        detail: format!("strict tuple of '{collection}' does not decode: {e}"),
+                    })
+            })
+            .collect()
+    }
+
     /// Read rows from any source (CRDT or strict) as Vec<Value>.
     async fn read_source_rows(
         &self,
@@ -226,39 +287,43 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
     ) -> Result<Vec<Vec<Value>>, LiteError> {
         // Try CRDT first.
         {
-            let crdt = match self.crdt.lock() {
-                Ok(c) => c,
-                Err(p) => p.into_inner(),
-            };
+            let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
             let ids = crdt.list_ids(collection);
             if !ids.is_empty() {
-                let mut rows = Vec::with_capacity(ids.len());
-                for id in &ids {
-                    if let Some(loro_val) = crdt.read(collection, id) {
-                        let doc = crate::nodedb::convert::loro_value_to_document(id, &loro_val);
-                        rows.push(document_to_row(&doc.fields, target_columns));
-                    }
-                }
-                return Ok(rows);
+                return Ok(ids
+                    .iter()
+                    .filter_map(|id| {
+                        crdt.read(collection, id).map(|loro_val| {
+                            let doc = crate::nodedb::convert::loro_value_to_document(id, &loro_val);
+                            document_to_row(&doc.fields, target_columns)
+                        })
+                    })
+                    .collect());
             }
         }
 
         // Try strict.
         if let Some(schema) = self.strict.schema(collection) {
-            let raw = self.strict.scan_raw(collection).await?;
-            let decoder = nodedb_strict::TupleDecoder::new(&schema);
-            let mut rows = Vec::with_capacity(raw.len());
-            for tuple_bytes in &raw {
-                if let Ok(values) = decoder.extract_all(tuple_bytes) {
-                    rows.push(values);
-                }
-            }
-            return Ok(rows);
+            return self.decode_strict_rows(collection, &schema).await;
         }
 
         Err(LiteError::Query(format!(
             "collection '{collection}' not found in any storage mode"
         )))
+    }
+}
+
+/// The error a conversion returns after rolling back: a storage-class
+/// failure keeps its type, anything else is the row not fitting the target.
+fn conversion_refused(source: &str, target: &str, row: &str, e: LiteError) -> LiteError {
+    match e {
+        LiteError::Storage { .. } | LiteError::Corrupted { .. } | LiteError::LockPoisoned => e,
+        other => LiteError::BadRequest {
+            detail: format!(
+                "CONVERT COLLECTION '{source}' TO {target} stopped at row '{row}' and was \
+                 rolled back: {other}"
+            ),
+        },
     }
 }
 

@@ -160,6 +160,29 @@ impl<S: StorageEngine> NodeDbLite<S> {
         Ok(())
     }
 
+    /// Whether `name` is a collection any engine or the catalog knows: a
+    /// CRDT (schemaless) collection, a strict or columnar collection, or one
+    /// with persisted metadata.
+    pub(crate) async fn collection_known(&self, name: &str) -> NodeDbResult<bool> {
+        if self
+            .crdt
+            .lock_or_recover()
+            .collection_names()
+            .iter()
+            .any(|n| n == name)
+            || self.strict.schema(name).is_some()
+            || self.columnar.schema(name).is_some()
+        {
+            return Ok(true);
+        }
+        let key = format!("collection:{name}");
+        Ok(self
+            .storage
+            .get(nodedb_types::Namespace::Meta, key.as_bytes())
+            .await?
+            .is_some())
+    }
+
     /// List all collections.
     pub async fn list_collections(&self) -> NodeDbResult<Vec<CollectionMeta>> {
         let pairs = self

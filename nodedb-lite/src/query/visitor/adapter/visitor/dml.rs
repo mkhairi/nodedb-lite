@@ -86,9 +86,14 @@ pub(super) fn update<'a, S: StorageEngine + 'a>(
         | EngineType::Columnar
         | EngineType::Timeseries
         | EngineType::Spatial
-        | EngineType::Array => {
-            lower_update(engine, collection, engine_type, assignments, target_keys)
-        }
+        | EngineType::Array => lower_update(
+            engine,
+            collection,
+            engine_type,
+            assignments,
+            filters,
+            target_keys,
+        ),
     }
 }
 
@@ -106,7 +111,7 @@ pub(super) fn delete<'a, S: StorageEngine + 'a>(
         | EngineType::Columnar
         | EngineType::Timeseries
         | EngineType::Spatial
-        | EngineType::Array => lower_delete(engine, collection, engine_type, target_keys),
+        | EngineType::Array => lower_delete(engine, collection, engine_type, filters, target_keys),
     }
 }
 

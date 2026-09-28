@@ -14,8 +14,12 @@ use crate::storage::engine::{StorageEngine, WriteOp};
 
 use super::is_strict;
 use super::reads::{loro_value_to_ndb_value, msgpack_bytes_to_crdt_fields, ndb_value_to_loro};
+use super::write_helpers::{
+    affected, decode_literal_updates, decode_strict_fields, fields_to_values, strict_schema,
+};
+use crate::query::text_index::{index_strict_rows, reindex_documents, reindex_strict_rows};
 
-type UpdateValue = nodedb_physical::physical_plan::document::types::UpdateValue;
+pub(super) type UpdateValue = nodedb_physical::physical_plan::document::types::UpdateValue;
 
 /// PointPut: unconditional overwrite (upsert semantics).
 pub async fn point_put<S: StorageEngine>(
@@ -38,17 +42,22 @@ pub async fn point_put<S: StorageEngine>(
             let values = fields_to_values(&fields, &schema.columns);
             engine.strict.insert(collection, &values).await?;
         }
+        reindex_strict_rows(engine, collection, &[existing_pk]).await?;
     } else {
         let crdt_fields = msgpack_bytes_to_crdt_fields(value_bytes)?;
         let loro_fields: Vec<(&str, loro::LoroValue)> = crdt_fields
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-        crdt.upsert(collection, document_id, &loro_fields)
+        engine
+            .crdt
+            .lock()
+            .map_err(|_| LiteError::LockPoisoned)?
+            .upsert(collection, document_id, &loro_fields)
             .map_err(|e| LiteError::Storage {
                 detail: e.to_string(),
             })?;
+        reindex_documents(engine, collection, [document_id])?;
     }
     Ok(affected(1, "INSERT"))
 }
@@ -77,6 +86,7 @@ pub async fn point_insert<S: StorageEngine>(
         let schema = strict_schema(engine, collection)?;
         let values = fields_to_values(&fields, &schema.columns);
         engine.strict.insert(collection, &values).await?;
+        index_strict_rows(engine, collection, [values.as_slice()])?;
     } else {
         let crdt_fields = msgpack_bytes_to_crdt_fields(value_bytes)?;
         let loro_fields: Vec<(&str, loro::LoroValue)> = crdt_fields
@@ -98,6 +108,8 @@ pub async fn point_insert<S: StorageEngine>(
             .map_err(|e| LiteError::Storage {
                 detail: e.to_string(),
             })?;
+        drop(crdt);
+        reindex_documents(engine, collection, [document_id])?;
     }
     Ok(affected(1, "INSERT"))
 }
@@ -116,6 +128,7 @@ pub async fn point_update<S: StorageEngine>(
             .strict
             .update(collection, &pk, &field_updates)
             .await?;
+        reindex_strict_rows(engine, collection, &[pk]).await?;
         Ok(affected(if updated { 1 } else { 0 }, "UPDATE"))
     } else {
         let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
@@ -148,11 +161,15 @@ pub async fn point_update<S: StorageEngine>(
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-        crdt.upsert(collection, document_id, &loro_fields)
+        engine
+            .crdt
+            .lock()
+            .map_err(|_| LiteError::LockPoisoned)?
+            .upsert(collection, document_id, &loro_fields)
             .map_err(|e| LiteError::Storage {
                 detail: e.to_string(),
             })?;
+        reindex_documents(engine, collection, [document_id])?;
         Ok(affected(1, "UPDATE"))
     }
 }
@@ -166,6 +183,7 @@ pub async fn point_delete<S: StorageEngine>(
     if is_strict(engine, collection) {
         let pk = Value::String(document_id.to_string());
         let deleted = engine.strict.delete(collection, &pk).await?;
+        reindex_strict_rows(engine, collection, &[pk]).await?;
         Ok(affected(if deleted { 1 } else { 0 }, "DELETE"))
     } else {
         let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
@@ -176,6 +194,8 @@ pub async fn point_delete<S: StorageEngine>(
             .map_err(|e| LiteError::Storage {
                 detail: e.to_string(),
             })?;
+        drop(crdt);
+        reindex_documents(engine, collection, [document_id])?;
         Ok(affected(1, "DELETE"))
     }
 }
@@ -196,6 +216,7 @@ pub async fn batch_insert<S: StorageEngine>(
         }
         let affected_n = rows.len() as u64;
         engine.strict.insert_batch(collection, &rows).await?;
+        index_strict_rows(engine, collection, rows.iter().map(Vec::as_slice))?;
         Ok(affected(affected_n, "INSERT"))
     } else {
         let mut decoded: Vec<(String, Vec<(String, loro::LoroValue)>)> =
@@ -219,6 +240,12 @@ pub async fn batch_insert<S: StorageEngine>(
         crdt.flush_deltas().map_err(|e| LiteError::Storage {
             detail: e.to_string(),
         })?;
+        drop(crdt);
+        reindex_documents(
+            engine,
+            collection,
+            decoded.iter().map(|(doc_id, _)| doc_id.as_str()),
+        )?;
         Ok(affected(affected_n, "INSERT"))
     }
 }
@@ -252,17 +279,22 @@ pub async fn upsert<S: StorageEngine>(
                 engine.strict.insert(collection, &values).await?;
             }
         }
+        reindex_strict_rows(engine, collection, &[pk]).await?;
     } else {
         let crdt_fields = msgpack_bytes_to_crdt_fields(value_bytes)?;
         let loro_fields: Vec<(&str, loro::LoroValue)> = crdt_fields
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-        crdt.upsert(collection, document_id, &loro_fields)
+        engine
+            .crdt
+            .lock()
+            .map_err(|_| LiteError::LockPoisoned)?
+            .upsert(collection, document_id, &loro_fields)
             .map_err(|e| LiteError::Storage {
                 detail: e.to_string(),
             })?;
+        reindex_documents(engine, collection, [document_id])?;
     }
     Ok(affected(1, "UPSERT"))
 }
@@ -345,12 +377,17 @@ pub async fn bulk_update<S: StorageEngine>(
             })?;
         let all_rows = engine.strict.list_rows(collection).await?;
         let mut affected_n: u64 = 0;
+        let mut pks: Vec<Value> = Vec::with_capacity(all_rows.len());
         for row in &all_rows {
-            let pk = &row[pk_idx];
+            let Some(pk) = row.get(pk_idx) else {
+                continue;
+            };
             if engine.strict.update(collection, pk, &field_updates).await? {
                 affected_n += 1;
             }
+            pks.push(pk.clone());
         }
+        reindex_strict_rows(engine, collection, &pks).await?;
         Ok(affected(affected_n, "UPDATE"))
     } else {
         let loro_updates: Vec<(String, loro::LoroValue)> = field_updates
@@ -374,6 +411,8 @@ pub async fn bulk_update<S: StorageEngine>(
         crdt.flush_deltas().map_err(|e| LiteError::Storage {
             detail: e.to_string(),
         })?;
+        drop(crdt);
+        reindex_documents(engine, collection, ids.iter().map(String::as_str))?;
         Ok(affected(affected_n, "UPDATE"))
     }
 }
@@ -381,88 +420,17 @@ pub async fn bulk_update<S: StorageEngine>(
 /// BulkDelete dispatch target.
 ///
 /// `DocumentOp::BulkDelete` carries a msgpack-encoded filter predicate produced
-/// by Origin's Calvin/OLLP planner. Lite's SQL visitor never emits this variant —
-/// it always resolves DELETE to point-key `PointDelete` ops via `target_keys`.
-/// CRDT sync plans do not include bulk-predicate deletes. No valid code path
-/// in the Lite deployment shape reaches this arm.
+/// by Origin's Calvin/OLLP planner. Lite's SQL visitor resolves DELETE to
+/// point-key `PointDelete` ops via `target_keys`, and CRDT sync plans carry no
+/// bulk-predicate deletes, so Lite has no evaluator for this op and refuses it.
 pub async fn bulk_delete<S: StorageEngine>(
     _engine: &LiteQueryEngine<S>,
-    _collection: &str,
-) -> Result<QueryResult, LiteError> {
-    unreachable!(
-        "DocumentOp::BulkDelete is produced only by Origin's Calvin/OLLP planner; \
-         Lite's SQL visitor always resolves DELETE to PointDelete ops via target_keys \
-         and CRDT sync never emits bulk-predicate deletes"
-    )
-}
-
-// ─── Internal helpers ────────────────────────────────────────────────────────
-
-fn affected(n: u64, command: &'static str) -> QueryResult {
-    QueryResult {
-        columns: Vec::new(),
-        rows: Vec::new(),
-        rows_affected: n,
-        command: Some(command.into()),
-    }
-}
-
-fn strict_schema<S: StorageEngine>(
-    engine: &LiteQueryEngine<S>,
     collection: &str,
-) -> Result<nodedb_types::columnar::StrictSchema, LiteError> {
-    engine
-        .strict
-        .schema(collection)
-        .ok_or_else(|| LiteError::BadRequest {
-            detail: format!("strict collection '{collection}' does not exist"),
-        })
-}
-
-/// Decode msgpack document bytes into `(field_name, Value)` pairs.
-fn decode_strict_fields(value_bytes: &[u8]) -> Result<Vec<(String, Value)>, LiteError> {
-    let val: Value = zerompk::from_msgpack(value_bytes).map_err(|e| LiteError::Serialization {
-        detail: format!("decode strict document: {e}"),
-    })?;
-    match val {
-        Value::Object(map) => Ok(map.into_iter().collect()),
-        _ => Err(LiteError::BadRequest {
-            detail: "strict document payload must be a msgpack-encoded object".into(),
-        }),
-    }
-}
-
-/// Build a `Vec<Value>` in schema column order from a field map.
-fn fields_to_values(
-    fields: &[(String, Value)],
-    columns: &[nodedb_types::columnar::ColumnDef],
-) -> Vec<Value> {
-    let map: HashMap<&str, &Value> = fields.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    columns
-        .iter()
-        .map(|c| {
-            map.get(c.name.as_str())
-                .copied()
-                .cloned()
-                .unwrap_or(Value::Null)
-        })
-        .collect()
-}
-
-/// Decode literal-only update values; non-literal `UpdateValue::Expr` arms
-/// are ignored because the Lite executor has no expression evaluator.
-fn decode_literal_updates(
-    updates: &[(String, UpdateValue)],
-) -> Result<HashMap<String, Value>, LiteError> {
-    let mut field_updates: HashMap<String, Value> = HashMap::new();
-    for (field, update_val) in updates {
-        if let UpdateValue::Literal(bytes) = update_val {
-            let val: Value =
-                zerompk::from_msgpack(bytes).map_err(|e| LiteError::Serialization {
-                    detail: format!("decode update literal for '{field}': {e}"),
-                })?;
-            field_updates.insert(field.clone(), val);
-        }
-    }
-    Ok(field_updates)
+) -> Result<QueryResult, LiteError> {
+    Err(LiteError::Unsupported {
+        detail: format!(
+            "predicate bulk delete on '{collection}': Lite deletes by key; \
+             issue DELETE ... WHERE id = ... instead"
+        ),
+    })
 }

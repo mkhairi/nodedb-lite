@@ -23,6 +23,7 @@ use crate::storage::engine::StorageEngine;
 
 use super::super::adapter::LitePhysicalFut;
 use super::common::{delete_row, index_key, read_all_rows, remove_durable, remove_live_node};
+use crate::query::text_index::reindex_documents;
 
 /// Remove every row of the collection's primary index and reset the bucket.
 pub(in crate::query::physical_visitor) fn vector_direct_truncate<'a, S>(
@@ -41,6 +42,7 @@ where
             remove_live_node(&vector_state, &key, &doc_id).await?;
             remove_durable(&vector_state, &key, &doc_id, "DirectTruncate").await?;
             delete_row(&crdt, &collection, &doc_id, "DirectTruncate")?;
+            reindex_documents(engine, &collection, [doc_id.as_str()])?;
         }
         clear_index(&vector_state, &key).await?;
         Ok(truncated())

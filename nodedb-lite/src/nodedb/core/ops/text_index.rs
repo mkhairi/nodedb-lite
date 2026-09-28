@@ -1,69 +1,94 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Inverted text index maintenance for document writes.
+//!
+//! A schemaless document is indexed twice over: its whole-document text
+//! (searched when a caller names no field) and each top-level string field
+//! under `"{collection}:{field}"`. The work is done by `engine::fts::maintain`,
+//! shared with every other write path.
 
+use std::collections::HashMap;
+
+use nodedb_types::Value;
+
+use crate::engine::fts::maintain;
+use crate::error::LiteError;
 use crate::nodedb::core::types::NodeDbLite;
-use crate::nodedb::lock_ext::LockExt;
 use crate::storage::engine::StorageEngine;
+use crate::sync::FtsOutbound;
 
 impl<S: StorageEngine> NodeDbLite<S> {
-    /// Update the inverted text index after a document write.
+    /// The queue a local text-index change is staged on for Origin, or
+    /// `None` when there is none or the sync gate keeps the document local.
+    fn fts_outbound_for(
+        &self,
+        collection: &str,
+        fields: Option<&HashMap<String, Value>>,
+    ) -> Option<&FtsOutbound<S>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let gated_out = fields.is_some_and(|f| !self.should_sync_doc(collection, f));
+            if gated_out {
+                return None;
+            }
+            self.fts_outbound.as_deref()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (collection, fields);
+            None
+        }
+    }
+
+    /// Update the inverted text index after a local document write, and stage
+    /// the whole-document text for Origin — unless the sync gate keeps the
+    /// document local-only.
     ///
-    /// Called by `document_put` to keep the text index in sync.
-    /// Concatenates all string fields for full-text indexing.
+    /// A failure here fails the write: nothing re-indexes the gap afterwards.
     pub(crate) fn index_document_text(
         &self,
         collection: &str,
         doc_id: &str,
-        fields: &std::collections::HashMap<String, nodedb_types::Value>,
-    ) -> Result<(), crate::error::LiteError> {
-        let text: String = fields
-            .values()
-            .filter_map(|v| match v {
-                nodedb_types::Value::String(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // Always index locally so local search works. A failure here fails the
-        // write: nothing re-indexes the gap afterwards.
-        self.fts_state
-            .manager
-            .lock_or_recover()
-            .index_document(collection, doc_id, &text)?;
-
-        // Propagate to Origin via sync outbound queue — unless the sync gate
-        // keeps this document local-only.
-        #[cfg(not(target_arch = "wasm32"))]
-        if self.should_sync_doc(collection, fields)
-            && let Some(q) = &self.fts_outbound
-        {
-            q.stage_index(collection, doc_id, text);
-        }
-        #[cfg(target_arch = "wasm32")]
-        let _ = text;
-
-        Ok(())
+        fields: &HashMap<String, Value>,
+    ) -> Result<(), LiteError> {
+        maintain::index_document(
+            &self.fts_state,
+            self.fts_outbound_for(collection, Some(fields)),
+            collection,
+            doc_id,
+            fields,
+        )
     }
 
-    /// Remove a document from the text index.
+    /// Remove a document from every text index of its collection, and stage
+    /// the removal for Origin.
     pub(crate) fn remove_document_text(
         &self,
         collection: &str,
         doc_id: &str,
-    ) -> Result<(), crate::error::LiteError> {
-        self.fts_state
-            .manager
-            .lock_or_recover()
-            .remove_document(collection, doc_id)?;
+    ) -> Result<(), LiteError> {
+        maintain::remove_document(
+            &self.fts_state,
+            self.fts_outbound_for(collection, None),
+            collection,
+            doc_id,
+        )
+    }
 
-        // Propagate deletion to Origin via sync outbound queue.
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(q) = &self.fts_outbound {
-            q.stage_delete(collection, doc_id);
-        }
-
-        Ok(())
+    /// Bring the text entries of `doc_ids` in line with their current CRDT
+    /// state without staging anything for Origin. Used for changes that came
+    /// from Origin or a peer.
+    pub(crate) fn reindex_documents_local<'a>(
+        &self,
+        collection: &str,
+        doc_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), LiteError> {
+        maintain::reindex_crdt_documents(
+            &self.fts_state,
+            &self.crdt,
+            None::<&FtsOutbound<S>>,
+            collection,
+            doc_ids,
+        )
     }
 }

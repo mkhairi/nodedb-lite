@@ -68,10 +68,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// The collection must be supplied by the caller: each collection has its
     /// own document, and the update bytes alone do not identify which one.
     pub fn import_remote_deltas(&self, collection: &str, data: &[u8]) -> NodeDbResult<()> {
-        let mut crdt = self.crdt.lock_or_recover();
-        crdt.import_remote(collection, data)
-            .map(|_admission| ())
-            .map_err(NodeDbError::storage)
+        let imported = self
+            .crdt
+            .lock_or_recover()
+            .import_remote(collection, data)
+            .map_err(NodeDbError::storage)?;
+        // Re-index the rows the delta changed. They came from a peer, so
+        // nothing is staged back.
+        self.reindex_documents_local(collection, imported.changed_rows.iter().map(String::as_str))?;
+        Ok(())
     }
 
     /// Apply a server-originated row post-image from Origin.
@@ -145,6 +150,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .map_err(NodeDbError::storage)?
         };
         crdt.drop_pending(mutation_id);
+
+        drop(crdt);
+
+        // Keep the text index on the row as it now stands. The row came from
+        // Origin, so nothing is staged back to it.
+        self.reindex_documents_local(collection, [document_id])?;
         Ok(())
     }
 

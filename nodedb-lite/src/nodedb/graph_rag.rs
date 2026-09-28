@@ -166,6 +166,8 @@ pub struct HybridSearchParams<'a> {
     pub query_embedding: &'a [f32],
     /// Query text for BM25 relevance.
     pub query_text: &'a str,
+    /// Field the text query is scoped to. Empty searches every string field.
+    pub text_field: &'a str,
     /// Number of vector candidates.
     pub vector_k: usize,
     /// Number of text candidates.
@@ -219,7 +221,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         let text_results = self
             .text_search(
                 params.collection,
-                "",
+                params.text_field,
                 params.query_text,
                 params.text_k,
                 nodedb_types::TextSearchParams::default(),

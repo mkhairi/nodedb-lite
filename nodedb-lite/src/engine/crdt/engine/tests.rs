@@ -136,9 +136,13 @@ fn import_remote_deltas() {
     // Export engine1's state as a snapshot and import into engine2.
     let snapshot = engine1.export_snapshot("items").unwrap();
     let mut engine2 = CrdtEngine::new(2).unwrap();
-    engine2.import_remote("items", &snapshot).unwrap();
+    let imported = engine2.import_remote("items", &snapshot).unwrap();
 
     assert!(engine2.exists("items", "i1"));
+    assert!(
+        imported.changed_rows.contains("i1"),
+        "the import must report the row it created"
+    );
 }
 
 #[test]

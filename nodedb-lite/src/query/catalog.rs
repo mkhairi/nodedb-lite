@@ -90,10 +90,11 @@ impl<S: StorageEngine> LiteCatalog<S> {
     /// Build from a full descriptor. Exhaustive over `CollectionType`.
     fn info_from_descriptor(&self, name: &str, desc: &CollectionDescriptor) -> CollectionInfo {
         let (engine, columns, primary_key) = match &desc.collection_type {
+            // A schemaless document is keyed by its `id`, whatever else it holds.
             CollectionType::Document(DocumentMode::Schemaless) => (
                 EngineType::DocumentSchemaless,
                 columns_from_fields(&desc.fields),
-                None,
+                Some("id".into()),
             ),
             CollectionType::Document(DocumentMode::Strict(schema)) => {
                 // Prefer the freshest in-memory schema (post-ALTER) if present.
@@ -175,11 +176,12 @@ impl<S: StorageEngine> LiteCatalog<S> {
                     None,
                 ),
             },
-            // "document", "document_schemaless", or anything else → schemaless.
+            // "document", "document_schemaless", or anything else → schemaless,
+            // keyed by the document `id`.
             _ => (
                 EngineType::DocumentSchemaless,
                 columns_from_fields(&meta.fields),
-                None,
+                Some("id".into()),
             ),
         };
         CollectionInfo {

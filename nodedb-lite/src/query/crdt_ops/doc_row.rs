@@ -21,6 +21,7 @@ use crate::error::LiteError;
 use crate::nodedb::collection::import::json_to_loro;
 use crate::query::document_ops::reads::loro_value_to_ndb_value;
 use crate::query::engine::LiteQueryEngine;
+use crate::query::text_index::reindex_documents;
 use crate::storage::engine::StorageEngine;
 
 /// Insert-or-replace / partial-update a document row's scalar fields.
@@ -53,6 +54,7 @@ pub async fn handle_doc_upsert<S: StorageEngine>(
             crdt.upsert(collection, document_id, &field_refs)?;
         }
     }
+    reindex_documents(engine, collection, [document_id])?;
 
     project_returning(engine, collection, document_id, returning, 1, verb)
 }
@@ -82,6 +84,9 @@ pub async fn handle_doc_delete<S: StorageEngine>(
         }
         existed
     };
+    if existed {
+        reindex_documents(engine, collection, [document_id])?;
+    }
 
     let affected = u64::from(existed);
     match (returning, pre_delete) {

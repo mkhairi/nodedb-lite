@@ -54,12 +54,21 @@ pub(super) fn vector_search<'a, S: StorageEngine + 'a>(
 pub(super) fn text_search<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     collection: &str,
+    field: Option<&str>,
     query: &FtsQuery,
     top_k: usize,
     filters: &[Filter],
     score_alias: Option<&str>,
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_text_search(engine, collection, query, top_k, filters, score_alias)
+    lower_text_search(
+        engine,
+        collection,
+        field,
+        query,
+        top_k,
+        filters,
+        score_alias,
+    )
 }
 
 pub(super) fn multi_vector_search<'a, S: StorageEngine + 'a>(

@@ -13,6 +13,7 @@ use crate::engine::crdt::CrdtEngine;
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::scan_filter_convert::decode_scan_filters;
+use crate::query::text_index::reindex_documents;
 use crate::storage::engine::StorageEngine;
 
 use super::super::adapter::LitePhysicalFut;
@@ -76,6 +77,7 @@ where
             if delete_row(&crdt, &collection, &doc_id, "DirectDelete")? {
                 removed += 1;
             }
+            reindex_documents(engine, &collection, [doc_id.as_str()])?;
         }
         Ok(QueryResult {
             columns: vec![],
@@ -141,6 +143,7 @@ where
             let excluded = HashMap::new();
             apply_patch(&mut row, &payload_patch, &excluded)?;
             write_row(&crdt, &collection, &doc_id, dim, &row, "DirectUpdate")?;
+            reindex_documents(engine, &collection, [doc_id.as_str()])?;
             updated += 1;
         }
         Ok(QueryResult {

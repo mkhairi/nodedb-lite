@@ -5,9 +5,12 @@
 use nodedb_sql::types::{EngineType, SqlValue, WriteRoute};
 use nodedb_types::result::QueryResult;
 
+use super::dml_targets::document_targets;
 use super::engine::{LiteQueryEngine, sql_value_to_string};
+use super::text_index::reindex_documents;
 use crate::error::LiteError;
 use crate::storage::engine::StorageEngine;
+use nodedb_sql::types::filter::Filter;
 
 impl<S: StorageEngine> LiteQueryEngine<S> {
     /// `route` is the planner's `EngineRules` decision and picks the store
@@ -25,10 +28,13 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
     ) -> Result<QueryResult, LiteError> {
         match route {
             WriteRoute::ColumnarFamily => {
-                // `written` feeds outbound sync, which is compiled out on wasm32.
-                #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
                 let (result, written) =
                     super::columnar_dml::insert_columnar(&self.columnar, collection, rows)?;
+                super::text_index::index_columnar_rows(
+                    self,
+                    collection,
+                    written.iter().map(Vec::as_slice),
+                )?;
                 // Durable outbound enqueue must run here (async) — the sync insert
                 // path cannot await. Covers the SQL-INSERT route to Origin sync.
                 #[cfg(not(target_arch = "wasm32"))]
@@ -43,12 +49,12 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             WriteRoute::Document => {}
         }
         if *engine == EngineType::DocumentStrict {
-            return super::strict_dml::insert_strict(&self.strict, collection, rows, if_absent)
-                .await;
+            return super::strict_dml::insert_strict(self, collection, rows, if_absent).await;
         }
         // CRDT / schemaless path.
         let mut crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
         let mut affected = 0;
+        let mut written: Vec<String> = Vec::with_capacity(rows.len());
         for row in rows {
             let id = row
                 .iter()
@@ -73,7 +79,10 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             crdt.upsert(collection, &id, &fields)
                 .map_err(|e| LiteError::Query(format!("insert: {e}")))?;
             affected += 1;
+            written.push(id);
         }
+        drop(crdt);
+        reindex_documents(self, collection, written.iter().map(String::as_str))?;
         Ok(QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -87,22 +96,39 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         collection: &str,
         engine: &EngineType,
         assignments: &[(String, nodedb_sql::types::SqlExpr)],
+        filters: &[Filter],
         target_keys: &[SqlValue],
     ) -> Result<QueryResult, LiteError> {
-        if *engine == EngineType::DocumentStrict {
-            return super::strict_dml::update_strict(
-                &self.strict,
+        if is_columnar_family(engine) {
+            return super::columnar_dml::update_columnar(
+                self,
                 collection,
                 assignments,
+                filters,
                 target_keys,
             )
             .await;
         }
+        if *engine == EngineType::DocumentStrict {
+            return super::strict_dml::update_strict(
+                self,
+                collection,
+                assignments,
+                filters,
+                target_keys,
+            )
+            .await;
+        }
+        let targets = document_targets(self, collection, filters, target_keys)?;
         // CRDT / schemaless path.
         let mut crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
         let mut affected = 0;
-        for key in target_keys {
-            let key_str = sql_value_to_string(key);
+        let mut written: Vec<String> = Vec::with_capacity(targets.len());
+        for key_str in targets {
+            // UPDATE changes existing rows only, and only the assigned fields.
+            if !crdt.exists(collection, &key_str) {
+                continue;
+            }
             let fields: Vec<(&str, loro::LoroValue)> = assignments
                 .iter()
                 .filter_map(|(field, expr)| {
@@ -113,10 +139,13 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                     }
                 })
                 .collect();
-            crdt.upsert(collection, &key_str, &fields)
+            crdt.set_fields(collection, &key_str, &fields)
                 .map_err(|e| LiteError::Query(format!("update: {e}")))?;
             affected += 1;
+            written.push(key_str);
         }
+        drop(crdt);
+        reindex_documents(self, collection, written.iter().map(String::as_str))?;
         Ok(QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -129,20 +158,32 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         &self,
         collection: &str,
         engine: &EngineType,
+        filters: &[Filter],
         target_keys: &[SqlValue],
     ) -> Result<QueryResult, LiteError> {
-        if *engine == EngineType::DocumentStrict {
-            return super::strict_dml::delete_strict(&self.strict, collection, target_keys).await;
+        if is_columnar_family(engine) {
+            return super::columnar_dml::delete_columnar(self, collection, filters, target_keys)
+                .await;
         }
+        if *engine == EngineType::DocumentStrict {
+            return super::strict_dml::delete_strict(self, collection, filters, target_keys).await;
+        }
+        let targets = document_targets(self, collection, filters, target_keys)?;
         // CRDT / schemaless path.
         let mut crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
         let mut affected = 0;
-        for key in target_keys {
-            let key_str = sql_value_to_string(key);
+        let mut removed: Vec<String> = Vec::with_capacity(targets.len());
+        for key_str in targets {
+            if !crdt.exists(collection, &key_str) {
+                continue;
+            }
             crdt.delete(collection, &key_str)
                 .map_err(|e| LiteError::Query(format!("delete: {e}")))?;
             affected += 1;
+            removed.push(key_str);
         }
+        drop(crdt);
+        reindex_documents(self, collection, removed.iter().map(String::as_str))?;
         Ok(QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -160,4 +201,13 @@ fn sql_value_to_loro(v: &SqlValue) -> loro::LoroValue {
         SqlValue::Null => loro::LoroValue::Null,
         _ => loro::LoroValue::Null,
     }
+}
+
+/// Whether `engine` is stored in the columnar engine: plain, timeseries, and
+/// spatial collections alike.
+fn is_columnar_family(engine: &EngineType) -> bool {
+    matches!(
+        engine,
+        EngineType::Columnar | EngineType::Timeseries | EngineType::Spatial
+    )
 }

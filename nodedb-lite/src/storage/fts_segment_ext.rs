@@ -19,7 +19,7 @@ use crate::error::LiteError;
 /// Extension trait: write, open, delete, and list FTS posting segments backed
 /// by pagedb encrypted segment files.
 ///
-/// One segment per FTS index key (e.g. `"articles:_doc"`).  The segment
+/// One segment per FTS index key (e.g. `"articles"` or `"articles:title"`).  The segment
 /// contains the serialized posting blob exactly as produced by the checkpoint
 /// layer — no additional framing beyond the 8-byte length prefix envelope used
 /// to survive pagedb's page-boundary padding.

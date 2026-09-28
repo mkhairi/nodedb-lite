@@ -97,11 +97,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         // ── Restore Lite identity + CRDT state (snapshots, bitemporal
         // backfill, pending deltas, partial-flush safety, legacy CSR cleanup) ──
-        let (crdt, lite_identity) =
+        let (crdt, lite_identity, replayed_rows) =
             Self::restore_identity_and_crdt(&storage, config.corruption_policy).await?;
 
         // ── Restore FTS indices ──
-        let fts_manager = Self::restore_fts_indices(&storage, &governor).await?;
+        let (fts_manager, fts_checkpoint_complete) =
+            Self::restore_fts_indices(&storage, &governor).await?;
 
         // ── Restore sparse-vector inverted indices ──
         let (sparse_manager, sparse_checkpoint_present) =
@@ -299,9 +300,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
             tasks: crate::tasks::TaskRegistry::default(),
         };
 
-        // Rebuild text indices from CRDT state only when no checkpoint exists.
-        // When a checkpoint is present, `restore_fts_indices` has already loaded
-        // the full index without re-tokenizing source documents.
+        // Rebuild text indices from CRDT state only when the checkpoint is
+        // missing or incomplete. A complete checkpoint has already loaded the
+        // full index without re-tokenizing source documents. A checkpoint
+        // written before per-field indexing is kept (it holds strict rows
+        // nothing else re-indexes) and schemaless documents are re-indexed on
+        // top of it.
         {
             // `sparse_checkpoint_present` covers databases written before the
             // sparse index existed: they have a valid FTS checkpoint but no
@@ -309,8 +313,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
             // columns" from "never checkpointed". The first flush writes the
             // sparse catalog key even when empty, so this rebuild runs once.
             let fts_empty = db.fts_state.manager.lock_or_recover().is_empty();
-            if fts_empty || !sparse_checkpoint_present {
+            if fts_empty || !fts_checkpoint_complete || !sparse_checkpoint_present {
                 db.rebuild_text_indices().await?;
+            }
+            // Updates replayed on top of a snapshot can postdate the FTS
+            // checkpoint: re-index the rows they changed.
+            for (collection, rows) in &replayed_rows {
+                db.reindex_documents_local(collection, rows.iter().map(String::as_str))?;
             }
         }
 

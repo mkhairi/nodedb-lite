@@ -7,6 +7,7 @@
 
 use nodedb_physical::PhysicalTaskVisitor;
 use nodedb_sql::ScanVisitArgs;
+use nodedb_sql::types::filter::Filter;
 use nodedb_sql::types::query::EngineType;
 use nodedb_sql::types::{SqlValue, WriteRoute};
 use nodedb_sql::types_expr::SqlExpr;
@@ -110,14 +111,22 @@ pub(super) fn lower_update<'a, S: StorageEngine + 'a>(
     collection: &str,
     engine_type: EngineType,
     assignments: &[(String, SqlExpr)],
+    filters: &[Filter],
     target_keys: &[SqlValue],
 ) -> Result<LiteFut<'a>, LiteError> {
     let collection = collection.to_string();
     let assignments = assignments.to_vec();
+    let filters = filters.to_vec();
     let target_keys = target_keys.to_vec();
     Ok(Box::pin(async move {
         engine
-            .execute_update(&collection, &engine_type, &assignments, &target_keys)
+            .execute_update(
+                &collection,
+                &engine_type,
+                &assignments,
+                &filters,
+                &target_keys,
+            )
             .await
     }))
 }
@@ -126,13 +135,15 @@ pub(super) fn lower_delete<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     collection: &str,
     engine_type: EngineType,
+    filters: &[Filter],
     target_keys: &[SqlValue],
 ) -> Result<LiteFut<'a>, LiteError> {
     let collection = collection.to_string();
+    let filters = filters.to_vec();
     let target_keys = target_keys.to_vec();
     Ok(Box::pin(async move {
         engine
-            .execute_delete(&collection, &engine_type, &target_keys)
+            .execute_delete(&collection, &engine_type, &filters, &target_keys)
             .await
     }))
 }

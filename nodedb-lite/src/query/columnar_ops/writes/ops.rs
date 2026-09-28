@@ -9,6 +9,7 @@ use nodedb_types::value::Value;
 
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
+use crate::query::text_index::{index_columnar_rows, remove_columnar_rows};
 use crate::storage::engine::StorageEngine;
 
 use super::super::reads::row_to_object;
@@ -160,6 +161,7 @@ pub async fn insert<S: StorageEngine>(
         }
     }
 
+    index_columnar_rows(engine, collection, inserted_rows.iter().map(Vec::as_slice))?;
     Ok((
         QueryResult {
             columns: Vec::new(),
@@ -235,6 +237,7 @@ pub async fn update<S: StorageEngine>(
         }
 
         engine.columnar.update(collection, &pk, &new_values)?;
+        index_columnar_rows(engine, collection, [new_values.as_slice()])?;
         affected += 1;
     }
 
@@ -286,11 +289,12 @@ pub async fn delete<S: StorageEngine>(
     }
 
     let mut affected: u64 = 0;
-    for pk in pks_to_delete {
-        if engine.columnar.delete(collection, &pk)? {
+    for pk in &pks_to_delete {
+        if engine.columnar.delete(collection, pk)? {
             affected += 1;
         }
     }
+    remove_columnar_rows(engine, collection, &pks_to_delete)?;
 
     Ok(QueryResult {
         columns: Vec::new(),

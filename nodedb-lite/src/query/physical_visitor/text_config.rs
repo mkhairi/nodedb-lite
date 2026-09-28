@@ -36,10 +36,10 @@ where
             .lock()
             .map_err(|_| LiteError::LockPoisoned)?;
         if let Some(name) = analyzer_name.as_deref() {
-            mgr.set_collection_analyzer(&collection, name);
+            mgr.set_collection_analyzer(&collection, name)?;
         }
         if let Some(fuzzy) = fuzzy_default {
-            mgr.set_collection_fuzzy(&collection, fuzzy);
+            mgr.set_collection_fuzzy(&collection, fuzzy)?;
         }
         Ok(QueryResult {
             columns: vec![],

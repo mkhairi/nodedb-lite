@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shared row and assignment conversions for the DML lowerings.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use nodedb_sql::types_expr::SqlExpr;
+use nodedb_types::result::QueryResult;
+use nodedb_types::value::Value;
+
+use crate::error::LiteError;
+use crate::query::engine::LiteQueryEngine;
+use crate::query::filter_convert::sql_value_to_value;
+use crate::query::value_utils::value_to_string;
+use crate::storage::engine::StorageEngine;
+
+pub(super) type UpdateValue = nodedb_physical::physical_plan::document::types::UpdateValue;
+
+/// Convert a `SqlExpr` to `UpdateValue` for use in point_update.
+pub(super) fn expr_to_update_value(expr: &SqlExpr) -> Result<UpdateValue, LiteError> {
+    match expr {
+        SqlExpr::Literal(v) => {
+            let ndb_val = sql_value_to_value(v)?;
+            let bytes =
+                zerompk::to_msgpack_vec(&ndb_val).map_err(|e| LiteError::Serialization {
+                    detail: format!("encode update literal: {e}"),
+                })?;
+            Ok(UpdateValue::Literal(bytes))
+        }
+        other => {
+            let q_expr = crate::query::expr_convert::convert_sql_expr(other)?;
+            Ok(UpdateValue::Expr(q_expr))
+        }
+    }
+}
+
+/// Convert `Vec<(String, SqlExpr)>` assignments to `Vec<(String, UpdateValue)>`.
+pub(in crate::query::visitor) fn convert_assignments(
+    assignments: &[(String, SqlExpr)],
+) -> Result<Vec<(String, UpdateValue)>, LiteError> {
+    assignments
+        .iter()
+        .map(|(col, expr)| Ok((col.clone(), expr_to_update_value(expr)?)))
+        .collect()
+}
+
+/// Serialize a row map to msgpack bytes for `point_insert`.
+pub(super) fn row_to_msgpack(row: &HashMap<String, Value>) -> Result<Vec<u8>, LiteError> {
+    zerompk::to_msgpack_vec(row).map_err(|e| LiteError::Serialization {
+        detail: format!("encode row msgpack: {e}"),
+    })
+}
+
+/// Process-wide counter used to guarantee uniqueness within the same millisecond.
+static GEN_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Extract the "id" column value from a row map, or generate a synthetic key.
+///
+/// The fallback id combines the current millisecond timestamp with a
+/// process-wide monotonic counter so two inserts in the same millisecond
+/// produce distinct keys. `crate::runtime::now_millis()` is used instead of
+/// `SystemTime::now()` because the latter panics on wasm32.
+pub(super) fn extract_id(row: &HashMap<String, Value>) -> String {
+    row.get("id").map(value_to_string).unwrap_or_else(|| {
+        let ms = crate::runtime::now_millis();
+        let seq = GEN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("gen-{ms:x}-{seq:x}")
+    })
+}
+
+/// Convert `QueryResult` rows to `Vec<HashMap<String, Value>>`.
+pub(super) fn result_to_maps(result: QueryResult) -> Vec<HashMap<String, Value>> {
+    let cols = result.columns;
+    result
+        .rows
+        .into_iter()
+        .map(|row| cols.iter().cloned().zip(row).collect())
+        .collect()
+}
+
+/// Resolve `UpdateValue::Expr` column references against a source row.
+///
+/// Column expressions of the form `table.col` or `col` are resolved
+/// against the source row map; others are left as `UpdateValue::Expr`.
+pub(super) fn resolve_updates_with_source(
+    updates: &[(String, UpdateValue)],
+    source_row: &HashMap<String, Value>,
+) -> Result<Vec<(String, UpdateValue)>, LiteError> {
+    updates
+        .iter()
+        .map(|(col, uv)| {
+            let resolved = match uv {
+                UpdateValue::Literal(_) => uv.clone(),
+                UpdateValue::Expr(expr) => {
+                    if let nodedb_query::expr::types::SqlExpr::Column(name) = expr {
+                        let field = name.rsplit('.').next().unwrap_or(name.as_str());
+                        if let Some(val) = source_row.get(field) {
+                            let bytes = zerompk::to_msgpack_vec(val).map_err(|e| {
+                                LiteError::Serialization {
+                                    detail: format!("resolve source col '{field}': {e}"),
+                                }
+                            })?;
+                            return Ok((col.clone(), UpdateValue::Literal(bytes)));
+                        }
+                    }
+                    uv.clone()
+                }
+            };
+            Ok((col.clone(), resolved))
+        })
+        .collect()
+}
+
+// ── InsertSelect ─────────────────────────────────────────────────────────────
+
+/// The declared primary-key column of a strict target, or `None` when the
+/// target is schemaless (its `id` key is implicit, not declared).
+pub(super) fn declared_primary_key<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    collection: &str,
+) -> Option<String> {
+    engine
+        .strict
+        .schema(collection)?
+        .columns
+        .iter()
+        .find(|c| c.primary_key)
+        .map(|c| c.name.clone())
+}
+
+/// Convert a `nodedb_types::Value` to the nearest `SqlValue` equivalent.
+pub(super) fn value_to_sql_value(v: Value) -> nodedb_sql::types::SqlValue {
+    use nodedb_sql::types::SqlValue;
+    match v {
+        Value::String(s) => SqlValue::String(s),
+        Value::Integer(i) => SqlValue::Int(i),
+        Value::Float(f) => SqlValue::Float(f),
+        Value::Bool(b) => SqlValue::Bool(b),
+        Value::Null => SqlValue::Null,
+        _ => SqlValue::Null,
+    }
+}

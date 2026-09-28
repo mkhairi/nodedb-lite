@@ -77,6 +77,26 @@ pub enum LiteError {
     #[error("full-text index update failed for {collection}: {detail}")]
     FtsIndex { collection: String, detail: String },
 
+    /// A full-text read named a field no document of the collection holds as
+    /// text, while other fields of the collection are text-indexed. Maps to a
+    /// bad-request error at the public API boundary.
+    #[error(
+        "collection '{collection}' has no full-text index for field '{field}': \
+         write a document with a string value in '{field}', or search with an \
+         empty field to cover every string field"
+    )]
+    TextIndexMissing { collection: String, field: String },
+
+    /// A full-text query the index cannot run, such as a query with only
+    /// negated terms. Maps to a bad-request error at the public API boundary.
+    #[error("invalid full-text query on {collection}: {detail}")]
+    FtsQueryInvalid { collection: String, detail: String },
+
+    /// A full-text index read failed. The search fails with it: an empty
+    /// result would claim that no document matches.
+    #[error("full-text search failed for {collection}: {detail}")]
+    FtsSearch { collection: String, detail: String },
+
     /// A KV counter atomic read a stored value it cannot parse as a number,
     /// or computed a result out of range. Maps to SQLSTATE `22P02` or `22003`
     /// at the SQL boundary, the same as Origin.
@@ -157,6 +177,9 @@ impl From<LiteError> for nodedb_types::error::NodeDbError {
                 NodeDbError::type_mismatch(collection, detail)
             }
             LiteError::DataException { detail } => NodeDbError::data_exception(detail),
+            e @ (LiteError::TextIndexMissing { .. } | LiteError::FtsQueryInvalid { .. }) => {
+                NodeDbError::bad_request(e)
+            }
             e if is_corruption(&e) => NodeDbError::segment_corrupted(e.to_string()),
             e => NodeDbError::storage(e),
         }

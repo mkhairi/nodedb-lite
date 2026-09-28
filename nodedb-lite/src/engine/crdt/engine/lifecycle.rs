@@ -3,9 +3,9 @@
 //! Engine construction, per-collection state access, snapshot import/export,
 //! and history compaction.
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicU64;
 
 use nodedb_crdt::{CrdtState, ImportAdmission};
@@ -13,6 +13,14 @@ use nodedb_crdt::{CrdtState, ImportAdmission};
 use crate::error::LiteError;
 
 use super::types::CrdtEngine;
+
+/// What an import did to a collection.
+pub struct TrackedImport {
+    /// How much of the blob was new; see [`ImportAdmission`].
+    pub admission: ImportAdmission,
+    /// Ids of the rows whose applied state the import changed.
+    pub changed_rows: BTreeSet<String>,
+}
 
 /// Warn when an import carried operations but contributed none of them.
 ///
@@ -129,19 +137,30 @@ impl CrdtEngine {
     /// document already has, so a fully-trimmed import succeeds while
     /// contributing nothing — which is also what a peer-id collision looks like
     /// when it discards a healthy client's writes.
+    ///
+    /// Also returns the rows whose applied state the import changed, so
+    /// derived indexes can follow them without rescanning the collection.
     pub fn import_remote(
         &mut self,
         collection: &str,
         data: &[u8],
-    ) -> Result<ImportAdmission, LiteError> {
-        let admission =
-            self.state_mut(collection)?
-                .import(data)
+    ) -> Result<TrackedImport, LiteError> {
+        let state = self.state_mut(collection)?;
+        let before = state.state_frontiers();
+        let admission = state.import(data).map_err(|e| LiteError::Storage {
+            detail: format!("remote delta import for '{collection}' failed: {e}"),
+        })?;
+        let changed_rows =
+            state
+                .changed_rows_since(collection, &before)
                 .map_err(|e| LiteError::Storage {
-                    detail: format!("remote delta import for '{collection}' failed: {e}"),
+                    detail: format!("rows changed by remote delta for '{collection}': {e}"),
                 })?;
         warn_if_fully_trimmed(collection, "remote delta", &admission);
-        Ok(admission)
+        Ok(TrackedImport {
+            admission,
+            changed_rows,
+        })
     }
 
     // ─── Snapshot & Persistence ──────────────────────────────────────
@@ -176,6 +195,34 @@ impl CrdtEngine {
             })?;
         warn_if_fully_trimmed(collection, "snapshot", &admission);
         Ok(admission)
+    }
+
+    /// Import an update this device persisted itself — one replayed at cold
+    /// open, or a re-issued RESTORE — and report the rows it changed.
+    ///
+    /// Admitted as local, like [`Self::import_snapshot`]. The changed rows let
+    /// derived indexes follow an update written after their own checkpoint.
+    pub fn import_local_tracked(
+        &mut self,
+        collection: &str,
+        bytes: &[u8],
+    ) -> Result<TrackedImport, LiteError> {
+        let state = self.state_mut(collection)?;
+        let before = state.state_frontiers();
+        let admission = state.import_local(bytes).map_err(|e| LiteError::Storage {
+            detail: format!("update import for '{collection}' failed: {e}"),
+        })?;
+        let changed_rows =
+            state
+                .changed_rows_since(collection, &before)
+                .map_err(|e| LiteError::Storage {
+                    detail: format!("rows changed by update for '{collection}': {e}"),
+                })?;
+        warn_if_fully_trimmed(collection, "update", &admission);
+        Ok(TrackedImport {
+            admission,
+            changed_rows,
+        })
     }
 
     /// Export a full Loro state snapshot for one collection.

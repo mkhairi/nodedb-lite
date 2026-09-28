@@ -19,7 +19,7 @@ use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
 use crate::engine::crdt::CrdtEngine;
-use crate::engine::fts::search::run_text_search;
+use crate::engine::fts::search::{TextSearchRequest, run_text_search};
 use crate::engine::fts::state::FtsState;
 use crate::engine::vector::VectorState;
 use crate::engine::vector::search::run_vector_search;
@@ -104,17 +104,19 @@ pub async fn rag_fusion<S: StorageEngine>(
 
     // Step 2: Optional BM25 text search.
     let bm25_ranked: Option<Vec<RankedResult>> = match (bm25_query, bm25_field) {
-        (Some(q), Some(_field)) => {
+        (Some(q), Some(field)) => {
             let text_results = run_text_search(
                 fts_state,
                 crdt,
-                collection,
-                q,
-                vector_top_k,
-                &TextSearchParams::default(),
-                None,
-            )
-            .map_err(|e| LiteError::Query(e.to_string()))?;
+                TextSearchRequest {
+                    collection,
+                    field,
+                    query: q,
+                    top_k: vector_top_k,
+                    params: &TextSearchParams::default(),
+                    allowed_ids: None,
+                },
+            )?;
             let ranked: Vec<RankedResult> = text_results
                 .iter()
                 .enumerate()
@@ -272,6 +274,7 @@ mod tests {
     use crate::engine::htap::HtapBridge;
     use crate::engine::strict::StrictEngine;
     use crate::engine::vector::VectorState;
+    use crate::error::LiteError;
     use crate::query::engine::{LiteQueryEngine, LiteQueryEngineParams};
 
     async fn make_engine() -> LiteQueryEngine<PagedbStorageMem> {
@@ -386,6 +389,13 @@ mod tests {
     #[tokio::test]
     async fn rag_fusion_three_source_returns_correct_columns() {
         let engine = make_engine().await;
+        engine
+            .fts_state
+            .manager
+            .lock()
+            .expect("fts lock")
+            .index_field("col", "content", "d1", "retrieval augmented generation")
+            .expect("index update must succeed");
         let result = super::rag_fusion(
             &engine.vector_state,
             &engine.crdt,
@@ -408,6 +418,42 @@ mod tests {
         .expect("three-source path must not error");
         assert_eq!(result.columns[0], "surrogate");
         assert_eq!(result.columns[1], "score");
+    }
+
+    /// Three-source fusion names a text field no document holds while
+    /// another field is indexed: the search fails instead of fusing an empty
+    /// text leg.
+    #[tokio::test]
+    async fn rag_fusion_on_an_unindexed_text_field_is_an_error() {
+        let engine = make_engine().await;
+        engine
+            .fts_state
+            .manager
+            .lock()
+            .expect("fts lock")
+            .index_field("col", "title", "d1", "retrieval augmented generation")
+            .expect("index update must succeed");
+        let err = super::rag_fusion(
+            &engine.vector_state,
+            &engine.crdt,
+            &engine.fts_state,
+            &engine.csr,
+            "col",
+            &[1.0_f32, 0.0, 0.0, 0.0],
+            "",
+            5,
+            Some("KNOWS"),
+            Direction::Out,
+            2,
+            5,
+            (60.0, 60.0),
+            Some((60.0, 60.0, 60.0)),
+            Some("what is retrieval"),
+            Some("content"),
+        )
+        .await
+        .expect_err("an unindexed text field must fail the fusion");
+        assert!(matches!(err, LiteError::TextIndexMissing { .. }), "{err:?}");
     }
 
     /// RRF scoring logic: rank-0 score > rank-1 score for default k=60.

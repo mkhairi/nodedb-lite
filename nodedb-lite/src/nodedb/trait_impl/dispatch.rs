@@ -258,13 +258,13 @@ impl<S: StorageEngine> NodeDb for NodeDbLite<S> {
     async fn text_search(
         &self,
         collection: &str,
-        _field: &str,
+        field: &str,
         query: &str,
         top_k: usize,
         params: TextSearchParams,
         allowed_ids: Option<&HashSet<String>>,
     ) -> NodeDbResult<Vec<SearchResult>> {
-        self.text_search_impl(collection, query, top_k, params, allowed_ids)
+        self.text_search_impl(collection, field, query, top_k, params, allowed_ids)
             .await
     }
 

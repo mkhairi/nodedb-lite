@@ -9,8 +9,9 @@ use crate::storage::engine::StorageEngine;
 
 /// Apply a remote CRDT delta from another peer into `collection`'s document.
 ///
-/// Imports the raw Loro delta bytes, then acknowledges the mutation on
-/// success or rejects it on import failure.
+/// Imports the raw Loro delta bytes, re-indexes the text of the rows it
+/// changed, then acknowledges the mutation on success or rejects it on
+/// import failure.
 pub async fn handle_apply<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
@@ -26,7 +27,16 @@ pub async fn handle_apply<S: StorageEngine>(
         // The admission is already logged when it contributed nothing; the
         // delta is still acknowledged, since a fully-trimmed import is a
         // successful (idempotent) apply, not a failure to replicate.
-        Ok(_admission) => {
+        Ok(imported) => {
+            // Re-index the rows the delta changed. It came from a peer, so
+            // nothing is staged back.
+            crate::engine::fts::maintain::reindex_crdt_documents(
+                &engine.fts_state,
+                &engine.crdt,
+                None::<&crate::sync::FtsOutbound<S>>,
+                collection,
+                imported.changed_rows.iter().map(String::as_str),
+            )?;
             let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
             crdt.acknowledge(mutation_id);
             Ok(QueryResult {
@@ -54,8 +64,20 @@ pub async fn handle_import_snapshot<S: StorageEngine>(
     collection: &str,
     bytes: &[u8],
 ) -> Result<QueryResult, LiteError> {
-    let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-    crdt.import_snapshot(collection, bytes)?;
+    let imported = engine
+        .crdt
+        .lock()
+        .map_err(|_| LiteError::LockPoisoned)?
+        .import_local_tracked(collection, bytes)?;
+    // Re-index the rows the snapshot changed. It is this device's own state,
+    // so nothing is staged for Origin.
+    crate::engine::fts::maintain::reindex_crdt_documents(
+        &engine.fts_state,
+        &engine.crdt,
+        None::<&crate::sync::FtsOutbound<S>>,
+        collection,
+        imported.changed_rows.iter().map(String::as_str),
+    )?;
     Ok(QueryResult {
         columns: vec![],
         rows: vec![],

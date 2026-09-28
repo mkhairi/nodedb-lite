@@ -13,6 +13,7 @@ use nodedb_types::{Surrogate, VectorQuantization};
 use crate::error::LiteError;
 use crate::nodedb::LockExt;
 use crate::query::engine::LiteQueryEngine;
+use crate::query::text_index::reindex_documents;
 use crate::storage::engine::StorageEngine;
 
 use super::super::adapter::LitePhysicalFut;
@@ -123,6 +124,7 @@ where
         // tombstones the old one under the same lock.
         insert_node(&vector_state, &key, &doc_id, &vector, op_name).await?;
         write_row(&crdt, &collection, &doc_id, dim, &row, op_name)?;
+        reindex_documents(engine, &collection, [doc_id.as_str()])?;
 
         Ok(QueryResult {
             columns: vec![],

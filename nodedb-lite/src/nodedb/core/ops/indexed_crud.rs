@@ -33,7 +33,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .map_err(NodeDbError::storage)?;
 
         // Build a row_id string from the PK value for index keying.
-        let row_id = pk_to_string(&schema.columns, values);
+        let row_id = crate::engine::index_integration::row_id(&schema.columns, values);
 
         // Update secondary indexes.
         crate::engine::index_integration::index_row(
@@ -86,13 +86,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
         })?;
 
         // The same row id the insert indexed the row under.
-        let row_id = pk_value_to_string(pk);
+        let row_id = crate::engine::index_integration::pk_row_id(pk);
 
         // Remove text and vector index entries before deleting the row.
         crate::engine::index_integration::deindex_row_text(
             collection,
             &row_id,
-            &schema.columns,
             &self.fts_state.manager,
         )?;
         crate::engine::index_integration::deindex_row_vectors(
@@ -126,7 +125,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .insert(collection, values)
             .map_err(NodeDbError::storage)?;
 
-        let row_id = pk_to_string(&schema.columns, values);
+        let row_id = crate::engine::index_integration::row_id(&schema.columns, values);
 
         crate::engine::index_integration::index_row(
             collection,
@@ -147,17 +146,14 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         // Spatial profile: compute geohash for Point geometries and store
         // in the text index for prefix-based proximity queries.
-        if let Some(profile) = self.columnar.profile(collection)
-            && let Some((_idx, geom)) = crate::engine::columnar::spatial_profile::extract_geometry(
-                &schema, &profile, values,
-            )
-            && let Some(hash) = crate::engine::columnar::spatial_profile::compute_geohash(&geom)
-        {
-            self.fts_state
-                .manager
-                .lock_or_recover()
-                .index_field(collection, "_geohash", &row_id, &hash)?;
-        }
+        crate::engine::index_integration::index_geohash(
+            collection,
+            &row_id,
+            &schema,
+            self.columnar.profile(collection).as_ref(),
+            values,
+            &self.fts_state.manager,
+        )?;
         Ok(())
     }
 
@@ -209,33 +205,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .await
             .map_err(NodeDbError::storage)?;
 
+        // Re-index the patched row's text so no pre-patch term keeps matching.
+        crate::engine::index_integration::index_row_text(
+            collection,
+            &crate::engine::index_integration::row_id(&schema.columns, &new_values),
+            &schema.columns,
+            &new_values,
+            &self.fts_state.manager,
+        )?;
+
         Ok(())
-    }
-}
-
-/// Build a string row ID from PK column values (for index keying).
-fn pk_to_string(
-    columns: &[nodedb_types::columnar::ColumnDef],
-    values: &[nodedb_types::value::Value],
-) -> String {
-    let mut parts = Vec::new();
-    for (i, col) in columns.iter().enumerate() {
-        if col.primary_key
-            && let Some(val) = values.get(i)
-        {
-            parts.push(pk_value_to_string(val));
-        }
-    }
-    parts.join(":")
-}
-
-/// The row-id text of one primary-key value.
-fn pk_value_to_string(val: &nodedb_types::value::Value) -> String {
-    use nodedb_types::value::Value;
-    match val {
-        Value::Integer(n) => n.to_string(),
-        Value::String(s) => s.clone(),
-        Value::Uuid(s) => s.clone(),
-        other => format!("{other:?}"),
     }
 }

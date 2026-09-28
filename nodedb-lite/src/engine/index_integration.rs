@@ -16,6 +16,7 @@
 //! index through `engine::vector::resident`, which loads an evicted index
 //! back first.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nodedb_types::columnar::ColumnType;
@@ -32,11 +33,11 @@ use crate::nodedb::lock_ext::LockExt;
 use crate::storage::engine::StorageEngine;
 
 /// Index a row from a strict or columnar collection into its spatial and
-/// text indexes: GEOMETRY → R-tree, STRING → text/BM25. VECTOR columns go
-/// through [`index_row_vectors`].
+/// text indexes: GEOMETRY → R-tree, STRING → text/BM25 (see
+/// [`index_row_text`]). VECTOR columns go through [`index_row_vectors`].
 ///
 /// `collection` is the collection name (used as the index key).
-/// `row_id` is a string identifier for the row (typically the PK value).
+/// `row_id` is the row's text-index id ([`row_id`]).
 /// `columns` are the column definitions from the schema.
 /// `values` are the row's values in schema order.
 pub fn index_row(
@@ -47,43 +48,100 @@ pub fn index_row(
     spatial: &Mutex<SpatialIndexManager>,
     fts: &Mutex<FtsCollectionManager>,
 ) -> Result<(), LiteError> {
-    for (i, col) in columns.iter().enumerate() {
-        if i >= values.len() {
-            break;
-        }
-        let val = &values[i];
-
-        match &col.column_type {
-            ColumnType::Geometry => {
-                index_geometry(collection, &col.name, row_id, val, spatial);
-            }
-            ColumnType::String => {
-                index_text(collection, &col.name, row_id, val, fts)?;
-            }
-            _ => {} // No secondary index for other types.
+    for (col, val) in columns.iter().zip(values) {
+        if matches!(col.column_type, ColumnType::Geometry) {
+            index_geometry(collection, &col.name, row_id, val, spatial);
         }
     }
-    Ok(())
+    index_row_text(collection, row_id, columns, values, fts)
 }
 
-/// Remove a row's text entries from inverted indexes.
+/// Index a row's STRING columns: each under `"{collection}:{column}"`, and
+/// all of them together in the whole-document index, replacing what the row
+/// held before. A column that is NULL or empty stops matching.
 ///
-/// Only handles String columns (BM25 inverted index). R-tree spatial removal
-/// requires the original geometry (uses `SpatialIndexManager.remove_document`
-/// directly). HNSW uses soft-delete (tombstone) which doesn't need the original
-/// vector — call `HnswIndex.delete(node_id)` directly when the node ID is known.
-pub fn deindex_row_text(
+/// Shares [`FtsCollectionManager::index_document_fields`] with schemaless
+/// documents, so a strict row and a document are searched the same way.
+pub fn index_row_text(
     collection: &str,
     row_id: &str,
     columns: &[nodedb_types::columnar::ColumnDef],
+    values: &[Value],
     fts: &Mutex<FtsCollectionManager>,
 ) -> Result<(), LiteError> {
-    for col in columns {
-        if matches!(col.column_type, ColumnType::String) {
-            remove_text(collection, &col.name, row_id, fts)?;
-        }
+    let text_columns: HashMap<String, Value> = columns
+        .iter()
+        .zip(values)
+        .filter(|(col, _)| matches!(col.column_type, ColumnType::String))
+        .map(|(col, val)| (col.name.clone(), val.clone()))
+        .collect();
+    fts.lock_or_recover()
+        .index_document_fields(collection, row_id, &text_columns)
+        .map(|_| ())
+}
+
+/// Index a spatial-profile columnar row's Point geometry as a geohash in
+/// the `"{collection}:_geohash"` text index, for prefix proximity queries.
+/// A row with no Point geometry, or a collection with no spatial profile,
+/// indexes nothing.
+pub fn index_geohash(
+    collection: &str,
+    row_id: &str,
+    schema: &nodedb_types::columnar::ColumnarSchema,
+    profile: Option<&nodedb_types::columnar::ColumnarProfile>,
+    values: &[Value],
+    fts: &Mutex<FtsCollectionManager>,
+) -> Result<(), LiteError> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    let Some((_, geom)) =
+        crate::engine::columnar::spatial_profile::extract_geometry(schema, profile, values)
+    else {
+        return Ok(());
+    };
+    let Some(hash) = crate::engine::columnar::spatial_profile::compute_geohash(&geom) else {
+        return Ok(());
+    };
+    fts.lock_or_recover()
+        .index_field(collection, "_geohash", row_id, &hash)
+}
+
+/// Remove a row from every text index of its collection.
+///
+/// R-tree spatial removal requires the original geometry (uses
+/// `SpatialIndexManager.remove_document` directly). HNSW uses soft-delete
+/// (tombstone) which doesn't need the original vector — call
+/// `HnswIndex.delete(node_id)` directly when the node ID is known.
+pub fn deindex_row_text(
+    collection: &str,
+    row_id: &str,
+    fts: &Mutex<FtsCollectionManager>,
+) -> Result<(), LiteError> {
+    fts.lock_or_recover()
+        .remove_document_fields(collection, row_id)
+}
+
+/// The text-index id of a strict or columnar row: its primary-key values,
+/// in schema order, joined by `:`.
+pub(crate) fn row_id(columns: &[nodedb_types::columnar::ColumnDef], values: &[Value]) -> String {
+    columns
+        .iter()
+        .zip(values)
+        .filter(|(col, _)| col.primary_key)
+        .map(|(_, val)| pk_row_id(val))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// The text-index id of a row with a single-column primary key.
+pub(crate) fn pk_row_id(pk: &Value) -> String {
+    match pk {
+        Value::Integer(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Uuid(s) => s.clone(),
+        other => format!("{other:?}"),
     }
-    Ok(())
 }
 
 /// Index a geometry value into the spatial R-tree.
@@ -217,33 +275,6 @@ fn vector_value(
     };
     nodedb_vector::error::check_dim(dim, vector.len())?;
     Ok(Some(vector))
-}
-
-/// Index a string value into the inverted text index (BM25).
-fn index_text(
-    collection: &str,
-    field: &str,
-    doc_id: &str,
-    value: &Value,
-    fts: &Mutex<FtsCollectionManager>,
-) -> Result<(), LiteError> {
-    let text = match value {
-        Value::String(s) => s.as_str(),
-        _ => return Ok(()),
-    };
-    fts.lock_or_recover()
-        .index_field(collection, field, doc_id, text)
-}
-
-/// Remove a document from the text index.
-fn remove_text(
-    collection: &str,
-    field: &str,
-    doc_id: &str,
-    fts: &Mutex<FtsCollectionManager>,
-) -> Result<(), LiteError> {
-    fts.lock_or_recover()
-        .remove_field(collection, field, doc_id)
 }
 
 #[cfg(test)]

@@ -25,13 +25,19 @@ pub async fn truncate<S: StorageEngine>(
     Ok(truncated())
 }
 
-/// Empty the R-tree entries and the metric-engine samples keyed by
-/// `collection`.
+/// Empty the R-tree entries, the text indexes, and the metric-engine
+/// samples keyed by `collection`.
 pub(crate) fn clear_overlays<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
 ) -> Result<(), LiteError> {
     clear_spatial(engine, collection)?;
+    engine
+        .fts_state
+        .manager
+        .lock()
+        .map_err(|_| LiteError::LockPoisoned)?
+        .drop_collection(collection);
     engine
         .timeseries
         .lock()

@@ -83,6 +83,13 @@ pub async fn handle_unregister_collection<S: StorageEngine>(
             })?;
         }
     }
+    // The collection's documents are gone, and so is every text index over them.
+    engine
+        .fts_state
+        .manager
+        .lock()
+        .map_err(|_| LiteError::LockPoisoned)?
+        .drop_collection(name);
     Ok(QueryResult {
         columns: vec!["deleted_entries".into()],
         rows: vec![vec![Value::Integer(deleted as i64)]],

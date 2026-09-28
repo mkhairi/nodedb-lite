@@ -2,6 +2,7 @@
 pub mod indexes;
 pub mod reads;
 pub mod sets;
+mod write_helpers;
 pub mod writes;
 
 use crate::query::engine::LiteQueryEngine;
