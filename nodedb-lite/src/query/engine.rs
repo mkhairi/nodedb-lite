@@ -61,6 +61,9 @@ pub struct LiteQueryEngine<S: StorageEngine> {
     /// Durable outbound queue for spatial sync — `None` when sync is disabled.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) spatial_outbound: Option<Arc<crate::sync::SpatialOutbound<S>>>,
+    /// Durable outbound queue for KV write sync — `None` when sync is disabled.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) kv_outbound: Option<Arc<crate::sync::KvOutbound<S>>>,
 }
 
 /// Construction fields for [`LiteQueryEngine::new`].
@@ -104,6 +107,8 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             fts_outbound: None,
             #[cfg(not(target_arch = "wasm32"))]
             spatial_outbound: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            kv_outbound: None,
         }
     }
 
@@ -117,6 +122,12 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn set_spatial_outbound(&mut self, q: Arc<crate::sync::SpatialOutbound<S>>) {
         self.spatial_outbound = Some(q);
+    }
+
+    /// Wire the durable KV outbound queue so SQL-path KV writes are sync-tracked.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_kv_outbound(&mut self, q: Arc<crate::sync::KvOutbound<S>>) {
+        self.kv_outbound = Some(q);
     }
 
     /// The sequence registry SELECT-list accessors read and advance.
@@ -196,7 +207,14 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         plan: &SqlPlan,
     ) -> Result<QueryResult, LiteError> {
         let mut visitor = super::visitor::LiteVisitor { engine: self };
-        nodedb_sql::dispatch(&mut visitor, plan)?.await
+        let mut result = nodedb_sql::dispatch(&mut visitor, plan)?.await?;
+        // The shared plan dispatcher hands the visitor a point get without its
+        // SELECT list, so the list is applied here, as the scan path applies
+        // it to a scan.
+        if let SqlPlan::PointGet { projection, .. } = plan {
+            super::visitor::project_scan_result(&mut result, projection, &[], &self.sequences)?;
+        }
+        Ok(result)
     }
 
     pub(super) async fn execute_constant_result(
@@ -212,175 +230,6 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             command: None,
         })
     }
-
-    pub(super) async fn execute_scan(
-        &self,
-        collection: &str,
-        engine: &EngineType,
-    ) -> Result<QueryResult, LiteError> {
-        match engine {
-            EngineType::DocumentSchemaless => {
-                // For bitemporal collections the Loro snapshot may lag storage
-                // (it is only saved on explicit flush).  Scan DocumentHistory
-                // as the authoritative source for the current set of live IDs.
-                let is_bt = crate::engine::document::history::ops::is_bitemporal(
-                    &*self.storage,
-                    collection,
-                )
-                .await
-                .unwrap_or(false);
-
-                if is_bt {
-                    let live_docs = crate::engine::document::history::ops::scan_live_documents(
-                        &*self.storage,
-                        collection,
-                    )
-                    .await
-                    .map_err(|e| LiteError::Query(e.to_string()))?;
-                    let mut rows = Vec::with_capacity(live_docs.len());
-                    for (id, body) in &live_docs {
-                        // Decode the msgpack body to a JSON string for the
-                        // document column so post-scan filters can match fields.
-                        let doc_str = if body.is_empty() {
-                            "{}".to_owned()
-                        } else {
-                            match nodedb_types::json_msgpack::value_from_msgpack(body) {
-                                Ok(nodedb_types::value::Value::Object(fields)) => {
-                                    let json_map: serde_json::Map<String, serde_json::Value> =
-                                        fields
-                                            .into_iter()
-                                            .map(|(k, v)| (k, value_to_serde_json(v)))
-                                            .collect();
-                                    sonic_rs::to_string(&serde_json::Value::Object(json_map))
-                                        .unwrap_or_else(|_| "{}".to_owned())
-                                }
-                                _ => "{}".to_owned(),
-                            }
-                        };
-                        rows.push(vec![Value::String(id.clone()), Value::String(doc_str)]);
-                    }
-                    return Ok(QueryResult {
-                        columns: vec!["id".into(), "document".into()],
-                        rows,
-                        rows_affected: 0,
-                        command: None,
-                    });
-                }
-
-                let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-                let ids = crdt.list_ids(collection);
-                let mut rows = Vec::with_capacity(ids.len());
-                for id in &ids {
-                    if let Some(val) = crdt.read(collection, id) {
-                        let json = loro_value_to_json(&val);
-                        let doc_str = sonic_rs::to_string(&json).unwrap_or_default();
-                        rows.push(vec![Value::String(id.clone()), Value::String(doc_str)]);
-                    }
-                }
-                Ok(QueryResult {
-                    columns: vec!["id".into(), "document".into()],
-                    rows,
-                    rows_affected: 0,
-                    command: None,
-                })
-            }
-            EngineType::DocumentStrict => {
-                let schema =
-                    self.strict
-                        .schema(collection)
-                        .ok_or_else(|| LiteError::BadRequest {
-                            detail: format!("strict collection '{collection}' does not exist"),
-                        })?;
-                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let rows = self.strict.list_rows(collection).await?;
-                Ok(QueryResult {
-                    columns,
-                    rows,
-                    rows_affected: 0,
-                    command: None,
-                })
-            }
-            EngineType::Columnar => {
-                let schema =
-                    self.columnar
-                        .schema(collection)
-                        .ok_or_else(|| LiteError::BadRequest {
-                            detail: format!("columnar collection '{collection}' does not exist"),
-                        })?;
-                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let rows = self.columnar.list_rows(collection).await?;
-                Ok(QueryResult {
-                    columns,
-                    rows,
-                    rows_affected: 0,
-                    command: None,
-                })
-            }
-            _ => Ok(QueryResult::empty()),
-        }
-    }
-
-    pub(super) async fn execute_point_get(
-        &self,
-        collection: &str,
-        engine: &EngineType,
-        key: &SqlValue,
-    ) -> Result<QueryResult, LiteError> {
-        let key_str = sql_value_to_string(key);
-        match engine {
-            EngineType::DocumentSchemaless => {
-                let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-                match crdt.read(collection, &key_str) {
-                    Some(val) => {
-                        let json = loro_value_to_json(&val);
-                        let doc_str = sonic_rs::to_string(&json).unwrap_or_default();
-                        Ok(QueryResult {
-                            columns: vec!["id".into(), "document".into()],
-                            rows: vec![vec![Value::String(key_str), Value::String(doc_str)]],
-                            rows_affected: 0,
-                            command: None,
-                        })
-                    }
-                    None => Ok(QueryResult::empty()),
-                }
-            }
-            EngineType::DocumentStrict => {
-                let schema =
-                    self.strict
-                        .schema(collection)
-                        .ok_or_else(|| LiteError::BadRequest {
-                            detail: format!("strict collection '{collection}' does not exist"),
-                        })?;
-                let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                // The PK column type determines how to parse the key string.
-                let pk_col = schema
-                    .columns
-                    .iter()
-                    .find(|c| c.primary_key)
-                    .ok_or_else(|| LiteError::BadRequest {
-                        detail: format!(
-                            "strict collection '{collection}' has no primary key column"
-                        ),
-                    })?;
-                let pk_value = parse_pk_value(&key_str, &pk_col.column_type);
-                match self.strict.get(collection, &pk_value).await? {
-                    Some(values) => Ok(QueryResult {
-                        columns,
-                        rows: vec![values],
-                        rows_affected: 0,
-                        command: None,
-                    }),
-                    None => Ok(QueryResult {
-                        columns,
-                        rows: Vec::new(),
-                        rows_affected: 0,
-                        command: None,
-                    }),
-                }
-            }
-            _ => Ok(QueryResult::empty()),
-        }
-    }
 }
 
 pub(super) fn sql_value_to_string(v: &SqlValue) -> String {
@@ -390,17 +239,6 @@ pub(super) fn sql_value_to_string(v: &SqlValue) -> String {
         SqlValue::Float(f) => f.to_string(),
         SqlValue::Bool(b) => b.to_string(),
         _ => String::new(),
-    }
-}
-
-pub(super) fn sql_value_to_loro(v: &SqlValue) -> loro::LoroValue {
-    match v {
-        SqlValue::Int(i) => loro::LoroValue::I64(*i),
-        SqlValue::Float(f) => loro::LoroValue::Double(*f),
-        SqlValue::String(s) => loro::LoroValue::String(s.clone().into()),
-        SqlValue::Bool(b) => loro::LoroValue::Bool(*b),
-        SqlValue::Null => loro::LoroValue::Null,
-        _ => loro::LoroValue::Null,
     }
 }
 
@@ -415,23 +253,6 @@ pub(super) fn sql_value_to_value(v: &nodedb_sql::types::SqlValue) -> Value {
     }
 }
 
-/// Convert a primary-key string from a SQL literal into the appropriate `Value`
-/// variant based on the column's declared type.
-pub(super) fn parse_pk_value(
-    key_str: &str,
-    col_type: &nodedb_types::columnar::ColumnType,
-) -> Value {
-    use nodedb_types::columnar::ColumnType;
-    match col_type {
-        ColumnType::Int64 => key_str
-            .parse::<i64>()
-            .map(Value::Integer)
-            .unwrap_or_else(|_| Value::String(key_str.to_string())),
-        ColumnType::Uuid => Value::Uuid(key_str.to_string()),
-        _ => Value::String(key_str.to_string()),
-    }
-}
-
 /// Convert a `nodedb_types::Value` to the `nodedb_sql::ParamValue` type used
 /// for AST-level parameter binding in `plan_sql_with_params`.
 fn value_to_param(v: &Value) -> nodedb_sql::ParamValue {
@@ -443,48 +264,6 @@ fn value_to_param(v: &Value) -> nodedb_sql::ParamValue {
         Value::String(s) => nodedb_sql::ParamValue::Text(s.clone()),
         Value::Uuid(s) => nodedb_sql::ParamValue::Text(s.clone()),
         _ => nodedb_sql::ParamValue::Null,
-    }
-}
-
-fn value_to_serde_json(v: nodedb_types::value::Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(b),
-        Value::Integer(n) => serde_json::json!(n),
-        Value::Float(f) => serde_json::json!(f),
-        Value::String(s) => serde_json::Value::String(s),
-        Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(value_to_serde_json).collect())
-        }
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, val) in map {
-                out.insert(k, value_to_serde_json(val));
-            }
-            serde_json::Value::Object(out)
-        }
-        _ => serde_json::Value::Null,
-    }
-}
-
-fn loro_value_to_json(v: &loro::LoroValue) -> serde_json::Value {
-    match v {
-        loro::LoroValue::Null => serde_json::Value::Null,
-        loro::LoroValue::Bool(b) => serde_json::Value::Bool(*b),
-        loro::LoroValue::I64(n) => serde_json::json!(*n),
-        loro::LoroValue::Double(f) => serde_json::json!(*f),
-        loro::LoroValue::String(s) => serde_json::Value::String(s.to_string()),
-        loro::LoroValue::Map(m) => {
-            let mut obj = serde_json::Map::new();
-            for (k, val) in m.iter() {
-                obj.insert(k.to_string(), loro_value_to_json(val));
-            }
-            serde_json::Value::Object(obj)
-        }
-        loro::LoroValue::List(arr) => {
-            serde_json::Value::Array(arr.iter().map(loro_value_to_json).collect())
-        }
-        _ => serde_json::Value::Null,
     }
 }
 

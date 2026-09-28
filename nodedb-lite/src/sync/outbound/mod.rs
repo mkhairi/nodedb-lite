@@ -1,6 +1,7 @@
 pub mod columnar;
 pub mod durable_queue;
 pub mod fts;
+pub mod kv;
 pub mod queue;
 pub mod reconcile;
 pub mod spatial;
@@ -10,6 +11,7 @@ pub mod vector;
 pub use columnar::{ColumnarOutbound, PendingColumnarBatch};
 pub use durable_queue::DurableOutboundQueue;
 pub use fts::{FtsOutbound, PendingFtsDelete, PendingFtsIndex};
+pub use kv::{KvOutbound, PendingKvOp, PendingKvWrite};
 pub use queue::{BatchIdGen, PendingQueue};
 pub(crate) use reconcile::reconcile_outbound_enqueue;
 pub use spatial::{PendingSpatialDelete, PendingSpatialInsert, SpatialOutbound};

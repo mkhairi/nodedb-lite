@@ -6,14 +6,6 @@
 #[cfg(not(target_arch = "wasm32"))]
 use crate::storage::engine::StorageEngine;
 
-/// Durable storage key for the Origin-assigned producer ID.
-#[cfg(not(target_arch = "wasm32"))]
-const META_SYNC_PRODUCER_ID: &[u8] = b"sync.producer_id";
-
-/// Durable storage key for the Origin-echoed accepted epoch.
-#[cfg(not(target_arch = "wasm32"))]
-const META_SYNC_ACCEPTED_EPOCH: &[u8] = b"sync.accepted_epoch";
-
 #[cfg(not(target_arch = "wasm32"))]
 use super::super::core::NodeDbLite;
 
@@ -93,18 +85,13 @@ impl<S: StorageEngine> crate::sync::SyncDelegate for NodeDbLite<S> {
         }
     }
 
-    async fn apply_remote_row(&self, msg: &nodedb_types::sync::wire::RowPushMsg) {
+    async fn apply_remote_row(
+        &self,
+        msg: &nodedb_types::sync::wire::RowPushMsg,
+    ) -> Result<(), nodedb_types::error::NodeDbError> {
         let delete = matches!(msg.op, nodedb_types::sync::wire::RowOp::Delete);
-        if let Err(e) =
-            self.apply_remote_row(&msg.collection, &msg.document_id, &msg.payload, delete)
-        {
-            tracing::warn!(
-                collection = %msg.collection,
-                doc = %msg.document_id,
-                error = %e,
-                "SyncDelegate: apply_remote_row failed"
-            );
-        }
+        self.apply_remote_row(&msg.collection, &msg.document_id, &msg.payload, delete)
+            .await
     }
 
     fn handle_array_delta(
@@ -299,6 +286,29 @@ impl<S: StorageEngine> crate::sync::SyncDelegate for NodeDbLite<S> {
         super::timeseries_handlers::acknowledge_timeseries_batch_impl(self, durable_key).await
     }
 
+    async fn pending_kv_writes(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, crate::sync::outbound::kv::PendingKvWrite)>, crate::error::LiteError>
+    {
+        super::kv_handlers::pending_kv_writes_impl(self).await
+    }
+
+    async fn persist_kv_write_seq(
+        &self,
+        key: &[u8],
+        write: &crate::sync::outbound::kv::PendingKvWrite,
+    ) -> Result<(), crate::error::LiteError> {
+        super::kv_handlers::persist_kv_write_seq_impl(self, key, write).await
+    }
+
+    async fn mark_kv_write_in_flight(&self, batch_id: u64) {
+        super::kv_handlers::mark_kv_write_in_flight_impl(self, batch_id).await
+    }
+
+    async fn retire_kv_write(&self, batch_id: u64) -> Result<(), crate::error::LiteError> {
+        super::kv_handlers::retire_kv_write_impl(self, batch_id).await
+    }
+
     async fn clear_engine_in_flight(&self) {
         if let Some(q) = &self.columnar_outbound {
             q.clear_in_flight().await;
@@ -313,6 +323,9 @@ impl<S: StorageEngine> crate::sync::SyncDelegate for NodeDbLite<S> {
             q.clear_in_flight().await;
         }
         if let Some(q) = &self.spatial_outbound {
+            q.clear_in_flight().await;
+        }
+        if let Some(q) = &self.kv_outbound {
             q.clear_in_flight().await;
         }
     }
@@ -343,38 +356,11 @@ impl<S: StorageEngine> crate::sync::SyncDelegate for NodeDbLite<S> {
     }
 
     async fn persist_producer_state(&self, producer_id: u64, accepted_epoch: u64) {
-        let ns = nodedb_types::Namespace::Meta;
-        if let Err(e) = self
-            .storage
-            .put(ns, META_SYNC_PRODUCER_ID, &producer_id.to_be_bytes())
-            .await
-        {
-            tracing::warn!(error = %e, "SyncDelegate: persist_producer_state: producer_id write failed");
-        }
-        if let Err(e) = self
-            .storage
-            .put(ns, META_SYNC_ACCEPTED_EPOCH, &accepted_epoch.to_be_bytes())
-            .await
-        {
-            tracing::warn!(error = %e, "SyncDelegate: persist_producer_state: accepted_epoch write failed");
-        }
+        super::producer_state::persist_producer_state_impl(self, producer_id, accepted_epoch).await
     }
 
     async fn load_producer_state(&self) -> (u64, u64) {
-        let ns = nodedb_types::Namespace::Meta;
-        let producer_id = match self.storage.get(ns, META_SYNC_PRODUCER_ID).await {
-            Ok(Some(bytes)) if bytes.len() == 8 => {
-                u64::from_be_bytes(bytes.try_into().unwrap_or([0; 8]))
-            }
-            _ => 0,
-        };
-        let accepted_epoch = match self.storage.get(ns, META_SYNC_ACCEPTED_EPOCH).await {
-            Ok(Some(bytes)) if bytes.len() == 8 => {
-                u64::from_be_bytes(bytes.try_into().unwrap_or([0; 8]))
-            }
-            _ => 0,
-        };
-        (producer_id, accepted_epoch)
+        super::producer_state::load_producer_state_impl(self).await
     }
 
     async fn import_definition(&self, msg: &nodedb_types::sync::wire::DefinitionSyncMsg) {
@@ -408,25 +394,7 @@ impl<S: StorageEngine> crate::sync::SyncDelegate for NodeDbLite<S> {
         &self,
         name: &str,
     ) -> Option<crate::nodedb::collection::CollectionMeta> {
-        let key = format!("collection:{name}");
-        match self
-            .storage
-            .get(nodedb_types::Namespace::Meta, key.as_bytes())
-            .await
-        {
-            Ok(Some(bytes)) => match sonic_rs::from_slice(&bytes) {
-                Ok(meta) => Some(meta),
-                Err(e) => {
-                    tracing::warn!(collection = name, error = %e, "get_collection_meta: decode failed");
-                    None
-                }
-            },
-            Ok(None) => self.implicit_collection_meta(name),
-            Err(e) => {
-                tracing::warn!(collection = name, error = %e, "get_collection_meta: storage read failed");
-                None
-            }
-        }
+        super::producer_state::get_collection_meta_impl(self, name).await
     }
 
     // ── Stable seq persistence ────────────────────────────────────────────────

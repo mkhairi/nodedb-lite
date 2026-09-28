@@ -23,14 +23,13 @@ use nodedb_types::error::{NodeDbError, NodeDbResult};
 
 use crate::engine::crdt::engine::CrdtBatchOp;
 use crate::engine::document::history::ops::{is_bitemporal, versioned_put};
+use crate::engine::vector::resident::{check_insert_widths, lock_resident_or_create};
 use crate::engine::vector::sidecar;
-use crate::engine::vector::state::ensure_hnsw;
 use crate::nodedb::LockExt;
 use crate::nodedb::NodeDbLite;
 use crate::nodedb::convert::{document_to_msgpack, value_to_loro};
 use crate::runtime::now_millis_i64;
 use crate::storage::engine::StorageEngine;
-use nodedb_types::vector_dtype::VectorStorageDtype;
 
 /// One item in a batch ingest call.
 pub struct BatchItem<'a> {
@@ -81,6 +80,27 @@ impl<S: StorageEngine> NodeDbLite<S> {
                         .into(),
                 },
             ));
+        }
+
+        // Every embedding must fit its loaded index, or the first embedding
+        // bound for the same index when none is loaded. A refusal writes
+        // nothing: the check runs before the CRDT upsert and the durable rows.
+        let mut widths_by_index: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for item in items {
+            if let Some(emb) = item.embedding
+                && !emb.is_empty()
+            {
+                widths_by_index
+                    .entry(item.vector_collection)
+                    .or_default()
+                    .push(emb.len());
+            }
+        }
+        for (index_key, widths) in &widths_by_index {
+            check_insert_widths(&self.vector_state, index_key, widths.iter().copied())
+                .await
+                .map_err(NodeDbError::from)?;
         }
 
         // Pre-compute doc IDs and field vecs before taking the lock.
@@ -175,20 +195,18 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 && !embedding.is_empty()
             {
                 let internal_id = {
-                    let dtype = {
-                        let configs = self.vector_state.per_index_config.lock_or_recover();
-                        configs
-                            .get(item.vector_collection)
-                            .map(|cfg| cfg.storage_dtype)
-                            .unwrap_or(VectorStorageDtype::F32)
-                    };
-                    let mut indices = self.vector_state.hnsw_indices.lock_or_recover();
-                    let index =
-                        ensure_hnsw(&mut indices, item.vector_collection, embedding.len(), dtype);
+                    let mut resident = lock_resident_or_create(
+                        &self.vector_state,
+                        item.vector_collection,
+                        embedding.len(),
+                    )
+                    .await
+                    .map_err(NodeDbError::from)?;
+                    let index = resident.index();
                     let id_before = index.len() as u32;
                     index
                         .insert(embedding.to_vec())
-                        .map_err(NodeDbError::bad_request)?;
+                        .map_err(|e| NodeDbError::from(crate::error::LiteError::from(e)))?;
                     id_before
                 };
 

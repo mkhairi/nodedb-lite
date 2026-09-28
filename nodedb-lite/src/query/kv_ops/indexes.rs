@@ -74,12 +74,10 @@ pub async fn kv_register_index<S: StorageEngine>(
             continue;
         }
 
-        let map: std::collections::HashMap<String, nodedb_types::value::Value> =
-            zerompk::from_msgpack(user_bytes).map_err(|e| LiteError::Serialization {
-                detail: format!(
-                    "kv_register_index backfill: decode value for collection '{collection}': {e}"
-                ),
-            })?;
+        // A raw body has no typed columns to index, as on Origin.
+        let Some(map) = super::body::decode_kv_map(user_bytes)? else {
+            continue;
+        };
 
         if let Some(field_val) = map.get(field) {
             let field_str = value_to_string(field_val);

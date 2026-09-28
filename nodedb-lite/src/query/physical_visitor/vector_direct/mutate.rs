@@ -71,7 +71,7 @@ where
         let hits = resolve_targets(&crdt, &collection, &targets)?;
         let mut removed = 0u64;
         for (doc_id, _) in hits {
-            remove_live_node(&vector_state, &key, &doc_id);
+            remove_live_node(&vector_state, &key, &doc_id).await?;
             remove_durable(&vector_state, &key, &doc_id, "DirectDelete").await?;
             if delete_row(&crdt, &collection, &doc_id, "DirectDelete")? {
                 removed += 1;
@@ -130,7 +130,7 @@ where
         for (doc_id, mut row) in hits {
             let dim = match &new_vector {
                 Some(vector) => {
-                    remove_live_node(&vector_state, &key, &doc_id);
+                    remove_live_node(&vector_state, &key, &doc_id).await?;
                     insert_node(&vector_state, &key, &doc_id, vector, "DirectUpdate").await?;
                     vector.len()
                 }

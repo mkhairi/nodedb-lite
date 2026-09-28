@@ -122,7 +122,7 @@ where
 
         // A stored row keeps exactly one live node: the old one goes before
         // the new vector is bound under the same identity.
-        remove_live_node(&vector_state, &key, &doc_id);
+        remove_live_node(&vector_state, &key, &doc_id).await?;
         insert_node(&vector_state, &key, &doc_id, &vector, op_name).await?;
         write_row(&crdt, &collection, &doc_id, dim, &row, op_name)?;
 

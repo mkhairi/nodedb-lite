@@ -4,6 +4,7 @@ mod array;
 mod dml;
 mod having_eval;
 mod kv;
+mod kv_dml;
 mod lateral;
 mod projection;
 mod queries;
@@ -15,3 +16,4 @@ mod timeseries;
 mod vector_primary;
 
 pub(super) use adapter::LiteVisitor;
+pub(super) use projection::project_scan_result;

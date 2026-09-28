@@ -43,6 +43,7 @@ async fn concurrent_columnar_scan_and_delete() {
                 Value::Float(i as f64 * 0.25),
             ],
         )
+        .await
         .unwrap();
     }
 
@@ -98,6 +99,7 @@ async fn concurrent_scan_and_compaction() {
             "logs",
             &[Value::Integer(i), Value::String(format!("log_{i}"))],
         )
+        .await
         .unwrap();
     }
 
@@ -156,6 +158,7 @@ async fn concurrent_insert_and_flush() {
             "events",
             &[Value::Integer(i), Value::String(format!("event_{i}"))],
         )
+        .await
         .unwrap();
     }
 
@@ -175,10 +178,12 @@ async fn concurrent_insert_and_flush() {
         tokio::task::yield_now().await;
         // Insert more rows — these go to a fresh memtable after flush.
         for i in 20..30 {
-            let _ = db_insert.columnar_insert(
-                "events",
-                &[Value::Integer(i), Value::String(format!("event_{i}"))],
-            );
+            let _ = db_insert
+                .columnar_insert(
+                    "events",
+                    &[Value::Integer(i), Value::String(format!("event_{i}"))],
+                )
+                .await;
         }
     });
 

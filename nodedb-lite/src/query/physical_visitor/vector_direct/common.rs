@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use nodedb_types::Surrogate;
 use nodedb_types::value::Value;
-use nodedb_types::vector_dtype::VectorStorageDtype;
 
 use crate::engine::crdt::CrdtEngine;
 use crate::engine::vector::VectorState;
-use crate::engine::vector::state::ensure_hnsw;
+use crate::engine::vector::resident::{
+    check_insert_widths, lock_resident, lock_resident_or_create,
+};
 use crate::error::LiteError;
 use crate::nodedb::LockExt;
 use crate::nodedb::convert::{loro_value_to_document, value_to_loro};
@@ -60,41 +61,36 @@ pub(super) fn decode_payload(payload: &[u8]) -> Result<HashMap<String, Value>, L
     })
 }
 
-/// The live HNSW node bound to `doc_id` in `index_key`, if any.
-pub(super) fn live_node<S: StorageEngine>(
-    vector_state: &VectorState<S>,
-    index_key: &str,
-    doc_id: &str,
-) -> Option<u32> {
-    let prefix = format!("{index_key}:");
-    // Lock order matches the search path: indices, then the id map.
-    let indices = vector_state.hnsw_indices.lock_or_recover();
-    let id_map = vector_state.vector_id_map.lock_or_recover();
-    let index = indices.get(index_key)?;
-    id_map
-        .iter()
-        .filter(|(key, _)| key.starts_with(&prefix))
-        .filter(|(_, (did, _))| did == doc_id)
-        .map(|(_, (_, iid))| *iid)
-        .find(|iid| !index.is_deleted(*iid))
-}
-
 /// Tombstone the live node bound to `doc_id`, drop its id-map entry and
-/// codec sidecar code. Returns whether a live node existed.
-pub(in crate::query::physical_visitor) fn remove_live_node<S: StorageEngine>(
-    vector_state: &VectorState<S>,
+/// codec sidecar code. An evicted index is loaded back first: a tombstone it
+/// missed would bring the vector back. Returns whether a live node existed.
+/// Fails when loading the index fails.
+pub(in crate::query::physical_visitor) async fn remove_live_node<S: StorageEngine>(
+    vector_state: &Arc<VectorState<S>>,
     index_key: &str,
     doc_id: &str,
-) -> bool {
-    let Some(iid) = live_node(vector_state, index_key, doc_id) else {
-        return false;
+) -> Result<bool, LiteError> {
+    let iid = {
+        // Lock order matches the search path: indices, then the id map.
+        let mut indices = lock_resident(vector_state, index_key).await?;
+        let Some(index) = indices.get_mut(index_key) else {
+            return Ok(false);
+        };
+        let prefix = format!("{index_key}:");
+        let live = vector_state
+            .vector_id_map
+            .lock_or_recover()
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .filter(|(_, (did, _))| did == doc_id)
+            .map(|(_, (_, iid))| *iid)
+            .find(|iid| !index.is_deleted(*iid));
+        let Some(iid) = live else {
+            return Ok(false);
+        };
+        index.delete(iid);
+        iid
     };
-    {
-        let mut indices = vector_state.hnsw_indices.lock_or_recover();
-        if let Some(index) = indices.get_mut(index_key) {
-            index.delete(iid);
-        }
-    }
     vector_state
         .vector_id_map
         .lock_or_recover()
@@ -106,7 +102,7 @@ pub(in crate::query::physical_visitor) fn remove_live_node<S: StorageEngine>(
     {
         sidecar.remove(iid);
     }
-    true
+    Ok(true)
 }
 
 /// Make `embedding` durable for `doc_id`, insert it into the HNSW index,
@@ -119,6 +115,9 @@ pub(super) async fn insert_node<S: StorageEngine>(
     embedding: &[f32],
     op_name: &str,
 ) -> Result<u32, LiteError> {
+    // A vector of another width than the index, loaded back if it was
+    // evicted, is refused before its durable row is written.
+    check_insert_widths(vector_state, index_key, [embedding.len()]).await?;
     // Durable row first: it is the source of truth both the in-memory index
     // and the pagedb segment are rebuilt from.
     let op = crate::engine::vector::durable::put_op(index_key, doc_id, embedding);
@@ -130,21 +129,11 @@ pub(super) async fn insert_node<S: StorageEngine>(
             detail: format!("{op_name}: durable vector write failed: {e}"),
         })?;
     let internal_id = {
-        let dtype = {
-            let configs = vector_state.per_index_config.lock_or_recover();
-            configs
-                .get(index_key)
-                .map(|c| c.storage_dtype)
-                .unwrap_or(VectorStorageDtype::F32)
-        };
-        let mut indices = vector_state.hnsw_indices.lock_or_recover();
-        let index = ensure_hnsw(&mut indices, index_key, embedding.len(), dtype);
+        let mut resident =
+            lock_resident_or_create(vector_state, index_key, embedding.len()).await?;
+        let index = resident.index();
         let id_before = index.len() as u32;
-        index
-            .insert(embedding.to_vec())
-            .map_err(|e| LiteError::BadRequest {
-                detail: format!("{op_name}: HNSW insert failed: {e}"),
-            })?;
+        index.insert(embedding.to_vec()).map_err(LiteError::from)?;
         id_before
     };
     vector_state.vector_id_map.lock_or_recover().insert(

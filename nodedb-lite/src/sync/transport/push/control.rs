@@ -1,6 +1,6 @@
 //! Control / latched single-shot messages: reactive token refresh, pending
-//! resync requests, pending array acks, and the CRDT delta push (the original
-//! sync flow). Drained once per tick before the per-engine queues.
+//! resync requests, row push refusals, pending array acks, and the CRDT
+//! delta push (the original sync flow). Drained once per tick before the per-engine queues.
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use crate::sync::collection_schema_builder::descriptor_from_meta;
 use crate::sync::transport::delegate::SyncDelegate;
 
 /// Drain control messages: token refresh (when paused for auth), resync
-/// requests, and array acks. Returns `Break` if push must pause this tick
+/// requests, row push refusals, and array acks. Returns `Break` if push must pause this tick
 /// (auth pause) or the connection is lost.
 pub(super) async fn push_control_messages<S>(
     client: &Arc<SyncClient>,
@@ -59,6 +59,35 @@ where
             reason = ?resync.reason,
             from_mutation_id = resync.from_mutation_id,
             "sent ResyncRequest to Origin"
+        );
+    }
+
+    let mut rejects = client.drain_row_push_rejects().await.into_iter();
+    while let Some(reject) = rejects.next() {
+        let Some(frame) = SyncFrame::try_encode(SyncMessageType::RowPushReject, &reject) else {
+            tracing::error!(
+                collection = %reject.collection,
+                document_id = %reject.document_id,
+                "failed to encode RowPushReject frame; Origin is not told about this refused row"
+            );
+            continue;
+        };
+        if let Err(e) = send_binary(sink, frame).await {
+            tracing::warn!(
+                collection = %reject.collection,
+                document_id = %reject.document_id,
+                error = %e,
+                "RowPushReject send failed; the unsent refusals are re-sent after reconnect"
+            );
+            client
+                .requeue_row_push_rejects(std::iter::once(reject).chain(rejects).collect())
+                .await;
+            return ControlFlow::Break(());
+        }
+        tracing::debug!(
+            collection = %reject.collection,
+            document_id = %reject.document_id,
+            "sent RowPushReject to Origin"
         );
     }
 

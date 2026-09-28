@@ -6,23 +6,26 @@
 use std::sync::Arc;
 
 use nodedb_types::Namespace;
-use nodedb_types::error::NodeDbResult;
 
 use crate::engine::vector::VectorState;
 use crate::engine::vector::graph::HnswIndex;
 use crate::engine::vector::sidecar;
+use crate::error::LiteError;
 use crate::nodedb::lock_ext::LockExt;
 use crate::storage::engine::StorageEngine;
 
 /// If `index_key` is not already in memory, load its HNSW checkpoint from
 /// storage and restore (or retrain) its codec sidecar.
 ///
-/// Called at the start of every search so cold collections are transparently
-/// promoted to hot without a full database restart.
-pub(super) async fn ensure_index_loaded<S: StorageEngine>(
+/// Reached through `resident::lock_resident` by every insert, search and
+/// delete, so a cold or evicted collection is promoted to hot without a
+/// restart. Publishing the index clears its eviction mark under the
+/// `hnsw_indices` lock, and so does giving up on an unloadable checkpoint.
+/// Fails when reading the checkpoint or the durable vectors fails.
+pub(crate) async fn ensure_index_loaded<S: StorageEngine>(
     vector_state: &Arc<VectorState<S>>,
     index_key: &str,
-) -> NodeDbResult<()> {
+) -> Result<(), LiteError> {
     let has_it = vector_state
         .hnsw_indices
         .lock_or_recover()
@@ -43,13 +46,16 @@ pub(super) async fn ensure_index_loaded<S: StorageEngine>(
         return Ok(());
     }
 
-    /// Record `index_key` as unloadable so later searches short-circuit.
+    /// Record `index_key` as unloadable so later searches short-circuit, and
+    /// clear its eviction mark: there is no index left to load back.
     macro_rules! give_up {
         () => {{
+            let _indices = vector_state.hnsw_indices.lock_or_recover();
             vector_state
                 .unloadable
                 .lock_or_recover()
                 .insert(index_key.to_string());
+            vector_state.evicted.lock_or_recover().remove(index_key);
             return Ok(());
         }};
     }
@@ -154,7 +160,8 @@ pub(super) async fn ensure_index_loaded<S: StorageEngine>(
                     }
                     index = rebuilt;
                 }
-                Ok(None) | Err(_) => {
+                Err(e) => return Err(e),
+                Ok(None) => {
                     // Nothing durable to rebuild from: publishing the
                     // vectorless checkpoint would score nodes that have no
                     // vector, so leave the collection unloaded instead — and
@@ -173,10 +180,11 @@ pub(super) async fn ensure_index_loaded<S: StorageEngine>(
     }
 
     tracing::info!(index_key, "lazy-loaded HNSW collection from storage");
-    vector_state
-        .hnsw_indices
-        .lock_or_recover()
-        .insert(index_key.to_string(), index);
+    {
+        let mut indices = vector_state.hnsw_indices.lock_or_recover();
+        indices.insert(index_key.to_string(), index);
+        vector_state.evicted.lock_or_recover().remove(index_key);
+    }
 
     // Try to restore a persisted sidecar. On failure, fall through to
     // ensure_sidecar which retrains from the live HNSW vectors.
@@ -263,7 +271,7 @@ mod tests {
     }
 
     /// The negative cache must not block a collection that later gains vectors:
-    /// an insert creates the index directly, and the load path short-circuits on
+    /// an insert creates the index, and the load path short-circuits on
     /// `hnsw_indices` before ever consulting `unloadable`.
     #[tokio::test]
     async fn a_later_insert_resolves_an_unloadable_collection() {
@@ -272,14 +280,11 @@ mod tests {
         state.unloadable.lock_or_recover().insert("late".into());
 
         {
-            let mut indices = state.hnsw_indices.lock_or_recover();
-            let idx = crate::engine::vector::state::ensure_hnsw(
-                &mut indices,
-                "late",
-                3,
-                nodedb_types::vector_dtype::VectorStorageDtype::F32,
-            );
-            idx.insert(vec![1.0, 2.0, 3.0]).unwrap();
+            let mut resident =
+                crate::engine::vector::resident::lock_resident_or_create(&state, "late", 3)
+                    .await
+                    .unwrap();
+            resident.index().insert(vec![1.0, 2.0, 3.0]).unwrap();
         }
 
         ensure_index_loaded(&state, "late").await.unwrap();

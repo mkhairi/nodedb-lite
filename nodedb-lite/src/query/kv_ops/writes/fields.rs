@@ -10,8 +10,12 @@ use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::{StorageEngine, WriteOp};
 
 use super::super::reads::{decode_value, encode_value, is_expired, kv_key};
+use super::row_merge::{TransferRows, compute_transfer, merge_field_updates};
 
-/// FieldSet: read-modify-write on named fields of a MessagePack map value.
+/// FieldSet: read-modify-write on named fields of a typed row.
+///
+/// The merge follows Origin's field-set rules: a raw single-`value` body is
+/// a `TypeMismatch`, and update values are standard MessagePack.
 ///
 /// `if_present` is the SQL `UPDATE` contract: an absent or expired key is
 /// `UPDATE 0` and no row is created. `false` is the RESP hash-set contract,
@@ -41,38 +45,24 @@ pub async fn kv_field_set<S: StorageEngine>(
             if is_expired(deadline) {
                 None
             } else {
-                let m: std::collections::HashMap<String, nodedb_types::value::Value> =
-                    zerompk::from_msgpack(user_bytes).map_err(|e| LiteError::Serialization {
-                        detail: format!("FieldSet: decode existing value: {e}"),
-                    })?;
-                Some((deadline, m))
+                Some((deadline, user_bytes.to_vec()))
             }
         }
     };
-    let (old_deadline, mut map) = match live {
-        Some(live) => live,
-        None if if_present => {
-            return Ok(QueryResult {
-                columns: vec![],
-                rows: vec![],
-                rows_affected: 0,
-                command: Some("UPDATE".into()),
-            });
-        }
-        None => (0u64, std::collections::HashMap::new()),
-    };
-
-    for (field, val_bytes) in field_updates {
-        let v: nodedb_types::value::Value =
-            zerompk::from_msgpack(val_bytes).map_err(|e| LiteError::Serialization {
-                detail: format!("FieldSet decode field '{field}': {e}"),
-            })?;
-        map.insert(field.clone(), v);
+    if if_present && live.is_none() {
+        return Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: 0,
+            command: Some("UPDATE".into()),
+        });
     }
-
-    let new_user_bytes = zerompk::to_msgpack_vec(&map).map_err(|e| LiteError::Serialization {
-        detail: format!("FieldSet encode: {e}"),
-    })?;
+    let old_deadline = live.as_ref().map_or(0, |(deadline, _)| *deadline);
+    let new_user_bytes = merge_field_updates(
+        collection,
+        live.as_ref().map(|(_, body)| body.as_slice()),
+        field_updates,
+    )?;
     let encoded = encode_value(old_deadline, &new_user_bytes);
     engine
         .storage
@@ -125,20 +115,6 @@ pub async fn kv_transfer<S: StorageEngine>(
         });
     }
 
-    let mut src_map: std::collections::HashMap<String, nodedb_types::value::Value> =
-        zerompk::from_msgpack(src_user_bytes).map_err(|e| LiteError::Serialization {
-            detail: format!("Transfer: decode source: {e}"),
-        })?;
-
-    let src_balance = extract_f64(&src_map, field)?;
-    if src_balance < amount {
-        return Err(LiteError::BadRequest {
-            detail: format!(
-                "Transfer: insufficient balance ({src_balance} < {amount}) in field '{field}'"
-            ),
-        });
-    }
-
     let dst_raw = engine
         .storage
         .get(Namespace::Kv, &dst_rkey)
@@ -146,41 +122,30 @@ pub async fn kv_transfer<S: StorageEngine>(
         .map_err(|e| LiteError::Storage {
             detail: e.to_string(),
         })?;
-
-    let (dst_deadline, mut dst_map) = match dst_raw {
-        None => (
-            0u64,
-            std::collections::HashMap::<String, nodedb_types::value::Value>::new(),
-        ),
+    let dst_live = match dst_raw {
+        None => None,
         Some(raw) => {
-            let (dl, user_bytes) = decode_value(&raw).ok_or_else(|| LiteError::Storage {
+            let (deadline, user_bytes) = decode_value(&raw).ok_or_else(|| LiteError::Storage {
                 detail: "corrupt KV entry: dest".into(),
             })?;
-            let m: std::collections::HashMap<String, nodedb_types::value::Value> =
-                zerompk::from_msgpack(user_bytes).map_err(|e| LiteError::Serialization {
-                    detail: format!("Transfer: decode destination value: {e}"),
-                })?;
-            (dl, m)
+            if is_expired(deadline) {
+                None
+            } else {
+                Some((deadline, user_bytes.to_vec()))
+            }
         }
     };
-
-    let dst_balance = extract_f64(&dst_map, field).unwrap_or(0.0);
-
-    src_map.insert(
-        field.to_string(),
-        nodedb_types::value::Value::Float(src_balance - amount),
-    );
-    dst_map.insert(
-        field.to_string(),
-        nodedb_types::value::Value::Float(dst_balance + amount),
-    );
-
-    let src_bytes = zerompk::to_msgpack_vec(&src_map).map_err(|e| LiteError::Serialization {
-        detail: format!("Transfer encode source: {e}"),
-    })?;
-    let dst_bytes = zerompk::to_msgpack_vec(&dst_map).map_err(|e| LiteError::Serialization {
-        detail: format!("Transfer encode dest: {e}"),
-    })?;
+    let dst_deadline = dst_live.as_ref().map_or(0, |(deadline, _)| *deadline);
+    let TransferRows {
+        source: src_bytes,
+        dest: dst_bytes,
+    } = compute_transfer(
+        collection,
+        src_user_bytes,
+        dst_live.as_ref().map(|(_, body)| body.as_slice()),
+        field,
+        amount,
+    )?;
 
     let ops = vec![
         WriteOp::Put {
@@ -273,20 +238,6 @@ pub async fn kv_transfer_item<S: StorageEngine>(
     })
 }
 
-fn extract_f64(
-    map: &std::collections::HashMap<String, nodedb_types::value::Value>,
-    field: &str,
-) -> Result<f64, LiteError> {
-    match map.get(field) {
-        Some(nodedb_types::value::Value::Float(f)) => Ok(*f),
-        Some(nodedb_types::value::Value::Integer(i)) => Ok(*i as f64),
-        Some(_) => Err(LiteError::BadRequest {
-            detail: format!("Transfer: field '{field}' is not numeric"),
-        }),
-        None => Ok(0.0),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,7 +245,7 @@ mod tests {
     use crate::query::kv_ops::reads::kv_get;
 
     fn update(field: &str, value: i64) -> (String, Vec<u8>) {
-        let bytes = zerompk::to_msgpack_vec(&nodedb_types::value::Value::Integer(value))
+        let bytes = nodedb_types::value_to_msgpack(&nodedb_types::value::Value::Integer(value))
             .expect("encode field");
         (field.to_string(), bytes)
     }
@@ -321,6 +272,25 @@ mod tests {
         assert_eq!(r.rows_affected, 1);
         let stored = kv_get(&engine, "kvfs", b"fresh", None).await.expect("get");
         assert_eq!(stored.rows.len(), 1);
+    }
+
+    /// SQL `UPDATE` on a raw single-`value` row is Origin's `TypeMismatch`,
+    /// and the row keeps its value.
+    #[tokio::test]
+    async fn field_set_on_a_raw_row_is_a_type_mismatch() {
+        let engine = test_engine().await;
+        crate::query::kv_ops::writes::kv_put(&engine, "kvfs", b"raw", b"first", 0)
+            .await
+            .expect("seed");
+        let err = kv_field_set(&engine, "kvfs", b"raw", &[update("value", 1)], true)
+            .await
+            .expect_err("a raw row is not a hash");
+        assert!(matches!(err, LiteError::TypeMismatch { .. }), "{err:?}");
+        let stored = kv_get(&engine, "kvfs", b"raw", None).await.expect("get");
+        assert_eq!(
+            stored.rows[0][1],
+            nodedb_types::value::Value::Bytes(b"first".to_vec())
+        );
     }
 
     #[tokio::test]

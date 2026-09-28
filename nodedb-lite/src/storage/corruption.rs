@@ -10,9 +10,9 @@
 //! makes, in advance, by name.
 //!
 //! Note that "does this store sync?" is not something the library can infer at
-//! open time. `LiteConfig::sync_enabled` governs whether KV writes flow through
-//! Loro, not whether an Origin has ever been reachable, and `start_sync` is
-//! called after open in any case. Treating either as consent to discard would
+//! open time. `LiteConfig::sync_enabled` governs whether writes record
+//! themselves for the push to Origin, not whether an Origin has ever been
+//! reachable, and `start_sync` is called after open in any case. Treating either as consent to discard would
 //! reintroduce exactly the silent decision this type exists to prevent.
 
 use serde::{Deserialize, Serialize};

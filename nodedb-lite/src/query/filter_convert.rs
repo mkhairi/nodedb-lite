@@ -70,10 +70,9 @@ impl LiteFilter {
 /// The only remaining `Err` paths are genuine client input errors:
 /// - `Range` payload atom with no bounds (malformed request)
 /// - Decimal literals that do not fit in `f64` (malformed request)
-/// - `SqlExpr` shapes that have no post-scan equivalent (`Subquery`,
-///   `Wildcard`, `InList`, `Between`, `Like`, `ArrayLiteral` — all of which
-///   are disallowed in a predicate context by the SQL planner before Lite
-///   receives the plan)
+/// - `SqlExpr` shapes with no evaluator form: a subquery or a wildcard.
+///   The planner hands `IN`, `BETWEEN` and `LIKE` over as `Expr`
+///   predicates, and `convert_sql_expr` lowers them.
 pub(crate) fn sql_filters_to_metadata(
     filters: &[Filter],
     payload_filters: &[SqlPayloadAtom],

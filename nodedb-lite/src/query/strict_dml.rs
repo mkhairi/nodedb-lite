@@ -16,7 +16,7 @@ use crate::error::LiteError;
 use crate::storage::engine::StorageEngine;
 
 use super::coerce::{build_row, coerce_sql_value, sql_value_to_string, sql_value_to_value};
-use super::engine::parse_pk_value;
+use super::engine_read::parse_pk_value;
 
 /// Insert rows into a strict collection.
 ///

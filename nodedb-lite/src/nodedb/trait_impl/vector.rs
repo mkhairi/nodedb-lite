@@ -10,9 +10,10 @@ use nodedb_types::document::Document;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 use nodedb_types::filter::MetadataFilter;
 use nodedb_types::result::SearchResult;
-use nodedb_types::vector_dtype::VectorStorageDtype;
 
-use crate::engine::vector::state::ensure_hnsw;
+use crate::engine::vector::resident::{
+    check_insert_widths, lock_resident, lock_resident_or_create,
+};
 use crate::nodedb::LockExt;
 use crate::nodedb::NodeDbLite;
 use crate::nodedb::convert::value_to_loro;
@@ -90,6 +91,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
             ));
         }
 
+        // A vector of another width than the collection's index, loaded back
+        // if it was evicted, is refused before its durable row is written.
+        check_insert_widths(&self.vector_state, collection, [embedding.len()])
+            .await
+            .map_err(NodeDbError::from)?;
+
         // Make the vector durable BEFORE it enters the in-memory index. The
         // durable row is the source of truth that the index and the pagedb
         // segment are both derived from, so it must never be the copy that is
@@ -104,19 +111,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         let internal_id = {
-            let dtype = {
-                let configs = self.vector_state.per_index_config.lock_or_recover();
-                configs
-                    .get(collection)
-                    .map(|cfg| cfg.storage_dtype)
-                    .unwrap_or(VectorStorageDtype::F32)
-            };
-            let mut indices = self.vector_state.hnsw_indices.lock_or_recover();
-            let index = ensure_hnsw(&mut indices, collection, embedding.len(), dtype);
+            let mut resident =
+                lock_resident_or_create(&self.vector_state, collection, embedding.len())
+                    .await
+                    .map_err(NodeDbError::from)?;
+            let index = resident.index();
             let id_before = index.len() as u32;
             index
                 .insert(embedding.to_vec())
-                .map_err(NodeDbError::bad_request)?;
+                .map_err(|e| NodeDbError::from(crate::error::LiteError::from(e)))?;
             id_before
         };
 
@@ -190,32 +193,32 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // one. Ordering also matters: if the process dies between the two, a
         // surviving durable row would come back, whereas a removed row simply
         // leaves the tombstoned slot to be rebuilt away.
-        if let Err(e) = crate::engine::vector::durable::remove(&*self.storage, collection, id).await
-        {
-            tracing::warn!(
-                collection,
-                id,
-                error = %e,
-                "removing durable vector failed; it may reappear if the index is rebuilt"
-            );
-        }
+        crate::engine::vector::durable::remove(&*self.storage, collection, id)
+            .await
+            .map_err(NodeDbError::from)?;
 
+        // The index, loaded back if it was evicted, takes the tombstone:
+        // an evicted index that missed it would bring the vector back.
         let internal_id = {
-            let id_map = self.vector_state.vector_id_map.lock_or_recover();
-            id_map
+            let mut indices = lock_resident(&self.vector_state, collection)
+                .await
+                .map_err(NodeDbError::from)?;
+            let prefix = format!("{collection}:");
+            let internal_id = self
+                .vector_state
+                .vector_id_map
+                .lock_or_recover()
                 .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
                 .find(|(_, (doc_id, _))| doc_id == id)
-                .map(|(_, (_, iid))| *iid)
+                .map(|(_, (_, iid))| *iid);
+            if let (Some(iid), Some(index)) = (internal_id, indices.get_mut(collection)) {
+                index.delete(iid);
+            }
+            internal_id
         };
 
         if let Some(iid) = internal_id {
-            {
-                let mut indices = self.vector_state.hnsw_indices.lock_or_recover();
-                if let Some(index) = indices.get_mut(collection) {
-                    index.delete(iid);
-                }
-            }
-
             // Remove the encoded entry from any installed sidecar so it
             // doesn't carry stale data after the HNSW slot is tombstoned.
             {
@@ -283,6 +286,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
             format!("{collection}:{field_name}")
         };
 
+        check_insert_widths(&self.vector_state, &index_key, [embedding.len()])
+            .await
+            .map_err(NodeDbError::from)?;
+
         // Durable row first — see `vector_insert_impl`. Keyed by `index_key` so
         // each named-vector sub-index rebuilds from its own rows.
         if !embedding.is_empty() {
@@ -294,19 +301,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         let internal_id = {
-            let dtype = {
-                let configs = self.vector_state.per_index_config.lock_or_recover();
-                configs
-                    .get(&index_key)
-                    .map(|cfg| cfg.storage_dtype)
-                    .unwrap_or(VectorStorageDtype::F32)
-            };
-            let mut indices = self.vector_state.hnsw_indices.lock_or_recover();
-            let index = ensure_hnsw(&mut indices, &index_key, embedding.len(), dtype);
+            let mut resident =
+                lock_resident_or_create(&self.vector_state, &index_key, embedding.len())
+                    .await
+                    .map_err(NodeDbError::from)?;
+            let index = resident.index();
             let id_before = index.len() as u32;
             index
                 .insert(embedding.to_vec())
-                .map_err(NodeDbError::bad_request)?;
+                .map_err(|e| NodeDbError::from(crate::error::LiteError::from(e)))?;
             id_before
         };
 

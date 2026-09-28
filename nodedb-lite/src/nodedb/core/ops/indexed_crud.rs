@@ -41,10 +41,17 @@ impl<S: StorageEngine> NodeDbLite<S> {
             &row_id,
             &schema.columns,
             values,
-            &self.vector_state.hnsw_indices,
             &self.spatial,
             &self.fts_state.manager,
         )?;
+        crate::engine::index_integration::index_row_vectors(
+            &self.vector_state,
+            collection,
+            &row_id,
+            &schema.columns,
+            values,
+        )
+        .await?;
 
         // Update secondary B-tree indexes on non-PK columns.
         {
@@ -78,15 +85,23 @@ impl<S: StorageEngine> NodeDbLite<S> {
             NodeDbError::storage(format!("strict collection '{collection}' not found"))
         })?;
 
-        let row_id = format!("{pk:?}");
+        // The same row id the insert indexed the row under.
+        let row_id = pk_value_to_string(pk);
 
-        // Remove text index entries before deleting the row.
+        // Remove text and vector index entries before deleting the row.
         crate::engine::index_integration::deindex_row_text(
             collection,
             &row_id,
             &schema.columns,
             &self.fts_state.manager,
         )?;
+        crate::engine::index_integration::deindex_row_vectors(
+            &self.vector_state,
+            collection,
+            &row_id,
+            &schema.columns,
+        )
+        .await?;
 
         // Replicate delete to materialized columnar views (HTAP CDC).
         self.htap.replicate_delete(collection, pk, &self.columnar);
@@ -98,7 +113,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
     }
 
     /// Insert a row into a columnar collection and update secondary indexes.
-    pub fn columnar_insert(
+    pub async fn columnar_insert(
         &self,
         collection: &str,
         values: &[nodedb_types::value::Value],
@@ -118,10 +133,17 @@ impl<S: StorageEngine> NodeDbLite<S> {
             &row_id,
             &schema.columns,
             values,
-            &self.vector_state.hnsw_indices,
             &self.spatial,
             &self.fts_state.manager,
         )?;
+        crate::engine::index_integration::index_row_vectors(
+            &self.vector_state,
+            collection,
+            &row_id,
+            &schema.columns,
+            values,
+        )
+        .await?;
 
         // Spatial profile: compute geohash for Point geometries and store
         // in the text index for prefix-based proximity queries.
@@ -196,19 +218,24 @@ fn pk_to_string(
     columns: &[nodedb_types::columnar::ColumnDef],
     values: &[nodedb_types::value::Value],
 ) -> String {
-    use nodedb_types::value::Value;
     let mut parts = Vec::new();
     for (i, col) in columns.iter().enumerate() {
         if col.primary_key
             && let Some(val) = values.get(i)
         {
-            match val {
-                Value::Integer(n) => parts.push(n.to_string()),
-                Value::String(s) => parts.push(s.clone()),
-                Value::Uuid(s) => parts.push(s.clone()),
-                other => parts.push(format!("{other:?}")),
-            }
+            parts.push(pk_value_to_string(val));
         }
     }
     parts.join(":")
+}
+
+/// The row-id text of one primary-key value.
+fn pk_value_to_string(val: &nodedb_types::value::Value) -> String {
+    use nodedb_types::value::Value;
+    match val {
+        Value::Integer(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Uuid(s) => s.clone(),
+        other => format!("{other:?}"),
+    }
 }

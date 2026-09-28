@@ -175,7 +175,7 @@ pub async fn kv_batch_get<S: StorageEngine>(
     })
 }
 
-/// FieldGet: extract named fields from a MessagePack-encoded value.
+/// FieldGet: extract named fields from a typed row.
 pub async fn kv_field_get<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
@@ -202,10 +202,12 @@ pub async fn kv_field_get<S: StorageEngine>(
         return Ok(QueryResult::empty());
     }
 
-    let map: std::collections::HashMap<String, nodedb_types::value::Value> =
-        zerompk::from_msgpack(user_bytes).map_err(|e| LiteError::Serialization {
-            detail: format!("FieldGet decode: {e}"),
-        })?;
+    // A raw body (the single-`value` form) is not a hash: Origin refuses
+    // `HGET` on it with the same `TypeMismatch`.
+    let map = super::body::decode_kv_map(user_bytes)?.ok_or_else(|| LiteError::TypeMismatch {
+        collection: collection.to_owned(),
+        detail: "key holds a bare value, not a hash".into(),
+    })?;
 
     let row: Vec<Value> = fields
         .iter()
@@ -233,16 +235,20 @@ pub async fn kv_scan<S: StorageEngine>(
     _surrogate_ceiling: Option<u32>,
 ) -> Result<QueryResult, LiteError> {
     let start = kv_key(collection, cursor);
+    // Every key of `collection` sorts below `{collection}\x01`, so the scan
+    // stops at the collection's end instead of reading later collections.
+    let mut end = collection.as_bytes().to_vec();
+    end.push(1);
     let entries = engine
         .storage
-        .scan_range(Namespace::Kv, &start, count + 1)
+        .scan_range_bounded(Namespace::Kv, Some(&start), Some(&end), Some(count))
         .await
         .map_err(|e| LiteError::Storage {
             detail: e.to_string(),
         })?;
 
     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(count.min(entries.len()));
-    for (composite_key, raw_value) in entries.iter().take(count) {
+    for (composite_key, raw_value) in &entries {
         let Some((coll, user_key_bytes)) = split_kv_key(composite_key) else {
             continue;
         };

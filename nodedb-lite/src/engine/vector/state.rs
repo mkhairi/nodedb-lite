@@ -12,8 +12,6 @@ use std::sync::{Arc, Mutex};
 
 use nodedb_mem::ScopedMemory;
 use nodedb_types::collection_config::VectorPrimaryConfig;
-use nodedb_types::hnsw::HnswParams;
-use nodedb_types::vector_dtype::VectorStorageDtype;
 use nodedb_vector::rerank::CodecSidecar;
 
 use crate::engine::vector::HnswIndex;
@@ -45,9 +43,15 @@ pub struct VectorState<S: StorageEngine> {
     ///
     /// This is a NEGATIVE cache for the load path only. It is not consulted once
     /// the collection is present in `hnsw_indices`, so a later insert (which
-    /// creates the index through `ensure_hnsw`) resolves the collection normally
-    /// without anything here needing to be cleared.
+    /// creates the index through `resident::lock_resident_or_create`) resolves
+    /// the collection normally without anything here needing to be cleared.
     pub(crate) unloadable: Mutex<HashSet<String>>,
+    /// Index keys eviction dropped from `hnsw_indices` after writing their
+    /// checkpoint. An index absent from memory and named here must be loaded
+    /// back before any use: creating an empty one in its place hides every
+    /// vector it held. The lazy loader clears the mark once it has loaded
+    /// the index or found it unloadable. Lock order: `hnsw_indices` first.
+    pub(crate) evicted: Mutex<HashSet<String>>,
     /// Memory scope for codec sidecar and rerank allocations owned by this state.
     pub(crate) memory: ScopedMemory,
 }
@@ -64,26 +68,6 @@ pub struct RestoredVectorState<S: StorageEngine> {
     pub memory: ScopedMemory,
 }
 
-/// Get or create the HNSW index for `index_key` with the given dimensionality and
-/// storage dtype. When the index already exists the `dtype` argument is ignored —
-/// dtype is fixed at index-creation time and cannot be changed in place.
-pub(crate) fn ensure_hnsw<'a>(
-    indices: &'a mut HashMap<String, HnswIndex>,
-    index_key: &str,
-    dim: usize,
-    dtype: VectorStorageDtype,
-) -> &'a mut HnswIndex {
-    indices.entry(index_key.to_string()).or_insert_with(|| {
-        HnswIndex::new(
-            dim,
-            HnswParams {
-                dtype,
-                ..HnswParams::default()
-            },
-        )
-    })
-}
-
 impl<S: StorageEngine> VectorState<S> {
     pub fn new(storage: Arc<S>, search_ef: usize, memory: ScopedMemory) -> Self {
         Self {
@@ -94,6 +78,7 @@ impl<S: StorageEngine> VectorState<S> {
             codec_sidecars: Arc::new(Mutex::new(HashMap::new())),
             per_index_config: Arc::new(Mutex::new(HashMap::new())),
             unloadable: Mutex::new(HashSet::new()),
+            evicted: Mutex::new(HashSet::new()),
             memory,
         }
     }
@@ -107,6 +92,7 @@ impl<S: StorageEngine> VectorState<S> {
             codec_sidecars: Arc::new(Mutex::new(HashMap::new())),
             per_index_config: Arc::new(Mutex::new(HashMap::new())),
             unloadable: Mutex::new(HashSet::new()),
+            evicted: Mutex::new(HashSet::new()),
             memory: restored.memory,
         }
     }
@@ -131,36 +117,6 @@ mod tests {
         assert!(
             configs.is_empty(),
             "per_index_config must be empty on construction"
-        );
-    }
-
-    #[test]
-    fn ensure_hnsw_creates_index_with_f32_default() {
-        let mut indices: HashMap<String, HnswIndex> = HashMap::new();
-        ensure_hnsw(&mut indices, "col", 4, VectorStorageDtype::F32);
-        let idx = indices.get("col").expect("index created");
-        assert_eq!(idx.params().dtype, VectorStorageDtype::F32);
-    }
-
-    #[test]
-    fn ensure_hnsw_creates_index_with_bf16() {
-        let mut indices: HashMap<String, HnswIndex> = HashMap::new();
-        ensure_hnsw(&mut indices, "col", 4, VectorStorageDtype::BF16);
-        let idx = indices.get("col").expect("index created");
-        assert_eq!(idx.params().dtype, VectorStorageDtype::BF16);
-    }
-
-    #[test]
-    fn ensure_hnsw_existing_index_ignores_dtype_arg() {
-        let mut indices: HashMap<String, HnswIndex> = HashMap::new();
-        ensure_hnsw(&mut indices, "col", 4, VectorStorageDtype::F32);
-        // Call again with BF16 — dtype is fixed at creation time, must not change.
-        ensure_hnsw(&mut indices, "col", 4, VectorStorageDtype::BF16);
-        let idx = indices.get("col").expect("index present");
-        assert_eq!(
-            idx.params().dtype,
-            VectorStorageDtype::F32,
-            "dtype must remain F32; dtype is fixed at index-creation time"
         );
     }
 }

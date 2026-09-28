@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Mutating `KvOp` arms: put/insert/delete/increment/CAS/transfer.
+//!
+//! Every arm runs its write through `kv_ops::sync_capture`, which records
+//! the rows it leaves for the sync push to Origin.
 
-use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
+use nodedb_physical::physical_plan::{KvCounterShape, ReturningSpec, UpdateValue};
 use nodedb_types::{QualifiedCollection, RlsWriteCheck};
 
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::kv_ops;
+use crate::query::kv_ops::sync_capture::{KvTouched, record_kv_write};
 use crate::storage::engine::StorageEngine;
 
 use super::super::LitePhysicalFut;
@@ -32,7 +36,9 @@ pub(super) fn put<'a, S: StorageEngine + 'a>(
     let k = key.to_vec();
     let v = value.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_put(engine, col.as_str(), &k, &v, ttl_ms).await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_put(engine, col.as_str(), &k, &v, ttl_ms);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -57,7 +63,9 @@ pub(super) fn insert<'a, S: StorageEngine + 'a>(
     let k = key.to_vec();
     let v = value.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_insert(engine, col.as_str(), &k, &v, ttl_ms).await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_insert(engine, col.as_str(), &k, &v, ttl_ms);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -82,7 +90,9 @@ pub(super) fn insert_if_absent<'a, S: StorageEngine + 'a>(
     let k = key.to_vec();
     let v = value.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_insert_if_absent(engine, col.as_str(), &k, &v, ttl_ms).await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_insert_if_absent(engine, col.as_str(), &k, &v, ttl_ms);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -115,8 +125,16 @@ pub(super) fn insert_on_conflict_update<'a, S: StorageEngine + 'a>(
     let ttl_ms = args.ttl_ms;
     let upd = args.updates.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_insert_on_conflict_update(engine, col.as_str(), &k, &v, ttl_ms, &upd)
-            .await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_insert_on_conflict_update(
+            engine,
+            col.as_str(),
+            &k,
+            &v,
+            ttl_ms,
+            &upd,
+        );
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -137,7 +155,12 @@ pub(super) fn delete<'a, S: StorageEngine + 'a>(
     let col = collection.clone();
     let ks = keys.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_delete(engine, col.as_str(), &ks).await
+        let touched = ks
+            .iter()
+            .map(|k| (col.as_str().to_owned(), k.clone()))
+            .collect();
+        let write = kv_ops::writes::kv_delete(engine, col.as_str(), &ks);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -160,7 +183,12 @@ pub(super) fn batch_put<'a, S: StorageEngine + 'a>(
     let col = collection.clone();
     let ents = entries.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_batch_put(engine, col.as_str(), &ents, ttl_ms).await
+        let touched = ents
+            .iter()
+            .map(|(k, _)| (col.as_str().to_owned(), k.clone()))
+            .collect();
+        let write = kv_ops::writes::kv_batch_put(engine, col.as_str(), &ents, ttl_ms);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -175,7 +203,9 @@ pub(super) fn expire<'a, S: StorageEngine + 'a>(
     let col = collection.clone();
     let k = key.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_expire(engine, col.as_str(), &k, ttl_ms).await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_expire(engine, col.as_str(), &k, ttl_ms);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -189,7 +219,9 @@ pub(super) fn persist<'a, S: StorageEngine + 'a>(
     let col = collection.clone();
     let k = key.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_persist(engine, col.as_str(), &k).await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_persist(engine, col.as_str(), &k);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -200,40 +232,52 @@ pub(super) fn truncate<'a, S: StorageEngine + 'a>(
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
     let col = collection.clone();
     Ok(Box::pin(async move {
-        let result = kv_ops::writes::kv_truncate(engine, col.as_str()).await?;
+        let result = kv_ops::sync_capture::truncate_recorded(engine, col.as_str()).await?;
         crate::query::truncate::restart_identity(engine, col.as_str(), restart_identity);
         Ok(result)
     }))
 }
 
+/// `KvOp::Incr`. `shape` names the row an absent key becomes, as on Origin.
 pub(super) fn incr<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     collection: &QualifiedCollection,
     key: &[u8],
     delta: i64,
     ttl_ms: u64,
+    shape: &KvCounterShape,
     rls_write_check: &RlsWriteCheck,
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
     deny_policy("KvOp::Incr", None, &[], rls_write_check)?;
     let col = collection.clone();
     let k = key.to_vec();
+    let shape = shape.clone();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_incr(engine, col.as_str(), &k, delta, ttl_ms).await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_incr(engine, col.as_str(), &k, delta, ttl_ms, &shape);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
+/// `KvOp::IncrFloat`. `delta` is the client's decimal text, added exactly to
+/// a raw body, as on Origin.
 pub(super) fn incr_float<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     collection: &QualifiedCollection,
     key: &[u8],
-    delta: f64,
+    delta: &str,
+    shape: &KvCounterShape,
     rls_write_check: &RlsWriteCheck,
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
     deny_policy("KvOp::IncrFloat", None, &[], rls_write_check)?;
     let col = collection.clone();
     let k = key.to_vec();
+    let delta = delta.to_owned();
+    let shape = shape.clone();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_incr_float(engine, col.as_str(), &k, delta).await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_incr_float(engine, col.as_str(), &k, &delta, &shape);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -251,7 +295,9 @@ pub(super) fn cas<'a, S: StorageEngine + 'a>(
     let exp = expected.to_vec();
     let nv = new_value.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_cas(engine, col.as_str(), &k, &exp, &nv).await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_cas(engine, col.as_str(), &k, &exp, &nv);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -268,7 +314,9 @@ pub(super) fn get_set<'a, S: StorageEngine + 'a>(
     let k = key.to_vec();
     let nv = new_value.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_get_set(engine, col.as_str(), &k, &nv).await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_get_set(engine, col.as_str(), &k, &nv);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -308,7 +356,9 @@ pub(super) fn field_set<'a, S: StorageEngine + 'a>(
     let k = key.to_vec();
     let upd = updates.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_field_set(engine, col.as_str(), &k, &upd, if_present).await
+        let touched = one(&col, &k);
+        let write = kv_ops::writes::kv_field_set(engine, col.as_str(), &k, &upd, if_present);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -327,7 +377,12 @@ pub(super) fn transfer<'a, S: StorageEngine + 'a>(
     let dst = dest_key.to_vec();
     let fld = field.to_owned();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_transfer(engine, col.as_str(), &src, &dst, &fld, amount).await
+        let touched = vec![
+            (col.as_str().to_owned(), src.clone()),
+            (col.as_str().to_owned(), dst.clone()),
+        ];
+        let write = kv_ops::writes::kv_transfer(engine, col.as_str(), &src, &dst, &fld, amount);
+        record_kv_write(engine, touched, write).await
     }))
 }
 
@@ -349,6 +404,17 @@ pub(super) fn transfer_item<'a, S: StorageEngine + 'a>(
     let ik = item_key.to_vec();
     let dk = dest_key.to_vec();
     Ok(Box::pin(async move {
-        kv_ops::writes::kv_transfer_item(engine, src_col.as_str(), dst_col.as_str(), &ik, &dk).await
+        let touched = vec![
+            (src_col.as_str().to_owned(), ik.clone()),
+            (dst_col.as_str().to_owned(), dk.clone()),
+        ];
+        let write =
+            kv_ops::writes::kv_transfer_item(engine, src_col.as_str(), dst_col.as_str(), &ik, &dk);
+        record_kv_write(engine, touched, write).await
     }))
+}
+
+/// The single key a point write touches.
+fn one(collection: &QualifiedCollection, key: &[u8]) -> Vec<KvTouched> {
+    vec![(collection.as_str().to_owned(), key.to_vec())]
 }

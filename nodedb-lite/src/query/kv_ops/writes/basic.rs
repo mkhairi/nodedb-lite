@@ -2,15 +2,13 @@
 //! Point writes for the KV engine: put, insert variants, delete, batch put,
 //! expire, persist, truncate.
 
-use std::collections::HashMap;
-
 use nodedb_physical::physical_plan::document::UpdateValue;
 use nodedb_types::Namespace;
 use nodedb_types::result::QueryResult;
-use nodedb_types::value::Value;
 
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
+use crate::query::kv_ops::body::{encode_kv_body, kv_body_columns};
 use crate::query::on_conflict::apply_patch;
 use crate::query::truncate::truncated;
 use crate::storage::engine::{StorageEngine, WriteOp};
@@ -124,9 +122,9 @@ pub async fn kv_insert_if_absent<S: StorageEngine>(
 /// field directly; an `Expr` (`n + 1`, `EXCLUDED.n`, ...) evaluates via
 /// `query::on_conflict::apply_patch` against the existing stored row, with
 /// `EXCLUDED.col` bound to `value` (the row that would have been inserted).
-/// A stored value that decodes to a non-object (the single-`value`-column
-/// plain KV row) has no named fields to merge onto, so it starts from an
-/// empty row — the same fallback Origin's `apply_on_conflict_updates` takes.
+/// The merge follows Origin's: a raw single-`value` row reads as
+/// `{"value": <text>}` and stays raw, so `SET value = EXCLUDED.value`
+/// overwrites it, and assigning any other column to it is a `BadRequest`.
 pub async fn kv_insert_on_conflict_update<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
@@ -159,23 +157,15 @@ pub async fn kv_insert_on_conflict_update<S: StorageEngine>(
         detail: "corrupt KV entry".into(),
     })?;
 
-    // A multi-column KV row is the zerompk map `encode_kv_value` writes, so
-    // it decodes as that map; the single-`value` raw form is not a map and
-    // reports a decode error, the same outcome the Origin handler has.
-    let mut map: HashMap<String, Value> =
-        zerompk::from_msgpack(old_user_bytes).map_err(|e| LiteError::Serialization {
-            detail: format!("InsertOnConflictUpdate: decode existing value: {e}"),
-        })?;
-    let excluded: HashMap<String, Value> =
-        zerompk::from_msgpack(value).map_err(|e| LiteError::Serialization {
-            detail: format!("InsertOnConflictUpdate: decode incoming value: {e}"),
-        })?;
+    // Origin's merge: both sides decode to rows (a raw body reads as
+    // `{"value": <text>}`), and the merged row re-encodes in the stored
+    // body's shape, so a raw row stays raw.
+    let (mut map, shape) = kv_body_columns(old_user_bytes)?;
+    let (excluded, _) = kv_body_columns(value)?;
 
     apply_patch(&mut map, updates, &excluded)?;
 
-    let new_user_bytes = zerompk::to_msgpack_vec(&map).map_err(|e| LiteError::Serialization {
-        detail: format!("encode updated KV value: {e}"),
-    })?;
+    let new_user_bytes = encode_kv_body(map, shape)?;
 
     let keep_deadline = if ttl_ms > 0 {
         crate::runtime::now_millis().saturating_add(ttl_ms)
@@ -427,20 +417,23 @@ pub async fn kv_truncate<S: StorageEngine>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use nodedb_query::expr::types::{BinaryOp, SqlExpr as QExpr};
+    use nodedb_types::value::Value;
 
     use super::*;
     use crate::query::engine::test_engine;
     use crate::query::kv_ops::reads::kv_get;
 
-    /// Encode a `{field: value}` map, the shape `encode_kv_value` produces
-    /// for a multi-column KV row.
+    /// Encode a `{field: value}` map body, the body a multi-column KV row
+    /// stores.
     fn row_bytes(fields: &[(&str, i64)]) -> Vec<u8> {
         let map: HashMap<String, Value> = fields
             .iter()
             .map(|(k, v)| (k.to_string(), Value::Integer(*v)))
             .collect();
-        zerompk::to_msgpack_vec(&map).expect("encode row")
+        crate::query::kv_ops::body::encode_kv_map(map).expect("encode row")
     }
 
     fn literal(n: i64) -> UpdateValue {
@@ -453,7 +446,9 @@ mod tests {
         let Value::Bytes(bytes) = &r.rows[0][1] else {
             panic!("kv_get value column is not bytes");
         };
-        let map: HashMap<String, Value> = zerompk::from_msgpack(bytes).expect("decode row");
+        let map = crate::query::kv_ops::body::decode_kv_map(bytes)
+            .expect("decode row")
+            .expect("map body");
         match map.get("n") {
             Some(Value::Integer(n)) => *n,
             other => panic!("expected integer 'n', got {other:?}"),
@@ -546,6 +541,36 @@ mod tests {
         .expect("insert");
         assert_eq!(r.rows_affected, 1);
         assert_eq!(stored_n(&engine, b"missing").await, 7);
+    }
+
+    #[tokio::test]
+    async fn a_raw_row_overwritten_from_excluded_stays_raw() {
+        let engine = test_engine().await;
+        kv_put(&engine, "kvoc", b"r", b"first", 0)
+            .await
+            .expect("seed");
+        let updates = vec![(
+            "value".to_string(),
+            UpdateValue::Expr(QExpr::ExcludedColumn("value".to_string())),
+        )];
+        kv_insert_on_conflict_update(&engine, "kvoc", b"r", b"second", 0, &updates)
+            .await
+            .expect("on conflict update");
+        let r = kv_get(&engine, "kvoc", b"r", None).await.expect("get");
+        assert_eq!(r.rows[0][1], Value::Bytes(b"second".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_raw_row_refuses_a_typed_column_assignment() {
+        let engine = test_engine().await;
+        kv_put(&engine, "kvoc", b"r2", b"first", 0)
+            .await
+            .expect("seed");
+        let updates = vec![("n".to_string(), literal(1))];
+        let err = kv_insert_on_conflict_update(&engine, "kvoc", b"r2", b"second", 0, &updates)
+            .await
+            .expect_err("a raw row cannot grow a typed column");
+        assert!(matches!(err, LiteError::BadRequest { .. }), "{err:?}");
     }
 
     #[tokio::test]

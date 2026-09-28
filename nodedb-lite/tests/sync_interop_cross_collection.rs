@@ -166,13 +166,12 @@ async fn documents_only_replicate_to_origin() {
 }
 
 /// Variant B of the original report: each `document_put` into `probe` is
-/// followed by a write to the unrelated `signals` collection. `signals` is
-/// written through the KV deferred path (`kv_put` + `kv_flush`) exactly as
-/// the original report did, because KV writes go through the same
-/// CRDT-backed deferred-delta path as documents — the shape that let a write
-/// to one collection affect the causal completeness Origin computed for
-/// another. Before the fix this returned 1 instead of 3; this is the
-/// regression guard.
+/// followed by a write to the unrelated `signals` collection, written with
+/// `kv_put` + `kv_flush` as the original report did. A KV write reaches
+/// Origin as a `KvPush` on its own stream, not as a CRDT delta. The variant
+/// guards that a write to another collection, sent between two `probe`
+/// deltas, does not leave `probe`'s deltas causally incomplete on Origin.
+/// The original defect returned 1 row instead of 3.
 #[tokio::test]
 async fn interleaved_second_collection_writes_still_replicate() {
     let Some((_origin, pg, lite, _sync)) = setup_probe().await else {
@@ -188,9 +187,8 @@ async fn interleaved_second_collection_writes_still_replicate() {
             .unwrap_or_else(|e| panic!("Lite document_put {id}: {e}"));
 
         // The trigger: a write to a completely different collection, landed
-        // between two `probe` writes. `kv_flush` forces it out immediately
-        // instead of waiting for the KV auto-flush threshold, so the
-        // interleaving is deterministic rather than timing-dependent.
+        // between two `probe` writes. `kv_flush` commits it locally at once
+        // instead of at the KV auto-flush threshold.
         let entry_id = format!("signal-{i}");
         lite.kv_put(SIGNALS, &entry_id, entry_id.as_bytes())
             .await

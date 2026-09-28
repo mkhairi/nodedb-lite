@@ -5,7 +5,7 @@
 use nodedb_sql::types::{EngineType, SqlValue, WriteRoute};
 use nodedb_types::result::QueryResult;
 
-use super::engine::{LiteQueryEngine, sql_value_to_loro, sql_value_to_string};
+use super::engine::{LiteQueryEngine, sql_value_to_string};
 use crate::error::LiteError;
 use crate::storage::engine::StorageEngine;
 
@@ -149,5 +149,15 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             rows_affected: affected,
             command: Some("DELETE".into()),
         })
+    }
+}
+fn sql_value_to_loro(v: &SqlValue) -> loro::LoroValue {
+    match v {
+        SqlValue::Int(i) => loro::LoroValue::I64(*i),
+        SqlValue::Float(f) => loro::LoroValue::Double(*f),
+        SqlValue::String(s) => loro::LoroValue::String(s.clone().into()),
+        SqlValue::Bool(b) => loro::LoroValue::Bool(*b),
+        SqlValue::Null => loro::LoroValue::Null,
+        _ => loro::LoroValue::Null,
     }
 }

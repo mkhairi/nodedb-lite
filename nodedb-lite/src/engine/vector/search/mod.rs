@@ -3,7 +3,7 @@
 //! Free-function vector search callable from both `NodeDbLite` and
 //! `LiteDataPlaneVisitor` without depending on either concrete type.
 
-mod lazy_load;
+pub(crate) mod lazy_load;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,9 @@ where
         })?;
 
     if let Some(codec_name) = rerank_codec {
+        // The sidecar trains on the index, so a cold or evicted one is loaded
+        // first.
+        lazy_load::ensure_index_loaded(vector_state, index_key).await?;
         install_sidecar_for_index(vector_state, index_key, codec_name)?;
     }
 
@@ -110,14 +113,15 @@ where
         .or(ef_search_caller)
         .unwrap_or(scaled_ef);
 
-    // ── Lazy-load HNSW from storage (+ sidecar restore) ──────────────────────
+    // ── Resident HNSW: loaded from storage when cold or evicted ──────────────
 
-    lazy_load::ensure_index_loaded(vector_state, index_key).await?;
-
-    let indices = vector_state.hnsw_indices.lock_or_recover();
+    let indices = crate::engine::vector::resident::lock_resident(vector_state, index_key).await?;
     let Some(index) = indices.get(index_key) else {
         return Ok(Vec::new());
     };
+    // The index width is fixed even while it holds no vector, so a query of
+    // another width fails before any shortcut returns an empty result.
+    nodedb_vector::error::check_dim(index.dim(), query.len()).map_err(LiteError::from)?;
 
     // Metric override: when `metric` differs from `index.metric()`, the coarse
     // HNSW traversal still uses the index's baked metric (graph topology is
@@ -146,7 +150,7 @@ where
 
     // ── Coarse HNSW search ────────────────────────────────────────────────────
 
-    let raw_results = if let Some(f) = filter
+    let searched = if let Some(f) = filter
         && collection_size <= 10_000
     {
         let mut allowed = roaring::RoaringBitmap::new();
@@ -180,6 +184,7 @@ where
     } else {
         index.search(query, fetch_k, ef_search)
     };
+    let raw_results = searched.map_err(LiteError::from)?;
 
     // ── Shared rerank (FP32 exact distance, Matryoshka-truncation aware) ──────
 

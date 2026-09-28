@@ -28,7 +28,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         self.query_engine
             .execute_sql_with_params(query, params)
             .await
-            .map_err(NodeDbError::storage)
+            .map_err(NodeDbError::from)
     }
 
     /// Run a BM25 text query against the in-memory FTS index for `collection`

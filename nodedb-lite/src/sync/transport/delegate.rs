@@ -9,6 +9,7 @@
 use crate::engine::crdt::engine::PendingDelta;
 use crate::sync::outbound::columnar::PendingColumnarBatch;
 use crate::sync::outbound::fts::{PendingFtsDelete, PendingFtsIndex};
+use crate::sync::outbound::kv::PendingKvWrite;
 use crate::sync::outbound::spatial::{PendingSpatialDelete, PendingSpatialInsert};
 use crate::sync::outbound::timeseries::PendingTimeseriesBatch;
 use crate::sync::outbound::vector::{PendingVectorDelete, PendingVectorInsert};
@@ -79,10 +80,17 @@ pub trait SyncDelegate: Send + Sync + 'static {
     /// policies and alerts — carrying the row's full post-image (or, for a
     /// delete, an empty payload and [`RowOp::Delete`]).
     ///
+    /// A KV collection's post-image is the `{key, value…}` row every KV read
+    /// returns. A payload that is not a row map is a serialization error,
+    /// and nothing is applied.
+    ///
     /// Async because applying the row writes through to local storage.
     ///
     /// [`RowOp::Delete`]: nodedb_types::sync::wire::RowOp::Delete
-    async fn apply_remote_row(&self, msg: &nodedb_types::sync::wire::RowPushMsg);
+    async fn apply_remote_row(
+        &self,
+        msg: &nodedb_types::sync::wire::RowPushMsg,
+    ) -> Result<(), nodedb_types::error::NodeDbError>;
     /// Import a definition sync message (function/trigger/procedure) from Origin.
     /// Async because persisting the definition to storage involves
     /// KV store writes through `spawn_blocking`.
@@ -223,6 +231,27 @@ pub trait SyncDelegate: Send + Sync + 'static {
     async fn ack_timeseries_batch_by_id(&self, batch_id: u64);
     /// Delete the durable entry directly (for empty/un-encodable batches).
     async fn acknowledge_timeseries_batch(&self, durable_key: Vec<u8>);
+
+    // ── KV ───────────────────────────────────────────────────────────────────
+    /// Up to `PUSH_DRAIN_LIMIT` pending KV writes in queue order, skipping
+    /// the ones in flight. Returns `(durable_key, write)` pairs.
+    async fn pending_kv_writes(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, PendingKvWrite)>, crate::error::LiteError>;
+    /// Persist the seq assigned to the KV write stored under `key`.
+    ///
+    /// Called before the frame is sent. On an error the caller does not
+    /// send, and the write waits for the next tick.
+    async fn persist_kv_write_seq(
+        &self,
+        key: &[u8],
+        write: &PendingKvWrite,
+    ) -> Result<(), crate::error::LiteError>;
+    /// Record that the KV write with `batch_id` was sent and awaits its ack.
+    async fn mark_kv_write_in_flight(&self, batch_id: u64);
+    /// Retire the KV write with `batch_id` after Origin's final answer:
+    /// forget it is in flight and delete its durable entry.
+    async fn retire_kv_write(&self, batch_id: u64) -> Result<(), crate::error::LiteError>;
 
     // ── Stable seq persistence ────────────────────────────────────────────────
 

@@ -144,9 +144,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
         embedding: &[f32],
     ) -> NodeDbResult<()> {
         use crate::engine::crdt::engine::CrdtBatchOp;
+        use crate::engine::vector::resident::{check_insert_widths, lock_resident_or_create};
         use crate::engine::vector::sidecar;
-        use crate::engine::vector::state::ensure_hnsw;
-        use nodedb_types::vector_dtype::VectorStorageDtype;
 
         let doc_id = if doc.id.is_empty() {
             nodedb_types::id_gen::uuid_v7()
@@ -217,6 +216,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // Written BEFORE the in-memory index below so the durable row can
         // never be the thing that is missing after a crash.
         if !embedding.is_empty() {
+            // A vector of another width than the loaded index is refused
+            // before its durable row is written.
+            check_insert_widths(&self.vector_state, vector_collection, [embedding.len()])
+                .await
+                .map_err(NodeDbError::from)?;
             let op = crate::engine::vector::durable::put_op(vector_collection, id, embedding);
             self.storage
                 .batch_write(std::slice::from_ref(&op))
@@ -230,19 +234,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // HNSW insert (no CRDT lock needed — vector_state uses its own locks).
         if !embedding.is_empty() {
             let internal_id = {
-                let dtype = {
-                    let configs = self.vector_state.per_index_config.lock_or_recover();
-                    configs
-                        .get(vector_collection)
-                        .map(|cfg| cfg.storage_dtype)
-                        .unwrap_or(VectorStorageDtype::F32)
-                };
-                let mut indices = self.vector_state.hnsw_indices.lock_or_recover();
-                let index = ensure_hnsw(&mut indices, vector_collection, embedding.len(), dtype);
+                let mut resident =
+                    lock_resident_or_create(&self.vector_state, vector_collection, embedding.len())
+                        .await
+                        .map_err(NodeDbError::from)?;
+                let index = resident.index();
                 let id_before = index.len() as u32;
                 index
                     .insert(embedding.to_vec())
-                    .map_err(NodeDbError::bad_request)?;
+                    .map_err(|e| NodeDbError::from(crate::error::LiteError::from(e)))?;
                 id_before
             };
 

@@ -83,6 +83,9 @@ pub(in crate::sync::transport) async fn delta_push_loop<S>(
         {
             return;
         }
+        if super::kv::push(client, delegate, sink).await.is_break() {
+            return;
+        }
         if super::control::push_collection_schemas(client, delegate, sink)
             .await
             .is_break()

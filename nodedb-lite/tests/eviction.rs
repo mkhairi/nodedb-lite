@@ -155,3 +155,73 @@ async fn startup_loads_only_persisted_collections() {
         );
     }
 }
+
+/// The ids a wide search of `collection` returns, sorted.
+async fn all_ids(db: &NodeDbLite<PagedbStorageMem>, collection: &str) -> Vec<String> {
+    let mut ids: Vec<String> = db
+        .vector_search(collection, &[1.0, 1.0, 0.0], 10, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// An insert into an evicted collection loads it back first, so the vectors
+/// it held stay searchable beside the new one.
+#[tokio::test]
+async fn insert_into_an_evicted_collection_keeps_its_vectors() {
+    let db = open_db_with_budget(100 * 1024 * 1024).await;
+    db.vector_insert("evict_ins", "old", &[1.0, 0.0, 0.0], None)
+        .await
+        .unwrap();
+    assert_eq!(db.evict_collections(1).await.unwrap(), 1);
+    assert!(db.loaded_collections().unwrap().is_empty());
+
+    db.vector_insert("evict_ins", "new", &[0.0, 1.0, 0.0], None)
+        .await
+        .unwrap();
+
+    assert_eq!(all_ids(&db, "evict_ins").await, vec!["new", "old"]);
+    let nearest = db
+        .vector_search("evict_ins", &[1.0, 0.0, 0.0], 1, None, None)
+        .await
+        .unwrap();
+    assert_eq!(nearest[0].id, "old");
+}
+
+/// A delete from an evicted collection loads it back first, so the deleted
+/// vector does not return with the stored index.
+#[tokio::test]
+async fn delete_from_an_evicted_collection_stays_deleted() {
+    let db = open_db_with_budget(100 * 1024 * 1024).await;
+    db.vector_insert("evict_del", "gone", &[1.0, 0.0, 0.0], None)
+        .await
+        .unwrap();
+    db.vector_insert("evict_del", "kept", &[0.0, 1.0, 0.0], None)
+        .await
+        .unwrap();
+    assert_eq!(db.evict_collections(1).await.unwrap(), 1);
+
+    db.vector_delete("evict_del", "gone").await.unwrap();
+
+    assert_eq!(all_ids(&db, "evict_del").await, vec!["kept"]);
+}
+
+/// A batch insert into an evicted collection loads it back first too.
+#[tokio::test]
+async fn batch_insert_into_an_evicted_collection_keeps_its_vectors() {
+    let db = open_db_with_budget(100 * 1024 * 1024).await;
+    db.batch_vector_insert("evict_batch", &[("old", &[1.0_f32, 0.0, 0.0][..])])
+        .await
+        .unwrap();
+    assert_eq!(db.evict_collections(1).await.unwrap(), 1);
+
+    db.batch_vector_insert("evict_batch", &[("new", &[0.0_f32, 1.0, 0.0][..])])
+        .await
+        .unwrap();
+
+    assert_eq!(all_ids(&db, "evict_batch").await, vec!["new", "old"]);
+}

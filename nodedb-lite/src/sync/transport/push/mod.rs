@@ -9,6 +9,7 @@ mod columnar;
 // schema-before-delta ordering test; not part of the public API.
 pub(in crate::sync::transport) mod control;
 mod fts;
+mod kv;
 mod loops;
 mod send;
 mod spatial;

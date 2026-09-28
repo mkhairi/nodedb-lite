@@ -80,14 +80,12 @@ pub struct LiteConfig {
     #[serde(default = "default_sparse_percent")]
     pub sparse_percent: usize,
 
-    /// Enable CRDT sync for KV operations. Default: `true`.
+    /// Open the durable outbound sync queues. Default: `true`.
     ///
-    /// When `false`, KV operations go directly to the B+ tree, bypassing
-    /// Loro entirely. This gives SQLite-class performance for local-only use.
-    /// Other engines (vector, graph, document) still use Loro for their storage.
-    ///
-    /// When `true`, KV writes also generate sync log entries (append-only)
-    /// for replication to Origin via LWW merge.
+    /// When `true`, KV, columnar, timeseries, vector, FTS and spatial writes
+    /// record themselves in their outbound queue, and the push loop sends
+    /// them to Origin. When `false`, those writes stay local. Documents sync
+    /// through Loro either way.
     #[serde(default = "default_sync_enabled")]
     pub sync_enabled: bool,
 

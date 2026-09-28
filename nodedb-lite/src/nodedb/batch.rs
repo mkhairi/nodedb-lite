@@ -2,9 +2,8 @@
 
 use nodedb_types::Namespace;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
-use nodedb_types::vector_dtype::VectorStorageDtype;
 
-use crate::engine::vector::state::ensure_hnsw;
+use crate::engine::vector::resident::{check_insert_widths, lock_resident_or_create};
 
 use super::{LockExt, NodeDbLite};
 use crate::storage::engine::StorageEngine;
@@ -36,6 +35,17 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         let dim = vectors[0].1.len();
 
+        // Every vector must fit the collection's index, loaded back if it was
+        // evicted, or the batch's first vector when there is none; a refusal
+        // writes nothing.
+        check_insert_widths(
+            &self.vector_state,
+            collection,
+            vectors.iter().map(|(_, e)| e.len()),
+        )
+        .await
+        .map_err(NodeDbError::from)?;
+
         // Durable rows first, in ONE batch write. They are the source of truth
         // the in-memory index and the pagedb segment are both derived from: a
         // flush that finds no durable row for a collection writes no segment for
@@ -57,22 +67,17 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         {
-            let dtype = {
-                let configs = self.vector_state.per_index_config.lock_or_recover();
-                configs
-                    .get(collection)
-                    .map(|cfg| cfg.storage_dtype)
-                    .unwrap_or(VectorStorageDtype::F32)
-            };
-            let mut indices = self.vector_state.hnsw_indices.lock_or_recover();
-            let index = ensure_hnsw(&mut indices, collection, dim, dtype);
+            let mut resident = lock_resident_or_create(&self.vector_state, collection, dim)
+                .await
+                .map_err(NodeDbError::from)?;
+            let index = resident.index();
             let mut id_map = self.vector_state.vector_id_map.lock_or_recover();
 
             for &(id, embedding) in vectors {
                 let internal_id = index.len() as u32;
                 index
                     .insert(embedding.to_vec())
-                    .map_err(NodeDbError::bad_request)?;
+                    .map_err(|e| NodeDbError::from(crate::error::LiteError::from(e)))?;
                 id_map.insert(
                     format!("{collection}:{internal_id}"),
                     (id.to_string(), internal_id),
@@ -196,33 +201,41 @@ impl<S: StorageEngine> NodeDbLite<S> {
             // vector slots whenever it was itself restored from a graph-only
             // checkpoint.
             // Otherwise: full checkpoint blob (WASM and non-pagedb native backends).
+            //
+            // `snapshot` is the index's (node count, tombstone count) at the
+            // checkpoint. A write between the checkpoint and the removal
+            // changes it, and the index then stays resident: dropping it would
+            // lose that write from the stored copy.
             #[cfg(not(target_arch = "wasm32"))]
-            let (blob, write_segment) = {
+            let (blob, write_segment, snapshot) = {
                 let indices = self.vector_state.hnsw_indices.lock_or_recover();
                 match indices.get(&name) {
                     Some(idx) => {
+                        let snapshot = (idx.len(), idx.tombstone_count());
                         if seg_ext.is_some() {
                             let graph_bytes = idx.graph_checkpoint_to_bytes().map_err(|e| {
                                 NodeDbError::serialization("hnsw-graph-checkpoint", e)
                             })?;
-                            (graph_bytes, true)
+                            (graph_bytes, true, snapshot)
                         } else {
                             let blob = idx
                                 .checkpoint_to_bytes()
                                 .map_err(|e| NodeDbError::serialization("hnsw-checkpoint", e))?;
-                            (blob, false)
+                            (blob, false, snapshot)
                         }
                     }
                     None => continue,
                 }
             };
             #[cfg(target_arch = "wasm32")]
-            let blob = {
+            let (blob, snapshot) = {
                 let indices = self.vector_state.hnsw_indices.lock_or_recover();
                 match indices.get(&name) {
-                    Some(idx) => idx
-                        .checkpoint_to_bytes()
-                        .map_err(|e| NodeDbError::serialization("hnsw-checkpoint", e))?,
+                    Some(idx) => (
+                        idx.checkpoint_to_bytes()
+                            .map_err(|e| NodeDbError::serialization("hnsw-checkpoint", e))?,
+                        (idx.len(), idx.tombstone_count()),
+                    ),
                     None => continue,
                 }
             };
@@ -266,8 +279,26 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 }
             }
 
+            // Mark and drop under one lock, so a loader never sees the index
+            // gone without the mark. The stored checkpoint is valid, so an
+            // earlier unloadable verdict no longer holds.
             {
                 let mut indices = self.vector_state.hnsw_indices.lock_or_recover();
+                let unchanged = indices
+                    .get(&name)
+                    .is_some_and(|idx| (idx.len(), idx.tombstone_count()) == snapshot);
+                if !unchanged {
+                    tracing::debug!(
+                        collection = %name,
+                        "HNSW collection changed during eviction; kept in memory"
+                    );
+                    continue;
+                }
+                self.vector_state
+                    .evicted
+                    .lock_or_recover()
+                    .insert(name.clone());
+                self.vector_state.unloadable.lock_or_recover().remove(&name);
                 indices.remove(&name);
             }
 

@@ -24,6 +24,7 @@ pub(super) struct OutboundQueues<S: StorageEngine> {
     pub(super) fts_outbound: Option<Arc<crate::sync::FtsOutbound<S>>>,
     pub(super) spatial_outbound: Option<Arc<crate::sync::SpatialOutbound<S>>>,
     pub(super) timeseries_outbound: Option<Arc<crate::sync::TimeseriesOutbound<S>>>,
+    pub(super) kv_outbound: Option<Arc<crate::sync::KvOutbound<S>>>,
 }
 
 /// Array CRDT sync state: send path (outbound), receive path (inbound), and
@@ -114,12 +115,24 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 None
             };
 
+        let kv_outbound: Option<Arc<crate::sync::KvOutbound<S>>> = if sync_enabled {
+            let q = Arc::new(
+                crate::sync::KvOutbound::open_with_cap(Arc::clone(storage), outbound_queue_cap)
+                    .await
+                    .map_err(|e| NodeDbError::storage(format!("kv outbound open: {e}")))?,
+            );
+            Some(q)
+        } else {
+            None
+        };
+
         Ok(OutboundQueues {
             columnar_outbound,
             vector_outbound,
             fts_outbound: fts_outbound_init,
             spatial_outbound: spatial_outbound_init,
             timeseries_outbound: timeseries_outbound_init,
+            kv_outbound,
         })
     }
 

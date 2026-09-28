@@ -66,13 +66,15 @@ pub(super) fn lower_point_get<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     collection: &str,
     engine_type: EngineType,
+    key_column: &str,
     key_value: &SqlValue,
 ) -> Result<LiteFut<'a>, LiteError> {
     let collection = collection.to_string();
+    let key_column = key_column.to_string();
     let key_value = key_value.clone();
     Ok(Box::pin(async move {
         engine
-            .execute_point_get(&collection, &engine_type, &key_value)
+            .execute_point_get(&collection, &engine_type, &key_column, &key_value)
             .await
     }))
 }

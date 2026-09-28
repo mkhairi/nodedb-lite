@@ -1,13 +1,9 @@
 //! KV collection operations for Lite.
 //!
-//! Two modes based on `sync_enabled`:
-//!
-//! - **sync off**: direct KV store via `Namespace::Kv`. No Loro, no CRDT,
-//!   no delta tracking. Same performance class as SQLite.
-//!
-//! - **sync on**: writes go to the KV store (source of truth) AND Loro CRDT
-//!   (for delta tracking). Reads always come from the KV store. Sync log
-//!   entries are generated for LWW replication to Origin.
+//! Reads and writes go to the KV store in `Namespace::Kv`. KV never touches
+//! Loro. With sync on, every put and delete is also recorded in the KV
+//! outbound queue before it applies locally, and the push loop sends it to
+//! Origin. See `kv_sync`.
 //!
 //! Writes are buffered in memory and flushed as a single KV transaction
 //! on `kv_flush()` or when the buffer exceeds `KV_FLUSH_THRESHOLD`. An
@@ -27,17 +23,14 @@ use nodedb_types::error::{NodeDbError, NodeDbResult};
 use super::super::{LockExt, NodeDbLite};
 use crate::storage::engine::{StorageEngine, WriteOp};
 
-/// Prefix for KV collection names in the CRDT namespace.
-const KV_CRDT_PREFIX: &str = "_kv_";
-
 /// Flush the write buffer when it reaches this many operations.
-const KV_FLUSH_THRESHOLD: usize = 1024;
+pub(super) const KV_FLUSH_THRESHOLD: usize = 1024;
 
 /// Size of the deadline prefix in bytes (u64 LE).
 const DEADLINE_PREFIX_LEN: usize = 8;
 
 /// Build the composite KV key: `{collection}\0{key}`.
-fn kv_key(collection: &str, key: &[u8]) -> Vec<u8> {
+pub(super) fn kv_key(collection: &str, key: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(collection.len() + 1 + key.len());
     k.extend_from_slice(collection.as_bytes());
     k.push(0);
@@ -46,7 +39,7 @@ fn kv_key(collection: &str, key: &[u8]) -> Vec<u8> {
 }
 
 /// Extract `(collection, key_bytes)` from a composite KV key.
-fn split_kv_key(composite: &[u8]) -> Option<(&str, &[u8])> {
+pub(super) fn split_kv_key(composite: &[u8]) -> Option<(&str, &[u8])> {
     let sep = composite.iter().position(|&b| b == 0)?;
     let coll = std::str::from_utf8(&composite[..sep]).ok()?;
     let key = &composite[sep + 1..];
@@ -56,7 +49,7 @@ fn split_kv_key(composite: &[u8]) -> Option<(&str, &[u8])> {
 /// Encode a value with a deadline prefix.
 ///
 /// `deadline_ms = 0` encodes as "no expiry".
-fn encode_value(deadline_ms: u64, value: &[u8]) -> Vec<u8> {
+pub(super) fn encode_value(deadline_ms: u64, value: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(DEADLINE_PREFIX_LEN + value.len());
     encoded.extend_from_slice(&deadline_ms.to_le_bytes());
     encoded.extend_from_slice(value);
@@ -66,7 +59,7 @@ fn encode_value(deadline_ms: u64, value: &[u8]) -> Vec<u8> {
 /// Decode a stored value into `(deadline_ms, user_bytes)`.
 ///
 /// Returns `None` if the stored bytes are too short (corrupt entry).
-fn decode_value(stored: &[u8]) -> Option<(u64, &[u8])> {
+pub(super) fn decode_value(stored: &[u8]) -> Option<(u64, &[u8])> {
     if stored.len() < DEADLINE_PREFIX_LEN {
         return None;
     }
@@ -77,7 +70,7 @@ fn decode_value(stored: &[u8]) -> Option<(u64, &[u8])> {
 /// Return `true` if the deadline has passed (key is expired).
 ///
 /// A deadline of `0` means no expiry and is never considered expired.
-fn is_expired(deadline_ms: u64) -> bool {
+pub(super) fn is_expired(deadline_ms: u64) -> bool {
     deadline_ms != 0 && crate::runtime::now_millis() >= deadline_ms
 }
 
@@ -107,6 +100,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
     }
 
     /// Internal: write a key with an explicit deadline (0 = no expiry).
+    ///
+    /// The write is recorded for sync before it applies, under the
+    /// write-order lock.
     async fn kv_put_with_deadline(
         &self,
         collection: &str,
@@ -114,14 +110,35 @@ impl<S: StorageEngine> NodeDbLite<S> {
         value: &[u8],
         deadline_ms: u64,
     ) -> NodeDbResult<()> {
+        self.kv_check_pressure()?;
+        let _order = self.kv_local.write_order.lock().await;
+        self.kv_record_put(collection, key.as_bytes(), value, deadline_ms)
+            .await?;
+        self.kv_buffer_put(collection, key, value, deadline_ms)
+            .await
+    }
+
+    /// Refuse a KV write while the memory governor is at Emergency pressure.
+    pub(super) fn kv_check_pressure(&self) -> NodeDbResult<()> {
         if self.governor.worst_engine_pressure() == nodedb_mem::PressureLevel::Emergency {
-            return Err(nodedb_types::error::NodeDbError::storage(
+            return Err(NodeDbError::storage(
                 crate::error::LiteError::Backpressure {
                     detail: "KV write rejected: memory governor is at Emergency pressure".into(),
                 },
             ));
         }
+        Ok(())
+    }
 
+    /// Buffer a put of `value` at `key` with the expiry `deadline_ms`.
+    /// Records nothing for sync.
+    pub(super) async fn kv_buffer_put(
+        &self,
+        collection: &str,
+        key: &str,
+        value: &[u8],
+        deadline_ms: u64,
+    ) -> NodeDbResult<()> {
         let rkey = kv_key(collection, key.as_bytes());
         let encoded = encode_value(deadline_ms, value);
 
@@ -144,18 +161,6 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         if should_flush {
             self.kv_flush_inner().await?;
-        }
-
-        // Sync path: also update Loro for delta generation.
-        if self.sync_enabled {
-            let crdt_collection = format!("{KV_CRDT_PREFIX}{collection}");
-            let crdt_err = {
-                let mut crdt = self.crdt.lock_or_recover();
-                let fields: Vec<(&str, loro::LoroValue)> =
-                    vec![("value", loro::LoroValue::Binary(value.to_vec().into()))];
-                crdt.upsert_deferred(&crdt_collection, key, &fields)
-            };
-            crdt_err.map_err(NodeDbError::storage)?;
         }
 
         Ok(())
@@ -272,10 +277,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
     ///
     /// Returns `true` when a live value was present and removed, `false` when
     /// the key was absent (or already expired) — mirroring `HashMap::remove`.
+    ///
+    /// The delete is recorded for sync even when the key is absent here,
+    /// because Origin can hold the key when this replica does not.
     pub async fn kv_delete(&self, collection: &str, key: &str) -> NodeDbResult<bool> {
+        let _order = self.kv_local.write_order.lock().await;
         // Capture prior presence so the returned bool means "a live value was
         // removed" rather than an unconditional `true`.
         let existed = self.kv_get(collection, key).await?.is_some();
+        self.kv_record_delete(collection, key.as_bytes()).await?;
 
         let rkey = kv_key(collection, key.as_bytes());
 
@@ -298,386 +308,23 @@ impl<S: StorageEngine> NodeDbLite<S> {
             self.kv_flush_inner().await?;
         }
 
-        if self.sync_enabled {
-            let crdt_collection = format!("{KV_CRDT_PREFIX}{collection}");
-            let crdt_err = {
-                let mut crdt = self.crdt.lock_or_recover();
-                crdt.delete_deferred(&crdt_collection, key)
-            };
-            crdt_err.map_err(NodeDbError::storage)?;
-        }
-
         Ok(existed)
     }
 
-    /// KV RANGE SCAN: ordered key scan with optional bounds and limit.
-    ///
-    /// Returns `(key, value)` pairs where `start <= key < end`, ordered by
-    /// key in lexicographic byte order. Expired keys are skipped and lazily
-    /// deleted.
-    ///
-    /// - `start = None` means scan from the beginning of the collection.
-    /// - `end = None` means scan to the end of the collection.
-    /// - `limit = None` means no cap on results.
-    ///
-    /// Flushes the write buffer before scanning so the KV store reflects all pending
-    /// writes.
-    pub async fn kv_range_scan(
-        &self,
-        collection: &str,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        limit: Option<usize>,
-    ) -> NodeDbResult<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.kv_flush_inner().await?;
-
-        let col_prefix_end = {
-            let mut p = collection.as_bytes().to_vec();
-            p.push(0);
-            p
-        };
-
-        // Build absolute start key (collection\0[user_start]).
-        let start_key: Option<Vec<u8>> = Some(match start {
-            Some(s) => {
-                let mut k = col_prefix_end.clone();
-                k.extend_from_slice(s);
-                k
-            }
-            None => col_prefix_end.clone(),
-        });
-
-        // Build absolute end key (collection\0[user_end]).
-        let end_key: Option<Vec<u8>> = end.map(|e| {
-            let mut k = col_prefix_end.clone();
-            k.extend_from_slice(e);
-            k
-        });
-
-        let entries = self
-            .storage
-            .scan_range_bounded(
-                Namespace::Kv,
-                start_key.as_deref(),
-                end_key.as_deref(),
-                limit.map(|l| l + 32), // over-fetch slightly to account for skipped expired keys
-            )
-            .await
-            .map_err(NodeDbError::storage)?;
-
-        let mut results: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(limit.unwrap_or(entries.len()).min(entries.len()));
-        let mut expired_keys: Vec<Vec<u8>> = Vec::new();
-
-        for (composite_key, raw_value) in entries {
-            if let Some(limit) = limit
-                && results.len() >= limit
-            {
-                break;
-            }
-            let Some((coll, user_key_bytes)) = split_kv_key(&composite_key) else {
-                continue;
-            };
-            if coll != collection {
-                break;
-            }
-            let Some((deadline, user_bytes)) = decode_value(&raw_value) else {
-                continue;
-            };
-            if is_expired(deadline) {
-                expired_keys.push(kv_key(collection, user_key_bytes));
-                continue;
-            }
-            results.push((user_key_bytes.to_vec(), user_bytes.to_vec()));
-        }
-
-        // Lazy-delete expired keys discovered during scan.
-        if !expired_keys.is_empty() {
-            let should_flush = {
-                let mut buf = self.kv_local.write_buf.lock_or_recover();
-                for rkey in &expired_keys {
-                    buf.overlay.insert(rkey.clone(), None);
-                    buf.ops.push(WriteOp::Delete {
-                        ns: Namespace::Kv,
-                        key: rkey.clone(),
-                    });
-                }
-                buf.ops.len() >= KV_FLUSH_THRESHOLD
-            };
-            // Evict expired keys from the cache.
-            {
-                let mut cache = self.kv_local.cache.lock_or_recover();
-                for rkey in &expired_keys {
-                    cache.pop(rkey);
-                }
-            }
-            if should_flush {
-                self.kv_flush_inner().await?;
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// KV COMPACT EXPIRED: eagerly remove all expired keys in a collection.
-    ///
-    /// Flushes the write buffer, then scans all keys in the collection and
-    /// deletes any whose TTL deadline has passed. Returns the count of keys
-    /// removed.
-    pub async fn kv_compact_expired(&self, collection: &str) -> NodeDbResult<usize> {
-        self.kv_flush_inner().await?;
-
-        let col_prefix = {
-            let mut p = collection.as_bytes().to_vec();
-            p.push(0);
-            p
-        };
-
-        let entries = self
-            .storage
-            .scan_range_bounded(Namespace::Kv, Some(&col_prefix), None, None)
-            .await
-            .map_err(NodeDbError::storage)?;
-
-        let now = crate::runtime::now_millis();
-        let mut delete_ops: Vec<WriteOp> = Vec::new();
-
-        for (composite_key, raw_value) in entries {
-            let Some((coll, _user_key_bytes)) = split_kv_key(&composite_key) else {
-                continue;
-            };
-            if coll != collection {
-                break;
-            }
-            if let Some((deadline, _)) = decode_value(&raw_value)
-                && deadline != 0
-                && now >= deadline
-            {
-                // composite_key is the user-key (namespace byte
-                // already stripped by scan_range_bounded). WriteOp
-                // re-prepends the namespace byte via make_key internally.
-                delete_ops.push(WriteOp::Delete {
-                    ns: Namespace::Kv,
-                    key: composite_key,
-                });
-            }
-        }
-
-        let count = delete_ops.len();
-        if count > 0 {
-            self.storage
-                .batch_write(&delete_ops)
-                .await
-                .map_err(NodeDbError::storage)?;
-        }
-
-        Ok(count)
-    }
-
-    /// KV SCAN: iterate keys in sorted order starting from `cursor`.
-    ///
-    /// Returns up to `count` key-value pairs where key >= cursor (inclusive).
-    /// Pass an empty cursor to start from the beginning of the collection.
-    ///
-    /// Flushes the write buffer first to ensure the KV store has all data, then
-    /// uses the storage's B-tree range scan — O(log N + count).
-    pub async fn kv_scan(
-        &self,
-        collection: &str,
-        cursor: &str,
-        count: usize,
-    ) -> NodeDbResult<Vec<(String, Vec<u8>)>> {
-        // Flush pending writes so storage is up to date.
-        self.kv_flush_inner().await?;
-
-        let start = kv_key(collection, cursor.as_bytes());
-        let entries = self
-            .storage
-            .scan_range(Namespace::Kv, &start, count)
-            .await
-            .map_err(NodeDbError::storage)?;
-
-        let mut results = Vec::with_capacity(entries.len());
-        for (composite_key, raw_value) in entries {
-            let Some((coll, key_bytes)) = split_kv_key(&composite_key) else {
-                continue;
-            };
-            if coll != collection {
-                break;
-            }
-            let Some((deadline, user_bytes)) = decode_value(&raw_value) else {
-                continue;
-            };
-            if is_expired(deadline) {
-                continue;
-            }
-            if let Ok(key_str) = std::str::from_utf8(key_bytes) {
-                results.push((key_str.to_string(), user_bytes.to_vec()));
-            }
-        }
-
-        Ok(results)
-    }
-
     /// Flush buffered KV writes to storage as a single transaction.
-    ///
-    /// Also flushes deferred CRDT deltas when sync is enabled.
+    /// Returns the number of writes flushed.
     pub async fn kv_flush(&self) -> NodeDbResult<usize> {
-        let count = self.kv_flush_inner().await?;
-
-        if self.sync_enabled {
-            let crdt_err = {
-                let mut crdt = self.crdt.lock_or_recover();
-                crdt.flush_deltas()
-            };
-            crdt_err.map_err(NodeDbError::storage)?;
-        }
-
-        Ok(count)
+        self.kv_flush_inner().await
     }
 
-    /// Internal: flush write buffer to storage without touching CRDT.
+    /// Internal: flush the write buffer to storage.
     /// `pub(in crate::nodedb)` so the global `flush()` can drain the KV buffer.
     pub(in crate::nodedb) async fn kv_flush_inner(&self) -> NodeDbResult<usize> {
-        let ops: Vec<WriteOp> = {
-            let mut buf = self.kv_local.write_buf.lock_or_recover();
-            if buf.ops.is_empty() {
-                return Ok(0);
-            }
-            let ops = std::mem::take(&mut buf.ops);
-            buf.overlay.clear();
-            ops
-        };
-
-        let count = ops.len();
-        self.storage
-            .batch_write(&ops)
+        self.kv_local
+            .flush_to(&*self.storage)
             .await
-            .map_err(NodeDbError::storage)?;
-
-        Ok(count)
+            .map_err(NodeDbError::storage)
     }
-
-    /// List all keys in a KV collection.
-    pub async fn kv_keys(&self, collection: &str) -> NodeDbResult<Vec<String>> {
-        // Flush pending writes first.
-        self.kv_flush_inner().await?;
-
-        let prefix = kv_key(collection, b"");
-        let entries = self
-            .storage
-            .scan_range(Namespace::Kv, &prefix, usize::MAX)
-            .await
-            .map_err(NodeDbError::storage)?;
-
-        let mut keys = Vec::with_capacity(entries.len());
-        for (composite_key, raw_value) in entries {
-            let Some((coll, key_bytes)) = split_kv_key(&composite_key) else {
-                continue;
-            };
-            if coll != collection {
-                break;
-            }
-            // Skip expired keys.
-            if let Some((deadline, _)) = decode_value(&raw_value) {
-                if is_expired(deadline) {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-            if let Ok(key_str) = std::str::from_utf8(key_bytes) {
-                keys.push(key_str.to_string());
-            }
-        }
-        Ok(keys)
-    }
-
-    /// KV INCREMENT: atomic counter increment via CRDT counter semantics.
-    ///
-    /// Always uses Loro (counters need CRDT merge for correctness).
-    pub fn kv_increment(&self, collection: &str, key: &str, delta: i64) -> NodeDbResult<i64> {
-        let crdt_collection = format!("{KV_CRDT_PREFIX}{collection}");
-        let mut crdt = self.crdt.lock_or_recover();
-
-        let current = match crdt.read(&crdt_collection, key) {
-            Some(loro::LoroValue::Map(map)) => {
-                if let Some(loro::LoroValue::I64(v)) = map.get("counter") {
-                    *v
-                } else {
-                    0
-                }
-            }
-            _ => 0,
-        };
-
-        let new_value = current + delta;
-        let fields: Vec<(&str, loro::LoroValue)> =
-            vec![("counter", loro::LoroValue::I64(new_value))];
-        crdt.upsert(&crdt_collection, key, &fields)
-            .map_err(NodeDbError::storage)?;
-
-        Ok(new_value)
-    }
-
-    /// Set conflict policy for a KV collection.
-    pub fn kv_set_conflict_policy(
-        &self,
-        collection: &str,
-        policy: nodedb_crdt::CollectionPolicy,
-    ) -> NodeDbResult<()> {
-        let crdt_collection = format!("{KV_CRDT_PREFIX}{collection}");
-        let mut crdt = self.crdt.lock_or_recover();
-        crdt.set_policy(&crdt_collection, policy);
-        Ok(())
-    }
-
-    /// Subscribe to a subset of KV keys matching a pattern.
-    pub async fn kv_subscribe_shape(
-        &self,
-        collection: &str,
-        key_pattern: &str,
-    ) -> NodeDbResult<Vec<String>> {
-        let all_keys = self.kv_keys(collection).await?;
-        let matched: Vec<String> = all_keys
-            .into_iter()
-            .filter(|k| glob_matches(key_pattern, k))
-            .collect();
-        Ok(matched)
-    }
-}
-
-/// Simple glob matching for shape subscriptions.
-fn glob_matches(pattern: &str, input: &str) -> bool {
-    let pat = pattern.as_bytes();
-    let inp = input.as_bytes();
-    let mut pi = 0;
-    let mut ii = 0;
-    let mut star_pi = usize::MAX;
-    let mut star_ii = 0;
-
-    while ii < inp.len() {
-        if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == inp[ii]) {
-            pi += 1;
-            ii += 1;
-        } else if pi < pat.len() && pat[pi] == b'*' {
-            star_pi = pi;
-            star_ii = ii;
-            pi += 1;
-        } else if star_pi != usize::MAX {
-            pi = star_pi + 1;
-            star_ii += 1;
-            ii = star_ii;
-        } else {
-            return false;
-        }
-    }
-
-    while pi < pat.len() && pat[pi] == b'*' {
-        pi += 1;
-    }
-
-    pi == pat.len()
 }
 
 #[cfg(test)]

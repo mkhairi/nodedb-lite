@@ -9,27 +9,30 @@
 //! (HNSW indices, spatial manager, text indices) — the same indexes used
 //! by schemaless document collections.
 //!
-//! Callers: `NodeDbLite` should call `index_row` after `StrictEngine.insert()`
-//! or `ColumnarEngine.insert()` to maintain secondary indexes. Call
-//! `deindex_row_text` before `delete()` to remove text index entries.
+//! Callers: `NodeDbLite` calls `index_row` and `index_row_vectors` after
+//! `StrictEngine.insert()` or `ColumnarEngine.insert()` to maintain secondary
+//! indexes, and `deindex_row_text` and `deindex_row_vectors` before
+//! `delete()` to remove a row's entries. Vector columns reach their HNSW
+//! index through `engine::vector::resident`, which loads an evicted index
+//! back first.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use nodedb_types::columnar::ColumnType;
 use nodedb_types::geometry::Geometry;
 use nodedb_types::value::Value;
-use nodedb_vector::HnswIndex;
 
 use crate::engine::fts::FtsCollectionManager;
 use crate::engine::spatial::SpatialIndexManager;
+use crate::engine::vector::VectorState;
+use crate::engine::vector::resident::{lock_resident, lock_resident_or_create};
 use crate::error::LiteError;
 use crate::nodedb::lock_ext::LockExt;
+use crate::storage::engine::StorageEngine;
 
-/// Index a row from a strict or columnar collection into secondary indexes.
-///
-/// Inspects the schema's column types and routes values to the appropriate
-/// index: GEOMETRY → R-tree, VECTOR → HNSW, STRING → text/BM25.
+/// Index a row from a strict or columnar collection into its spatial and
+/// text indexes: GEOMETRY → R-tree, STRING → text/BM25. VECTOR columns go
+/// through [`index_row_vectors`].
 ///
 /// `collection` is the collection name (used as the index key).
 /// `row_id` is a string identifier for the row (typically the PK value).
@@ -40,7 +43,6 @@ pub fn index_row(
     row_id: &str,
     columns: &[nodedb_types::columnar::ColumnDef],
     values: &[Value],
-    hnsw_indices: &Mutex<HashMap<String, HnswIndex>>,
     spatial: &Mutex<SpatialIndexManager>,
     fts: &Mutex<FtsCollectionManager>,
 ) -> Result<(), LiteError> {
@@ -53,9 +55,6 @@ pub fn index_row(
         match &col.column_type {
             ColumnType::Geometry => {
                 index_geometry(collection, &col.name, row_id, val, spatial);
-            }
-            ColumnType::Vector(dim) => {
-                index_vector(collection, &col.name, row_id, val, *dim, hnsw_indices);
             }
             ColumnType::String => {
                 index_text(collection, &col.name, row_id, val, fts)?;
@@ -110,48 +109,130 @@ fn index_geometry(
     spatial.index_document(collection, field, doc_id, &geom);
 }
 
-/// Index a vector value into the HNSW index.
-fn index_vector(
+/// Index a row's VECTOR columns into their HNSW indexes, keyed
+/// `"{collection}:{column}"`, and bind each node to `row_id`. The vector is
+/// made durable first, as every other vector insert does. A NULL value
+/// indexes nothing.
+///
+/// Fails with `DataException` for a value that is not a vector of the
+/// column's width, and propagates a storage or index error.
+pub(crate) async fn index_row_vectors<S: StorageEngine>(
+    vector_state: &Arc<VectorState<S>>,
     collection: &str,
-    field: &str,
-    _doc_id: &str,
+    row_id: &str,
+    columns: &[nodedb_types::columnar::ColumnDef],
+    values: &[Value],
+) -> Result<(), LiteError> {
+    for (col, value) in columns.iter().zip(values) {
+        let ColumnType::Vector(dim) = &col.column_type else {
+            continue;
+        };
+        let Some(vector) = vector_value(collection, &col.name, value, *dim as usize)? else {
+            continue;
+        };
+        let index_key = format!("{collection}:{}", col.name);
+        let op = crate::engine::vector::durable::put_op(&index_key, row_id, &vector);
+        vector_state
+            .storage
+            .batch_write(std::slice::from_ref(&op))
+            .await?;
+        let internal_id = {
+            let mut resident =
+                lock_resident_or_create(vector_state, &index_key, vector.len()).await?;
+            let index = resident.index();
+            let id_before = index.len() as u32;
+            index.insert(vector)?;
+            id_before
+        };
+        vector_state.vector_id_map.lock_or_recover().insert(
+            format!("{index_key}:{internal_id}"),
+            (row_id.to_string(), internal_id),
+        );
+    }
+    Ok(())
+}
+
+/// Remove a row's VECTOR column entries: the durable vector, and the live
+/// node bound to `row_id`, loading an evicted index back first. A tombstone
+/// an evicted index missed would bring the vector back.
+pub(crate) async fn deindex_row_vectors<S: StorageEngine>(
+    vector_state: &Arc<VectorState<S>>,
+    collection: &str,
+    row_id: &str,
+    columns: &[nodedb_types::columnar::ColumnDef],
+) -> Result<(), LiteError> {
+    for col in columns {
+        if !matches!(col.column_type, ColumnType::Vector(_)) {
+            continue;
+        }
+        let index_key = format!("{collection}:{}", col.name);
+        crate::engine::vector::durable::remove(&*vector_state.storage, &index_key, row_id).await?;
+        let mut indices = lock_resident(vector_state, &index_key).await?;
+        let Some(index) = indices.get_mut(&index_key) else {
+            continue;
+        };
+        let prefix = format!("{index_key}:");
+        let mut id_map = vector_state.vector_id_map.lock_or_recover();
+        let bound: Vec<(String, u32)> = id_map
+            .iter()
+            .filter(|(key, (doc_id, _))| key.starts_with(&prefix) && doc_id == row_id)
+            .map(|(key, (_, iid))| (key.clone(), *iid))
+            .collect();
+        for (key, iid) in bound {
+            index.delete(iid);
+            id_map.remove(&key);
+        }
+    }
+    Ok(())
+}
+
+/// The vector a VECTOR column value holds: an array of numbers or packed
+/// little-endian f32 bytes, exactly `dim` wide. `None` for NULL.
+fn vector_value(
+    collection: &str,
+    column: &str,
     value: &Value,
-    dim: u32,
-    hnsw_indices: &Mutex<HashMap<String, HnswIndex>>,
-) {
+    dim: usize,
+) -> Result<Option<Vec<f32>>, LiteError> {
     let vector: Vec<f32> = match value {
+        Value::Null => return Ok(None),
         Value::Array(arr) => arr
             .iter()
-            .take(dim as usize)
             .map(|v| match v {
-                Value::Float(f) => *f as f32,
-                Value::Integer(n) => *n as f32,
-                _ => 0.0,
+                Value::Float(f) => Ok(*f as f32),
+                Value::Integer(n) => Ok(*n as f32),
+                other => Err(LiteError::DataException {
+                    detail: format!(
+                        "vector column '{column}' of '{collection}' holds a non-numeric \
+                         component: {other:?}"
+                    ),
+                }),
             })
-            .collect(),
+            .collect::<Result<_, _>>()?,
         Value::Bytes(b) => {
-            // Packed f32 bytes.
-            b.as_chunks::<4>()
-                .0
-                .iter()
-                .take(dim as usize)
-                .map(|c| f32::from_le_bytes(*c))
-                .collect()
+            let (chunks, rest) = b.as_chunks::<4>();
+            if !rest.is_empty() {
+                return Err(LiteError::DataException {
+                    detail: format!(
+                        "vector column '{column}' of '{collection}' holds {} bytes, \
+                         not a multiple of 4",
+                        b.len()
+                    ),
+                });
+            }
+            chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
         }
-        _ => return,
+        other => {
+            return Err(LiteError::DataException {
+                detail: format!(
+                    "vector column '{column}' of '{collection}' holds a non-vector value: \
+                     {other:?}"
+                ),
+            });
+        }
     };
-
-    if vector.len() != dim as usize {
-        return;
-    }
-
-    let index_key = format!("{collection}:{field}");
-    let mut indices = hnsw_indices.lock_or_recover();
-    let index = indices
-        .entry(index_key)
-        .or_insert_with(|| HnswIndex::new(dim as usize, nodedb_types::HnswParams::default()));
-    // insert() takes Vec<f32> and returns Result — ignore error for index integration.
-    let _ = index.insert(vector);
+    nodedb_vector::error::check_dim(dim, vector.len())?;
+    Ok(Some(vector))
 }
 
 /// Index a string value into the inverted text index (BM25).
@@ -227,23 +308,39 @@ mod tests {
             }),
         ];
 
-        let hnsw = Mutex::new(HashMap::new());
         let spatial = Mutex::new(SpatialIndexManager::new(test_spatial_memory()));
         let text = Mutex::new(FtsCollectionManager::new(test_governor()));
 
-        index_row("test", "1", &columns, &values, &hnsw, &spatial, &text)
+        index_row("test", "1", &columns, &values, &spatial, &text)
             .expect("index update must succeed");
 
         let spatial = spatial.lock().expect("lock");
         assert!(!spatial.is_empty());
     }
 
-    #[test]
-    fn index_row_routes_vector() {
-        let columns = vec![
+    async fn vector_state() -> Arc<VectorState<crate::storage::pagedb_storage::PagedbStorageMem>> {
+        let storage = Arc::new(
+            crate::storage::pagedb_storage::PagedbStorageMem::open_in_memory()
+                .await
+                .expect("in-memory pagedb"),
+        );
+        let memory = crate::query::engine::test_scoped_memory(
+            &crate::query::engine::test_governor(),
+            EngineId::Vector,
+        );
+        Arc::new(VectorState::new(storage, 64, memory))
+    }
+
+    fn vector_columns() -> Vec<ColumnDef> {
+        vec![
             ColumnDef::required("id", ColumnType::Int64),
             ColumnDef::nullable("emb", ColumnType::Vector(3)),
-        ];
+        ]
+    }
+
+    #[tokio::test]
+    async fn index_row_vectors_indexes_binds_and_deindexes() {
+        let state = vector_state().await;
         let values = vec![
             Value::Integer(1),
             Value::Array(vec![
@@ -253,16 +350,37 @@ mod tests {
             ]),
         ];
 
-        let hnsw = Mutex::new(HashMap::new());
-        let spatial = Mutex::new(SpatialIndexManager::new(test_spatial_memory()));
-        let text = Mutex::new(FtsCollectionManager::new(test_governor()));
-
-        index_row("test", "1", &columns, &values, &hnsw, &spatial, &text)
+        index_row_vectors(&state, "test", "1", &vector_columns(), &values)
+            .await
             .expect("index update must succeed");
+        {
+            let hnsw = state.hnsw_indices.lock().expect("lock");
+            assert_eq!(hnsw.get("test:emb").map(|i| i.live_count()), Some(1));
+        }
+        assert_eq!(
+            state.vector_id_map.lock().expect("lock").get("test:emb:0"),
+            Some(&("1".to_string(), 0))
+        );
 
-        let hnsw = hnsw.lock().expect("lock");
-        assert!(hnsw.contains_key("test:emb"));
-        assert_eq!(hnsw["test:emb"].len(), 1);
+        deindex_row_vectors(&state, "test", "1", &vector_columns())
+            .await
+            .expect("deindex must succeed");
+        let hnsw = state.hnsw_indices.lock().expect("lock");
+        assert_eq!(hnsw.get("test:emb").map(|i| i.live_count()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn index_row_vectors_refuses_a_value_of_the_wrong_width() {
+        let state = vector_state().await;
+        let values = vec![
+            Value::Integer(1),
+            Value::Array(vec![Value::Float(1.0), Value::Float(2.0)]),
+        ];
+        let err = index_row_vectors(&state, "test", "1", &vector_columns(), &values)
+            .await
+            .expect_err("a 2-wide value in a 3-wide column must fail");
+        assert!(matches!(err, LiteError::DataException { .. }), "{err:?}");
+        assert!(state.hnsw_indices.lock().expect("lock").is_empty());
     }
 
     #[test]
@@ -276,11 +394,10 @@ mod tests {
             Value::String("hello world search test".into()),
         ];
 
-        let hnsw = Mutex::new(HashMap::new());
         let spatial = Mutex::new(SpatialIndexManager::new(test_spatial_memory()));
         let text = Mutex::new(FtsCollectionManager::new(test_governor()));
 
-        index_row("test", "1", &columns, &values, &hnsw, &spatial, &text)
+        index_row("test", "1", &columns, &values, &spatial, &text)
             .expect("index update must succeed");
 
         let text = text.lock().expect("lock");
@@ -298,15 +415,13 @@ mod tests {
         ];
         let values = vec![Value::Integer(1), Value::Integer(42)];
 
-        let hnsw = Mutex::new(HashMap::new());
         let spatial = Mutex::new(SpatialIndexManager::new(test_spatial_memory()));
         let text = Mutex::new(FtsCollectionManager::new(test_governor()));
 
-        index_row("test", "1", &columns, &values, &hnsw, &spatial, &text)
+        index_row("test", "1", &columns, &values, &spatial, &text)
             .expect("index update must succeed");
 
         // No indexes should be populated for Int64 columns.
-        assert!(hnsw.lock().expect("lock").is_empty());
         assert!(spatial.lock().expect("lock").is_empty());
         assert!(
             text.lock().expect("lock").is_empty(),

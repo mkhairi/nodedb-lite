@@ -275,7 +275,12 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             }))
         }
         // ── Origin-only ops that Lite's plan converter never emits ───────────
-        MetaOp::CreateTenantSnapshot { tenant_id } => {
+        // A Lite write has its final outcome once it commits, so a
+        // consistent cut needs no wait here.
+        MetaOp::CreateTenantSnapshot {
+            tenant_id,
+            cut_watermark: _,
+        } => {
             let tid = *tenant_id;
             let storage = engine.storage.clone();
             Ok(Box::pin(async move {
@@ -331,6 +336,11 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         MetaOp::ResolveTxn { .. } => Err(LiteError::Unsupported {
             detail: "ResolveTxn folds staged Data Plane write plans into one redo record; \
                      unsupported on the single-node Lite engine"
+                .into(),
+        }),
+        MetaOp::ApplyTransactionRedo { .. } => Err(LiteError::Unsupported {
+            detail: "ApplyTransactionRedo installs a committed redo record from a vShard's \
+                     data-group log; unsupported on the single-node Lite engine"
                 .into(),
         }),
 

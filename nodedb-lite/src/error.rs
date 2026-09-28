@@ -76,6 +76,46 @@ pub enum LiteError {
     /// leaves the document permanently missing from (or stale in) the index.
     #[error("full-text index update failed for {collection}: {detail}")]
     FtsIndex { collection: String, detail: String },
+
+    /// A KV counter atomic read a stored value it cannot parse as a number,
+    /// or computed a result out of range. Maps to SQLSTATE `22P02` or `22003`
+    /// at the SQL boundary, the same as Origin.
+    #[error("{fault} on {collection}")]
+    CounterFault {
+        collection: String,
+        fault: nodedb_physical::kv_atomic::CounterFault,
+    },
+
+    /// A KV atomic found a typed row with no column of the type it reads.
+    #[error("type mismatch on {collection}: {detail}")]
+    TypeMismatch { collection: String, detail: String },
+
+    /// An input the engine cannot compute on: a vector of the wrong
+    /// dimension, or index input it cannot use. The same public error
+    /// Origin raises for the same fault, SQLSTATE `22000`.
+    #[error("{detail}")]
+    DataException { detail: String },
+}
+
+/// A vector engine error, classified as Origin classifies it: an input
+/// vector of the wrong dimension, or index input the engine cannot use, is
+/// the caller's data error; a memory budget refusal is backpressure; a
+/// stored-data or checkpoint failure is corruption.
+impl From<nodedb_vector::error::VectorError> for LiteError {
+    fn from(e: nodedb_vector::error::VectorError) -> Self {
+        use nodedb_vector::error::VectorError as Ve;
+        let detail = e.to_string();
+        match e {
+            Ve::DimensionMismatch { .. } | Ve::InvalidInput { .. } => {
+                Self::DataException { detail }
+            }
+            Ve::BudgetExhausted(_) => Self::Backpressure { detail },
+            Ve::SegmentIo(_) | Ve::InvalidFilterBitmap { .. } => Self::Storage { detail },
+            // `VectorError` is `#[non_exhaustive]`; every other variant is a
+            // stored-data or checkpoint failure.
+            _ => Self::Corrupted { detail },
+        }
+    }
 }
 
 /// Returns `true` when `e` is the corruption-class variant that should drive
@@ -84,10 +124,13 @@ pub(crate) fn is_corruption(e: &LiteError) -> bool {
     matches!(e, LiteError::Corrupted { .. })
 }
 
-/// Expression evaluation failure — currently only division/modulo by a zero
-/// divisor, which SQL requires to fail the statement (SQLSTATE `22012`) rather
-/// than fold the row to `NULL`. Mapped to [`LiteError::Query`] so it surfaces
-/// to the caller instead of silently filtering rows out.
+/// Expression evaluation failure: division or modulo by a zero divisor, a
+/// call to a function no evaluator implements, or a function argument it
+/// cannot compute on (vectors of different dimensions, an argument of the
+/// wrong type, a malformed JSONPath). SQL requires each to fail the
+/// statement rather than fold the row to `NULL`. Mapped to
+/// [`LiteError::Query`] so it surfaces to the caller instead of silently
+/// filtering rows out.
 impl From<nodedb_query::EvalError> for LiteError {
     fn from(e: nodedb_query::EvalError) -> Self {
         Self::Query(e.to_string())
@@ -104,10 +147,18 @@ impl From<nodedb_types::columnar::SchemaError> for LiteError {
 
 impl From<LiteError> for nodedb_types::error::NodeDbError {
     fn from(e: LiteError) -> Self {
-        if is_corruption(&e) {
-            nodedb_types::error::NodeDbError::segment_corrupted(e.to_string())
-        } else {
-            nodedb_types::error::NodeDbError::storage(e)
+        use nodedb_types::error::NodeDbError;
+        match e {
+            // The same public errors Origin builds for the same faults.
+            LiteError::CounterFault { collection, fault } => {
+                NodeDbError::kv_counter_fault(collection, fault, fault.is_out_of_range())
+            }
+            LiteError::TypeMismatch { collection, detail } => {
+                NodeDbError::type_mismatch(collection, detail)
+            }
+            LiteError::DataException { detail } => NodeDbError::data_exception(detail),
+            e if is_corruption(&e) => NodeDbError::segment_corrupted(e.to_string()),
+            e => NodeDbError::storage(e),
         }
     }
 }

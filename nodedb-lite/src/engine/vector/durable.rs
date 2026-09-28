@@ -195,8 +195,8 @@ pub(crate) async fn load_collection<S: StorageEngine>(
 /// VALUE rather than as an `&HnswIndex` because the index holds a `RefCell`
 /// arena — borrowing it across this `await` would make every calling future
 /// non-`Send`. When it is `None` (nothing to replace) the params default
-/// exactly as `ensure_hnsw` would set them on a first insert. Returns `None`
-/// when the collection has no durable vectors.
+/// exactly as `resident::lock_resident_or_create` sets them on a first
+/// insert. Returns `None` when the collection has no durable vectors.
 pub(crate) async fn rebuild_index<S: StorageEngine>(
     storage: &S,
     collection: &str,

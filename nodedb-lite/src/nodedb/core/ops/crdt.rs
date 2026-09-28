@@ -77,14 +77,35 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// Apply a server-originated row post-image from Origin.
     ///
     /// Unlike [`Self::import_remote_deltas`], the payload here is a
-    /// MessagePack row image rather than Loro update bytes — Origin sends it
+    /// MessagePack row image rather than Loro update bytes. Origin sends it
     /// for writes that have no client-authored CRDT operation to replicate
     /// (SQL DML, DDL-managed system rows). An empty payload with `delete` set
     /// removes the row.
     ///
-    /// The resulting local mutation is dropped from the outbound queue: the
-    /// write came FROM Origin, so pushing it back would echo it into a loop.
-    pub fn apply_remote_row(
+    /// A KV collection's row is the `{key, value…}` row every KV read
+    /// returns. It lands in the KV store as the body a local write of the
+    /// same row stores. Any other collection's row lands in its Loro
+    /// document.
+    ///
+    /// Neither write reaches the outbound queue: the write came FROM Origin,
+    /// so pushing it back would echo it into a loop.
+    pub async fn apply_remote_row(
+        &self,
+        collection: &str,
+        document_id: &str,
+        payload: &[u8],
+        delete: bool,
+    ) -> NodeDbResult<()> {
+        if self.is_kv_collection(collection).await? {
+            return self
+                .kv_apply_remote_row(collection, document_id, payload, delete)
+                .await;
+        }
+        self.apply_remote_document_row(collection, document_id, payload, delete)
+    }
+
+    /// Apply a remote row post-image to `collection`'s Loro document.
+    fn apply_remote_document_row(
         &self,
         collection: &str,
         document_id: &str,
@@ -99,12 +120,21 @@ impl<S: StorageEngine> NodeDbLite<S> {
             crdt.delete(collection, document_id)
                 .map_err(NodeDbError::storage)?
         } else {
-            let value: Value = zerompk::from_msgpack(payload).map_err(|e| {
-                NodeDbError::storage(format!("remote row payload decode failed: {e}"))
+            // Origin writes a row post-image as standard msgpack, not the
+            // tagged zerompk `Value` encoding.
+            let value = nodedb_types::value_from_msgpack(payload).map_err(|e| {
+                NodeDbError::serialization(
+                    "msgpack",
+                    format!("row push for '{collection}'/'{document_id}' does not decode: {e}"),
+                )
             })?;
             let Value::Object(fields) = value else {
-                return Err(NodeDbError::storage(
-                    "remote row payload is not an object".to_string(),
+                return Err(NodeDbError::serialization(
+                    "msgpack",
+                    format!(
+                        "row push for '{collection}'/'{document_id}' is a {}, not a row map",
+                        value.type_name()
+                    ),
                 ));
             };
             let loro_fields: Vec<(&str, loro::LoroValue)> = fields
@@ -174,5 +204,57 @@ impl<S: StorageEngine> NodeDbLite<S> {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn stop_sync(&self) -> bool {
         self.tasks.stop(crate::tasks::TaskKind::Sync).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use nodedb_types::value::Value;
+
+    use crate::storage::pagedb_storage::PagedbStorageMem;
+
+    use super::*;
+
+    async fn open_db() -> Arc<NodeDbLite<PagedbStorageMem>> {
+        let storage = PagedbStorageMem::open_in_memory()
+            .await
+            .expect("open in-memory storage");
+        NodeDbLite::open(storage).await.expect("open NodeDbLite")
+    }
+
+    #[tokio::test]
+    async fn a_pushed_document_row_lands_in_its_loro_document() {
+        let db = open_db().await;
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), Value::String("ada".into()));
+        let row = nodedb_types::value_to_msgpack(&Value::Object(fields)).expect("encode");
+
+        db.apply_remote_row("people", "p1", &row, false)
+            .await
+            .expect("apply row");
+
+        let stored = db.crdt.lock_or_recover().read("people", "p1");
+        let Some(loro::LoroValue::Map(map)) = stored else {
+            panic!("row p1 is not a map: {stored:?}");
+        };
+        assert_eq!(
+            map.get("name"),
+            Some(&loro::LoroValue::String("ada".to_string().into()))
+        );
+        assert!(db.pending_crdt_deltas().expect("pending").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pushed_document_payload_that_is_not_a_row_map_is_refused() {
+        let db = open_db().await;
+        let scalar = nodedb_types::value_to_msgpack(&Value::Integer(1)).expect("encode");
+
+        let err = db
+            .apply_remote_row("people", "p1", &scalar, false)
+            .await
+            .expect_err("a scalar is not a row");
+        assert!(err.message().contains("not a row map"), "{err}");
     }
 }

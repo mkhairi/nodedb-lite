@@ -4,13 +4,13 @@
 //! dispatch/push tests assert on record into a `std::sync::Mutex` (not
 //! tokio's) so assertions can read them from outside an async context.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use nodedb_lite::LiteError;
 use nodedb_lite::engine::crdt::engine::PendingDelta;
 use nodedb_lite::nodedb::CollectionMeta;
 use nodedb_lite::sync::{
-    PendingColumnarBatch, PendingFtsDelete, PendingFtsIndex, PendingSpatialDelete,
+    PendingColumnarBatch, PendingFtsDelete, PendingFtsIndex, PendingKvWrite, PendingSpatialDelete,
     PendingSpatialInsert, PendingTimeseriesBatch, PendingVectorDelete, PendingVectorInsert,
     SyncDelegate,
 };
@@ -26,6 +26,12 @@ pub struct MockDelegate {
     identity: std::sync::Mutex<nodedb_lite::identity::LiteIdentity>,
     identity_changes: AtomicU64,
     peer_id_rotations: AtomicU64,
+    refuse_rows: AtomicBool,
+    kv_pending: std::sync::Mutex<Vec<(Vec<u8>, PendingKvWrite)>>,
+    kv_in_flight: std::sync::Mutex<Vec<u64>>,
+    kv_retired: std::sync::Mutex<Vec<u64>>,
+    stream_acks: std::sync::Mutex<Vec<(u64, u64)>>,
+    in_flight_clears: AtomicU64,
 }
 
 impl Default for MockDelegate {
@@ -51,7 +57,38 @@ impl MockDelegate {
             }),
             identity_changes: AtomicU64::new(0),
             peer_id_rotations: AtomicU64::new(0),
+            refuse_rows: AtomicBool::new(false),
+            kv_pending: std::sync::Mutex::new(Vec::new()),
+            kv_in_flight: std::sync::Mutex::new(Vec::new()),
+            kv_retired: std::sync::Mutex::new(Vec::new()),
+            stream_acks: std::sync::Mutex::new(Vec::new()),
+            in_flight_clears: AtomicU64::new(0),
         }
+    }
+
+    /// Make `apply_remote_row` refuse every row with a serialization error.
+    pub fn refuse_rows(&self) {
+        self.refuse_rows.store(true, Ordering::Relaxed);
+    }
+
+    /// Queue KV writes for the push loop, as `(durable_key, write)` pairs.
+    pub fn set_pending_kv(&self, writes: Vec<(Vec<u8>, PendingKvWrite)>) {
+        *self.kv_pending.lock().expect("kv_pending lock") = writes;
+    }
+
+    /// Batch ids passed to `retire_kv_write`, in order.
+    pub fn retired_kv(&self) -> Vec<u64> {
+        self.kv_retired.lock().expect("kv_retired lock").clone()
+    }
+
+    /// `(stream_id, applied_seq)` pairs passed to `record_stream_ack`.
+    pub fn stream_acks(&self) -> Vec<(u64, u64)> {
+        self.stream_acks.lock().expect("stream_acks lock").clone()
+    }
+
+    /// How many times `clear_engine_in_flight` was invoked.
+    pub fn in_flight_clears(&self) -> u64 {
+        self.in_flight_clears.load(Ordering::Relaxed)
     }
 
     /// The Loro peer id this delegate currently reports.
@@ -149,12 +186,22 @@ impl SyncDelegate for MockDelegate {
             .expect("rejected lock")
             .push(mutation_id);
     }
-    async fn apply_remote_row(&self, msg: &nodedb_types::sync::wire::RowPushMsg) {
+    async fn apply_remote_row(
+        &self,
+        msg: &nodedb_types::sync::wire::RowPushMsg,
+    ) -> Result<(), nodedb_types::error::NodeDbError> {
+        if self.refuse_rows.load(Ordering::Relaxed) {
+            return Err(nodedb_types::error::NodeDbError::serialization(
+                "msgpack",
+                "mock refuses every row",
+            ));
+        }
         self.applied_rows.lock().expect("applied_rows lock").push((
             msg.collection.clone(),
             msg.document_id.clone(),
             msg.op,
         ));
+        Ok(())
     }
 
     fn import_remote(&self, collection: &str, data: &[u8]) {
@@ -249,7 +296,54 @@ impl SyncDelegate for MockDelegate {
     async fn ack_timeseries_batches_through_seq(&self, _applied_seq: u64) {}
     async fn ack_timeseries_batch_by_id(&self, _batch_id: u64) {}
     async fn acknowledge_timeseries_batch(&self, _durable_key: Vec<u8>) {}
-    async fn clear_engine_in_flight(&self) {}
+    async fn clear_engine_in_flight(&self) {
+        self.in_flight_clears.fetch_add(1, Ordering::Relaxed);
+        self.kv_in_flight.lock().expect("kv_in_flight lock").clear();
+    }
+
+    async fn pending_kv_writes(&self) -> Result<Vec<(Vec<u8>, PendingKvWrite)>, LiteError> {
+        let in_flight = self.kv_in_flight.lock().expect("kv_in_flight lock").clone();
+        let retired = self.kv_retired.lock().expect("kv_retired lock").clone();
+        Ok(self
+            .kv_pending
+            .lock()
+            .expect("kv_pending lock")
+            .iter()
+            .filter(|(key, _)| {
+                let id = u64::from_be_bytes(key.as_slice().try_into().expect("8-byte key"));
+                !in_flight.contains(&id) && !retired.contains(&id)
+            })
+            .cloned()
+            .collect())
+    }
+    async fn persist_kv_write_seq(
+        &self,
+        key: &[u8],
+        write: &PendingKvWrite,
+    ) -> Result<(), LiteError> {
+        let mut pending = self.kv_pending.lock().expect("kv_pending lock");
+        if let Some(entry) = pending.iter_mut().find(|(k, _)| k.as_slice() == key) {
+            entry.1 = write.clone();
+        }
+        Ok(())
+    }
+    async fn mark_kv_write_in_flight(&self, batch_id: u64) {
+        self.kv_in_flight
+            .lock()
+            .expect("kv_in_flight lock")
+            .push(batch_id);
+    }
+    async fn retire_kv_write(&self, batch_id: u64) -> Result<(), LiteError> {
+        self.kv_in_flight
+            .lock()
+            .expect("kv_in_flight lock")
+            .retain(|id| *id != batch_id);
+        self.kv_retired
+            .lock()
+            .expect("kv_retired lock")
+            .push(batch_id);
+        Ok(())
+    }
 
     async fn persist_producer_state(&self, _producer_id: u64, _accepted_epoch: u64) {}
     async fn load_producer_state(&self) -> (u64, u64) {
@@ -258,7 +352,12 @@ impl SyncDelegate for MockDelegate {
     async fn next_stream_seq(&self, _stream_id: u64) -> u64 {
         0
     }
-    async fn record_stream_ack(&self, _stream_id: u64, _applied_seq: u64) {}
+    async fn record_stream_ack(&self, stream_id: u64, applied_seq: u64) {
+        self.stream_acks
+            .lock()
+            .expect("stream_acks lock")
+            .push((stream_id, applied_seq));
+    }
 
     async fn get_collection_meta(&self, name: &str) -> Option<CollectionMeta> {
         self.collection_metas

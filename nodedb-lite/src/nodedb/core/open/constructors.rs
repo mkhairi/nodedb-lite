@@ -83,6 +83,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             nodedb_mem::MemoryGovernor::new(config.to_governor_config())
                 .map_err(NodeDbError::config)?,
         );
+        #[cfg(not(target_arch = "wasm32"))]
         let sync_enabled = config.sync_enabled;
         let kv_cache_capacity = NonZeroUsize::new(config.kv_cache_capacity)
             .ok_or_else(|| NodeDbError::config("kv_cache_capacity must be greater than 0"))?;
@@ -165,6 +166,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
         let spatial_outbound_init = outbound_queues.spatial_outbound;
         #[cfg(not(target_arch = "wasm32"))]
         let timeseries_outbound_init = outbound_queues.timeseries_outbound;
+        #[cfg(not(target_arch = "wasm32"))]
+        let kv_outbound = outbound_queues.kv_outbound;
 
         let crdt = Arc::new(Mutex::new(crdt));
         let strict = Arc::new(strict);
@@ -222,6 +225,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ref q) = spatial_outbound_init {
             query_engine.set_spatial_outbound(Arc::clone(q));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref q) = kv_outbound {
+            query_engine.set_kv_outbound(Arc::clone(q));
         }
 
         // ── Array CRDT sync state (send path, receive path, stream sequence
@@ -282,10 +289,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
             spatial_outbound: spatial_outbound_init,
             #[cfg(not(target_arch = "wasm32"))]
             timeseries_outbound: timeseries_outbound_init,
+            #[cfg(not(target_arch = "wasm32"))]
+            kv_outbound,
             identity: Mutex::new(lite_identity),
             identity_change: tokio::sync::Mutex::new(()),
             flush_lock: tokio::sync::Mutex::new(()),
-            sync_enabled,
             kv_local,
             sync_gate: std::sync::RwLock::new(None),
             tasks: crate::tasks::TaskRegistry::default(),

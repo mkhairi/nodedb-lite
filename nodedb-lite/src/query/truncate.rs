@@ -78,7 +78,8 @@ pub(crate) async fn truncate_engine<S: StorageEngine>(
         EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
             document_ops::writes::truncate(engine, collection).await
         }
-        EngineType::KeyValue => kv_ops::writes::kv_truncate(engine, collection).await,
+        // Records a delete of every key for the sync push to Origin.
+        EngineType::KeyValue => kv_ops::sync_capture::truncate_recorded(engine, collection).await,
         // Lite keeps spatial rows in the columnar engine under the spatial
         // profile; the columnar clear also empties the R-tree entries.
         EngineType::Columnar | EngineType::Spatial => {

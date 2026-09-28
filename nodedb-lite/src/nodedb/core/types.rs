@@ -121,6 +121,9 @@ pub struct NodeDbLite<S: StorageEngine> {
     /// Durable outbound queue for timeseries-profile columnar insert sync. `None` when sync is disabled.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) timeseries_outbound: Option<Arc<crate::sync::TimeseriesOutbound<S>>>,
+    /// Durable outbound queue for KV write sync. `None` when sync is disabled.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) kv_outbound: Option<Arc<crate::sync::KvOutbound<S>>>,
     /// This instance's durable identity: `lite_id`, `epoch`, and the Loro peer
     /// id every local operation is authored under.
     ///
@@ -150,8 +153,6 @@ pub struct NodeDbLite<S: StorageEngine> {
     /// checkpoint knows to delete. Serializing them keeps the sequence a
     /// single writer's to allocate.
     pub(crate) flush_lock: tokio::sync::Mutex<()>,
-    /// When `false`, KV operations go directly to storage, bypassing Loro.
-    pub(crate) sync_enabled: bool,
     /// The KV write buffer and read cache, shared with the query engine so a
     /// SQL-path `TRUNCATE` forgets what they hold for the cleared collection.
     pub(crate) kv_local: Arc<super::kv_local::KvLocalState>,

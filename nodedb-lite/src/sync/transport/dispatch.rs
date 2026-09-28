@@ -145,8 +145,18 @@ pub(super) async fn dispatch_frame(
                 if client
                     .admit_row_push(msg.peer_id, &msg.collection, msg.sequence)
                     .await
+                    && let Err(e) = delegate.apply_remote_row(&msg).await
                 {
-                    delegate.apply_remote_row(&msg).await;
+                    // The refusal goes back to Origin as a `RowPushReject`
+                    // on the next push tick.
+                    tracing::error!(
+                        collection = %msg.collection,
+                        doc = %msg.document_id,
+                        sequence = msg.sequence,
+                        error = %e,
+                        "RowPush refused; row not applied, refusal queued for Origin"
+                    );
+                    client.queue_row_push_reject(&msg, &e).await;
                 }
             } else {
                 tracing::warn!(
@@ -324,6 +334,9 @@ pub(super) async fn dispatch_frame(
         }
         SyncMessageType::TimeseriesAck => {
             dispatch_acks::handle_timeseries_ack(client, delegate, frame).await;
+        }
+        SyncMessageType::KvPushAck => {
+            super::dispatch_kv::handle_kv_push_ack(client, delegate, frame).await;
         }
         SyncMessageType::PingPong => {
             // Origin pinged. Our `ping_loop` already keeps the link alive,

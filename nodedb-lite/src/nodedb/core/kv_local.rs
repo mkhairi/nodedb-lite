@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! KV state the public API keeps in front of storage: the write buffer with
-//! its read overlay, and the read cache. Shared between `NodeDbLite` and the
-//! query engine so a SQL-path `TRUNCATE` forgets what they hold for the
-//! collection it cleared; a buffered put would otherwise reach storage on
-//! the next flush, and a cached value would be served after its row is gone.
+//! its read overlay, the read cache, and the write-order lock.
+//!
+//! `NodeDbLite` and the query engine share it:
+//! - a SQL-path `TRUNCATE` forgets what the buffer and cache hold for the
+//!   collection it cleared, so a buffered put cannot reach storage on the
+//!   next flush and a cached value is not served after its row is gone;
+//! - public-API and SQL writes take one write-order lock, so both enqueue
+//!   for sync in the order they applied.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
+use crate::error::LiteError;
 use crate::nodedb::lock_ext::LockExt;
-use crate::storage::engine::WriteOp;
+use crate::storage::engine::{StorageEngine, WriteOp};
 
 /// Buffered KV writes for batch commit.
 ///
@@ -41,6 +46,14 @@ pub struct KvLocalState {
     ///
     /// Capacity is controlled by [`crate::config::LiteConfig::kv_cache_capacity`].
     pub(crate) cache: Mutex<lru::LruCache<Vec<u8>, Vec<u8>>>,
+    /// Serializes every KV write that syncs to Origin, public API and SQL.
+    ///
+    /// A write holds it from its local apply through its outbound enqueue,
+    /// so the outbound queue holds writes in the order they were applied.
+    /// Without it, two writes to one key could apply in one order and
+    /// enqueue in the other, and Origin would keep the value Lite overwrote.
+    /// It also makes a read-modify-write such as `kv_increment` atomic.
+    pub(crate) write_order: tokio::sync::Mutex<()>,
 }
 
 impl KvLocalState {
@@ -51,7 +64,28 @@ impl KvLocalState {
                 overlay: HashMap::new(),
             }),
             cache: Mutex::new(lru::LruCache::new(cache_capacity)),
+            write_order: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Commit every buffered write to `storage` as one batch. Returns the
+    /// number of writes committed.
+    ///
+    /// A SQL KV write calls this before it runs, so a buffered public-API
+    /// write to the same key cannot land after it and overwrite it.
+    pub(crate) async fn flush_to<S: StorageEngine>(&self, storage: &S) -> Result<usize, LiteError> {
+        let ops: Vec<WriteOp> = {
+            let mut buf = self.write_buf.lock_or_recover();
+            if buf.ops.is_empty() {
+                return Ok(0);
+            }
+            let ops = std::mem::take(&mut buf.ops);
+            buf.overlay.clear();
+            ops
+        };
+        let count = ops.len();
+        storage.batch_write(&ops).await?;
+        Ok(count)
     }
 
     /// Drop every buffered write and cached value whose key belongs to

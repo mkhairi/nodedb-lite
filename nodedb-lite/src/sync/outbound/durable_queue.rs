@@ -85,19 +85,29 @@ impl<S: StorageEngine> DurableOutboundQueue<S> {
     ///
     /// Returns [`LiteError::Backpressure`] when `len() >= cap`.
     pub async fn enqueue(&self, payload: &[u8]) -> Result<(), LiteError> {
+        self.ensure_room(1).await?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let key = id.to_be_bytes().to_vec();
+        self.storage.put(self.namespace, &key, payload).await
+    }
+
+    /// Check that `entries` more entries fit under the cap.
+    ///
+    /// Returns [`LiteError::Backpressure`] when `len() + entries > cap`. A
+    /// writer that enqueues after its local write calls this first, so a
+    /// full queue refuses the write before it changes local state.
+    pub async fn ensure_room(&self, entries: usize) -> Result<(), LiteError> {
         let current = self.len().await?;
-        if current >= self.cap as u64 {
+        if current.saturating_add(entries as u64) > self.cap as u64 {
             return Err(LiteError::Backpressure {
                 detail: format!(
-                    "outbound pending queue full ({current} >= {}); writes paused until \
-                     Origin sync drains the queue",
+                    "outbound pending queue full ({current} pending, {entries} more, cap {}); \
+                     writes paused until Origin sync drains the queue",
                     self.cap
                 ),
             });
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let key = id.to_be_bytes().to_vec();
-        self.storage.put(self.namespace, &key, payload).await
+        Ok(())
     }
 
     /// Return up to `limit` entries in FIFO order (lowest key first).

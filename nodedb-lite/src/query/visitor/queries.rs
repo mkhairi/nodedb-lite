@@ -405,7 +405,7 @@ pub(super) fn lower_subquery<'a, S: StorageEngine + 'a>(
     } = args;
     let input = input.clone();
     let filters = filters.to_vec();
-    let projection = subquery_projection_columns(projection)?;
+    let projection = subquery_projection_columns(projection, window_functions)?;
     let window_functions = window_functions.to_vec();
     let sort_keys = sort_keys.to_vec();
 
@@ -416,10 +416,6 @@ pub(super) fn lower_subquery<'a, S: StorageEngine + 'a>(
 
         apply_window_functions(&mut result, &window_functions)?;
 
-        if offset > 0 {
-            result.rows = result.rows.into_iter().skip(offset).collect();
-        }
-
         sort_rows(&mut result, &sort_keys)?;
 
         if distinct {
@@ -427,6 +423,11 @@ pub(super) fn lower_subquery<'a, S: StorageEngine + 'a>(
         }
 
         project_rows(&mut result, &projection);
+
+        // OFFSET skips rows of the sorted result, never of the input.
+        if offset > 0 {
+            result.rows = result.rows.into_iter().skip(offset).collect();
+        }
 
         if let Some(n) = limit {
             result.rows.truncate(n);
@@ -439,13 +440,22 @@ pub(super) fn lower_subquery<'a, S: StorageEngine + 'a>(
 /// Lower an outer target list to bare column names. `Star` (and a qualified
 /// star) means "inherit the body's columns" and yields an empty list.
 ///
-/// A computed projection is rejected rather than silently dropped: the tail
-/// reshapes materialized rows and has no expression evaluator, so the
-/// expression must be projected inside the subquery instead.
-fn subquery_projection_columns(projection: &[Projection]) -> Result<Vec<String>, LiteError> {
+/// A window call is the column the window pass appended, named by its alias.
+/// Any other computed projection is rejected rather than silently dropped:
+/// the tail reshapes materialized rows and has no expression evaluator, so
+/// the expression must be projected inside the subquery instead.
+fn subquery_projection_columns(
+    projection: &[Projection],
+    window_functions: &[WindowSpec],
+) -> Result<Vec<String>, LiteError> {
     let mut names = Vec::with_capacity(projection.len());
     for p in projection {
         match p {
+            Projection::Computed { alias, .. }
+                if window_functions.iter().any(|spec| spec.alias == *alias) =>
+            {
+                names.push(alias.clone());
+            }
             Projection::Column(qname) => {
                 names.push(qname.rsplit('.').next().unwrap_or(qname).to_string());
             }

@@ -7,6 +7,7 @@ pub mod ddl;
 pub mod document_ops;
 pub mod engine;
 pub(crate) mod engine_dml;
+pub(crate) mod engine_read;
 pub(crate) mod expr_convert;
 pub(crate) mod filter_convert;
 pub(crate) mod graph_ops;

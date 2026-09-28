@@ -311,7 +311,7 @@ pub(super) fn windowed_score_key(
 /// Returns `None` if the column is absent or the value is not numeric.
 #[allow(dead_code)]
 pub(super) fn extract_ts_from_value(value_bytes: &[u8], column: &str) -> Option<u64> {
-    let map: std::collections::HashMap<String, Value> = zerompk::from_msgpack(value_bytes).ok()?;
+    let map = crate::query::kv_ops::body::decode_kv_map(value_bytes).ok()??;
     match map.get(column)? {
         Value::Integer(n) => {
             if *n >= 0 {

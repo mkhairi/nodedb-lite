@@ -2,7 +2,8 @@
 //! Write-path and config-path implementations for wired `VectorOp` variants.
 //!
 //! Each function corresponds to one variant routed here from `vector_op.rs`.
-//! `parse_metric` lives here; `ensure_hnsw` lives in `engine::vector::state`.
+//! Every index access goes through `engine::vector::resident`, which loads an
+//! evicted index back first.
 
 use std::sync::Arc;
 
@@ -11,9 +12,10 @@ use nodedb_types::collection_config::VectorPrimaryConfig;
 use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 use nodedb_types::vector_distance::DistanceMetric;
-use nodedb_types::vector_dtype::VectorStorageDtype;
 
-use crate::engine::vector::state::ensure_hnsw;
+use crate::engine::vector::resident::{
+    check_insert_widths, lock_resident, lock_resident_or_create,
+};
 use crate::error::LiteError;
 use crate::nodedb::LockExt;
 use crate::query::engine::LiteQueryEngine;
@@ -61,6 +63,9 @@ where
         } else {
             format!("{collection}:{field_name}")
         };
+        // A vector of another width than the index, loaded back if it was
+        // evicted, is refused before its durable row is written.
+        check_insert_widths(&vector_state, &index_key, [embedding.len()]).await?;
         // Durable row first: it is the source of truth that both the in-memory
         // index and the pagedb segment are derived from, so it must never be the
         // copy missing after a crash — and a flush that finds no durable row for
@@ -76,21 +81,11 @@ where
                 })?;
         }
         let internal_id = {
-            let dtype = {
-                let configs = vector_state.per_index_config.lock_or_recover();
-                configs
-                    .get(&index_key)
-                    .map(|c| c.storage_dtype)
-                    .unwrap_or(VectorStorageDtype::F32)
-            };
-            let mut indices = vector_state.hnsw_indices.lock_or_recover();
-            let index = ensure_hnsw(&mut indices, &index_key, embedding.len(), dtype);
+            let mut resident =
+                lock_resident_or_create(&vector_state, &index_key, embedding.len()).await?;
+            let index = resident.index();
             let id_before = index.len() as u32;
-            index
-                .insert(embedding.clone())
-                .map_err(|e| LiteError::BadRequest {
-                    detail: format!("Insert: HNSW insert failed: {e}"),
-                })?;
+            index.insert(embedding.clone()).map_err(LiteError::from)?;
             id_before
         };
         {
@@ -154,22 +149,31 @@ where
     let vector_state = Arc::clone(&engine.vector_state);
     let crdt = Arc::clone(&engine.crdt);
     Box::pin(async move {
-        let doc_id = {
-            let id_map = vector_state.vector_id_map.lock_or_recover();
-            id_map
-                .iter()
-                .find(|(_, (_, iid))| *iid == vector_id)
-                .map(|(_, (did, _))| did.clone())
-        };
-        let doc_id = doc_id.ok_or_else(|| LiteError::BadRequest {
-            detail: format!("Delete: vector_id {vector_id} not found in collection '{collection}'"),
-        })?;
+        let doc_id = vector_state
+            .vector_id_map
+            .lock_or_recover()
+            .get(&format!("{collection}:{vector_id}"))
+            .map(|(did, _)| did.clone())
+            .ok_or_else(|| LiteError::BadRequest {
+                detail: format!(
+                    "Delete: vector_id {vector_id} not found in collection '{collection}'"
+                ),
+            })?;
+        // Durable row first: left behind, it would bring the vector back on
+        // the next rebuild.
+        crate::engine::vector::durable::remove(&*vector_state.storage, &collection, &doc_id)
+            .await?;
         {
-            let mut indices = vector_state.hnsw_indices.lock_or_recover();
+            // The index, loaded back if it was evicted, takes the tombstone.
+            let mut indices = lock_resident(&vector_state, &collection).await?;
             if let Some(index) = indices.get_mut(&collection) {
                 index.delete(vector_id);
             }
         }
+        vector_state
+            .vector_id_map
+            .lock_or_recover()
+            .remove(&format!("{collection}:{vector_id}"));
         {
             let mut crdt = crdt.lock_or_recover();
             crdt.delete(&collection, &doc_id)
@@ -206,7 +210,7 @@ where
         } else {
             format!("{collection}:{field_name}")
         };
-        let had_node = remove_live_node(&vector_state, &index_key, &doc_id);
+        let had_node = remove_live_node(&vector_state, &index_key, &doc_id).await?;
         let had_row = {
             let mut crdt = crdt.lock_or_recover();
             if crdt.exists(&collection, &doc_id) {
@@ -243,7 +247,8 @@ where
     let vector_state = Arc::clone(&engine.vector_state);
     Ok(Box::pin(async move {
         {
-            let indices = vector_state.hnsw_indices.lock_or_recover();
+            // An evicted index still exists: it is loaded back to be seen.
+            let indices = lock_resident(&vector_state, &index_key).await?;
             if indices.contains_key(&index_key) {
                 return Err(LiteError::BadRequest {
                     detail: format!(
@@ -288,7 +293,7 @@ where
             "dtype".to_string(),
             "metric".to_string(),
         ];
-        let indices = vector_state.hnsw_indices.lock_or_recover();
+        let indices = lock_resident(&vector_state, &index_key).await?;
         let rows = if let Some(idx) = indices.get(&index_key) {
             let p = idx.params();
             vec![vec![
@@ -325,11 +330,12 @@ where
 {
     let vector_state = Arc::clone(&engine.vector_state);
     Ok(Box::pin(async move {
-        let existed = vector_state
-            .hnsw_indices
-            .lock_or_recover()
-            .remove(&index_key)
-            .is_some();
+        // An evicted index exists too: its checkpoint is in storage.
+        let existed = {
+            let mut indices = vector_state.hnsw_indices.lock_or_recover();
+            let evicted = vector_state.evicted.lock_or_recover().remove(&index_key);
+            indices.remove(&index_key).is_some() || evicted
+        };
 
         {
             let mut map = vector_state.vector_id_map.lock_or_recover();
@@ -345,45 +351,22 @@ where
             .lock_or_recover()
             .remove(&index_key);
 
-        // Persisted checkpoint.
-        let _ = vector_state
+        // Persisted checkpoint, then the durable per-document vectors — see
+        // the doc comment above. Either one left behind resurrects the index
+        // on the next open, so a failure fails the drop.
+        vector_state
             .storage
             .delete(
                 nodedb_types::Namespace::Vector,
                 format!("hnsw:{index_key}").as_bytes(),
             )
-            .await;
-
-        // Durable per-document vectors — see the doc comment above.
-        match crate::engine::vector::durable::load_collection(&*vector_state.storage, &index_key)
-            .await
-        {
-            Ok(rows) => {
-                for (doc_id, _) in rows {
-                    if let Err(e) = crate::engine::vector::durable::remove(
-                        &*vector_state.storage,
-                        &index_key,
-                        &doc_id,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            index_key,
-                            doc_id,
-                            error = %e,
-                            "DropIndex: removing a durable vector failed; it may resurrect \
-                             the dropped index on the next open"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    index_key,
-                    error = %e,
-                    "DropIndex: listing durable vectors failed; some may survive the drop"
-                );
-            }
+            .await?;
+        let rows =
+            crate::engine::vector::durable::load_collection(&*vector_state.storage, &index_key)
+                .await?;
+        for (doc_id, _) in rows {
+            crate::engine::vector::durable::remove(&*vector_state.storage, &index_key, &doc_id)
+                .await?;
         }
 
         tracing::info!(index_key, existed, "vector index dropped");

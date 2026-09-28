@@ -44,10 +44,10 @@ pub(super) fn point_get<'a, S: StorageEngine + 'a>(
     collection: &str,
     _alias: Option<&str>,
     engine_type: EngineType,
-    _key_column: &str,
+    key_column: &str,
     key_value: &SqlValue,
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_point_get(engine, collection, engine_type, key_value)
+    lower_point_get(engine, collection, engine_type, key_column, key_value)
 }
 
 pub(super) fn document_index_lookup<'a, S: StorageEngine + 'a>(

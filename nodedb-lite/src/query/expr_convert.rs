@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Convert `nodedb_sql::types_expr::SqlExpr` to `nodedb_query::expr::types::SqlExpr`
-//! for use in sort-key evaluation and other post-processing steps.
+//! for WHERE predicates, sort keys, projections and assignments.
+//!
+//! The evaluator has no `IN`, `BETWEEN`, `LIKE` or array-construct variant.
+//! Each is lowered the way Origin's planner lowers it, so an expression
+//! evaluates the same on both.
 
 use nodedb_query::expr::types::{BinaryOp as QBinaryOp, CastType, SqlExpr as QExpr};
 use nodedb_sql::types_expr::{BinaryOp as SBinaryOp, SqlExpr as SExpr, UnaryOp};
@@ -11,9 +15,17 @@ use crate::query::filter_convert::sql_value_to_value;
 
 /// Convert a SQL-side expression to a query-side expression.
 ///
-/// Variants that have no meaningful query-side equivalent in a sort context
-/// (Subquery, Wildcard, InList, Between, Like, ArrayLiteral) return
-/// `LiteError::BadRequest` naming the unsupported variant.
+/// Lowerings, as on Origin:
+/// - `e IN (a, b)` is `e = a OR e = b`, and `NOT IN` is `e <> a AND e <> b`.
+///   An empty list is `false`, or `true` for `NOT IN`.
+/// - `e BETWEEN lo AND hi` is `e >= lo AND e <= hi`, and `NOT BETWEEN` is
+///   `e < lo OR e > hi`.
+/// - `e LIKE p` calls `like(e, p)`, or `ilike` when case-insensitive.
+///   `NOT LIKE` negates the call.
+/// - An array of literals is one array literal. An array with any other
+///   element calls `make_array`, which builds the array per row.
+///
+/// A subquery or a wildcard has no evaluator form and is a `BadRequest`.
 pub(crate) fn convert_sql_expr(expr: &SExpr) -> Result<QExpr, LiteError> {
     match expr {
         // `EXCLUDED.col` (`INSERT ... ON CONFLICT DO UPDATE`) resolves
@@ -106,28 +118,113 @@ pub(crate) fn convert_sql_expr(expr: &SExpr) -> Result<QExpr, LiteError> {
             })
         }
 
+        SExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let target = convert_sql_expr(expr)?;
+            let (eq_op, combine_op) = if *negated {
+                (QBinaryOp::NotEq, QBinaryOp::And)
+            } else {
+                (QBinaryOp::Eq, QBinaryOp::Or)
+            };
+            let mut lowered: Option<QExpr> = None;
+            for item in list {
+                let test = QExpr::BinaryOp {
+                    left: Box::new(target.clone()),
+                    op: eq_op,
+                    right: Box::new(convert_sql_expr(item)?),
+                };
+                lowered = Some(match lowered {
+                    None => test,
+                    Some(acc) => QExpr::BinaryOp {
+                        left: Box::new(acc),
+                        op: combine_op,
+                        right: Box::new(test),
+                    },
+                });
+            }
+            Ok(lowered.unwrap_or(QExpr::Literal(nodedb_types::Value::Bool(*negated))))
+        }
+
+        SExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let e = convert_sql_expr(expr)?;
+            let lo = convert_sql_expr(low)?;
+            let hi = convert_sql_expr(high)?;
+            let (low_op, high_op, combine_op) = if *negated {
+                (QBinaryOp::Lt, QBinaryOp::Gt, QBinaryOp::Or)
+            } else {
+                (QBinaryOp::GtEq, QBinaryOp::LtEq, QBinaryOp::And)
+            };
+            Ok(QExpr::BinaryOp {
+                left: Box::new(QExpr::BinaryOp {
+                    left: Box::new(e.clone()),
+                    op: low_op,
+                    right: Box::new(lo),
+                }),
+                op: combine_op,
+                right: Box::new(QExpr::BinaryOp {
+                    left: Box::new(e),
+                    op: high_op,
+                    right: Box::new(hi),
+                }),
+            })
+        }
+
+        SExpr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
+            let name = if *case_insensitive { "ilike" } else { "like" };
+            let call = QExpr::Function {
+                name: name.into(),
+                args: vec![convert_sql_expr(expr)?, convert_sql_expr(pattern)?],
+            };
+            Ok(if *negated {
+                QExpr::Negate(Box::new(call))
+            } else {
+                call
+            })
+        }
+
+        SExpr::ArrayLiteral(elems) => {
+            let lowered = elems
+                .iter()
+                .map(convert_sql_expr)
+                .collect::<Result<Vec<QExpr>, LiteError>>()?;
+            let literals: Option<Vec<nodedb_types::Value>> = lowered
+                .iter()
+                .map(|elem| {
+                    if let QExpr::Literal(v) = elem {
+                        Some(v.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            Ok(match literals {
+                Some(values) => QExpr::Literal(nodedb_types::Value::Array(values)),
+                None => QExpr::Function {
+                    name: "make_array".into(),
+                    args: lowered,
+                },
+            })
+        }
+
         SExpr::Subquery(_) => Err(LiteError::BadRequest {
-            detail: "Subquery expressions are not valid in a sort context".to_string(),
+            detail: "a subquery has no expression form here".to_string(),
         }),
 
         SExpr::Wildcard => Err(LiteError::BadRequest {
-            detail: "Wildcard expressions are not valid in a sort context".to_string(),
-        }),
-
-        SExpr::InList { .. } => Err(LiteError::BadRequest {
-            detail: "InList expressions are not valid in a sort context".to_string(),
-        }),
-
-        SExpr::Between { .. } => Err(LiteError::BadRequest {
-            detail: "Between expressions are not valid in a sort context".to_string(),
-        }),
-
-        SExpr::Like { .. } => Err(LiteError::BadRequest {
-            detail: "Like expressions are not valid in a sort context".to_string(),
-        }),
-
-        SExpr::ArrayLiteral(_) => Err(LiteError::BadRequest {
-            detail: "ArrayLiteral expressions are not valid in a sort context".to_string(),
+            detail: "a wildcard has no expression form here".to_string(),
         }),
     }
 }
@@ -158,7 +255,105 @@ fn convert_cast_type(to_type: &str) -> Result<CastType, LiteError> {
         "TEXT" | "STRING" | "VARCHAR" | "CHAR" => Ok(CastType::String),
         "BOOL" | "BOOLEAN" => Ok(CastType::Bool),
         other => Err(LiteError::BadRequest {
-            detail: format!("CAST to type '{other}' is not supported in a sort context"),
+            detail: format!("CAST to type '{other}' is not supported"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_sql::types_expr::SqlValue;
+    use nodedb_types::Value;
+
+    use super::*;
+
+    fn col(name: &str) -> SExpr {
+        SExpr::Column {
+            table: None,
+            name: name.into(),
+        }
+    }
+
+    fn lit(v: i64) -> SExpr {
+        SExpr::Literal(SqlValue::Int(v))
+    }
+
+    fn eval(expr: &SExpr, n: i64) -> Value {
+        let doc = Value::Object(std::collections::HashMap::from([
+            ("n".to_string(), Value::Integer(n)),
+            ("s".to_string(), Value::String("alpha".into())),
+        ]));
+        convert_sql_expr(expr)
+            .expect("lower")
+            .eval(&doc)
+            .expect("eval")
+    }
+
+    #[test]
+    fn in_lowers_to_an_or_of_equalities() {
+        let expr = SExpr::InList {
+            expr: Box::new(col("n")),
+            list: vec![lit(1), lit(3)],
+            negated: false,
+        };
+        assert_eq!(eval(&expr, 3), Value::Bool(true));
+        assert_eq!(eval(&expr, 2), Value::Bool(false));
+    }
+
+    #[test]
+    fn not_in_and_an_empty_list_follow_origin() {
+        let not_in = SExpr::InList {
+            expr: Box::new(col("n")),
+            list: vec![lit(1)],
+            negated: true,
+        };
+        assert_eq!(eval(&not_in, 2), Value::Bool(true));
+        let empty = SExpr::InList {
+            expr: Box::new(col("n")),
+            list: Vec::new(),
+            negated: false,
+        };
+        assert_eq!(eval(&empty, 1), Value::Bool(false));
+    }
+
+    #[test]
+    fn like_and_not_like_lower_to_the_like_function() {
+        let like = |negated, case_insensitive, pattern: &str| SExpr::Like {
+            expr: Box::new(col("s")),
+            pattern: Box::new(SExpr::Literal(SqlValue::String(pattern.into()))),
+            negated,
+            case_insensitive,
+        };
+        assert_eq!(eval(&like(false, false, "al%"), 0), Value::Bool(true));
+        assert_eq!(eval(&like(true, false, "al%"), 0), Value::Bool(false));
+        assert_eq!(eval(&like(false, true, "AL%"), 0), Value::Bool(true));
+        assert_eq!(eval(&like(false, false, "AL%"), 0), Value::Bool(false));
+    }
+
+    #[test]
+    fn an_array_with_a_column_element_is_built_per_row() {
+        let expr = SExpr::ArrayLiteral(vec![col("n"), lit(1)]);
+        assert_eq!(
+            eval(&expr, 7),
+            Value::Array(vec![Value::Integer(7), Value::Integer(1)])
+        );
+        let literal = SExpr::ArrayLiteral(vec![lit(1), lit(2)]);
+        assert_eq!(
+            convert_sql_expr(&literal).expect("lower"),
+            QExpr::Literal(Value::Array(vec![Value::Integer(1), Value::Integer(2)]))
+        );
+    }
+
+    #[test]
+    fn between_is_inclusive() {
+        let expr = SExpr::Between {
+            expr: Box::new(col("n")),
+            low: Box::new(lit(2)),
+            high: Box::new(lit(4)),
+            negated: false,
+        };
+        assert_eq!(eval(&expr, 2), Value::Bool(true));
+        assert_eq!(eval(&expr, 4), Value::Bool(true));
+        assert_eq!(eval(&expr, 5), Value::Bool(false));
     }
 }

@@ -67,6 +67,9 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             surrogate: _,
             returning,
             rls_filters,
+            // Provenance marks a write pushed by a sync producer. Lite is
+            // the producer and never receives one.
+            provenance: _,
         } => writes::put(
             engine,
             collection,
@@ -143,6 +146,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             rls_write_check,
             returning,
             rls_filters,
+            provenance: _,
         } => writes::delete(
             engine,
             collection,
@@ -186,7 +190,16 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             ttl_ms,
             surrogate: _,
             rls_write_check,
-        } => writes::incr(engine, collection, key, *delta, *ttl_ms, rls_write_check),
+            shape,
+        } => writes::incr(
+            engine,
+            collection,
+            key,
+            *delta,
+            *ttl_ms,
+            shape,
+            rls_write_check,
+        ),
 
         KvOp::IncrFloat {
             collection,
@@ -194,7 +207,8 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             delta,
             surrogate: _,
             rls_write_check,
-        } => writes::incr_float(engine, collection, key, *delta, rls_write_check),
+            shape,
+        } => writes::incr_float(engine, collection, key, delta, shape, rls_write_check),
 
         KvOp::Cas {
             collection,
@@ -340,6 +354,10 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             index_name,
             primary_key,
         } => indexes::sorted_index_score(engine, index_name, primary_key),
+
+        KvOp::SortedIndexTxnRead { collection, .. } => {
+            Err(unsupported::sorted_index_txn_read(collection.as_str()))
+        }
 
         // ResolveWrite/ResolvedWrite are the resolve-before-propose wire
         // shape Origin's cross-vshard write path uses to decide a policy

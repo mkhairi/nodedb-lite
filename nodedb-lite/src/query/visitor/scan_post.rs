@@ -26,15 +26,19 @@ use crate::sequence::LiteSequenceRegistry;
 ///
 /// Steps follow SQL semantics for a flat scan (no grouping or aggregation):
 /// 1. WHERE filtering
-/// 2. ORDER BY sorting
-/// 3. Window function evaluation
+/// 2. Window function evaluation
+/// 3. ORDER BY sorting
 /// 4. Target-list projection (computed and sequence expressions)
 /// 5. DISTINCT deduplication over the projected shape
 /// 6. OFFSET skip
 /// 7. LIMIT take
 ///
-/// Sorting runs before projection so an ORDER BY key outside the SELECT
-/// list still resolves against the scan columns.
+/// This is Origin's order. The window pass runs before the sort so ORDER BY
+/// can name a window alias; a window's own ORDER BY orders its partitions,
+/// so the input order does not matter to it. Sorting runs before projection
+/// so an ORDER BY key outside the SELECT list still resolves against the
+/// scan columns. Projection reads each window output as a column and never
+/// calls the window function.
 pub(crate) fn apply_scan_post_processing(
     mut result: QueryResult,
     args: ScanPostArgs<'_>,
@@ -53,14 +57,14 @@ pub(crate) fn apply_scan_post_processing(
     // 1. WHERE — apply both primitive MetadataFilter and complex QExpr predicates.
     filter_rows(&mut result, filters)?;
 
-    // 2. ORDER BY
-    sort_rows(&mut result, sort_keys)?;
-
-    // 3. Window functions
+    // 2. Window functions
     apply_window_functions(&mut result, window_specs)?;
 
+    // 3. ORDER BY
+    sort_rows(&mut result, sort_keys)?;
+
     // 4. Projection
-    project_scan_result(&mut result, projection, sequences)?;
+    project_scan_result(&mut result, projection, window_specs, sequences)?;
 
     // 5. DISTINCT — over the projected row.
     if distinct {
@@ -124,20 +128,32 @@ pub(crate) fn apply_window_functions(
 /// `MetadataFilter` form and the complex `QExpr` predicates. A no-op when
 /// `filters` is empty or lowers to nothing.
 pub(crate) fn filter_rows(result: &mut QueryResult, filters: &[Filter]) -> Result<(), LiteError> {
-    if filters.is_empty() {
-        return Ok(());
-    }
-    let lf: LiteFilter = sql_filters_to_metadata(filters, &[])?;
-    if lf.is_empty() {
-        return Ok(());
-    }
     // Evaluation is fallible (a divide-by-zero predicate must fail the
     // statement, not drop the row), so the keep-decision is computed up front
     // rather than inside a `retain` closure that cannot propagate.
-    let columns = result.columns.clone();
+    let keep = filter_mask(result, filters)?;
+    let mut iter = keep.into_iter();
+    result.rows.retain(|_| iter.next().unwrap_or(true));
+    Ok(())
+}
+
+/// Whether each row of `result` satisfies `filters`, in row order. Every
+/// row passes when `filters` is empty or lowers to nothing.
+pub(crate) fn filter_mask(
+    result: &QueryResult,
+    filters: &[Filter],
+) -> Result<Vec<bool>, LiteError> {
+    if filters.is_empty() {
+        return Ok(vec![true; result.rows.len()]);
+    }
+    let lf: LiteFilter = sql_filters_to_metadata(filters, &[])?;
+    if lf.is_empty() {
+        return Ok(vec![true; result.rows.len()]);
+    }
+    let columns = &result.columns;
     let mut keep = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
-        let json_doc = row_to_json(&columns, row);
+        let json_doc = row_to_json(columns, row);
         let meta_pass = lf
             .meta
             .as_ref()
@@ -150,13 +166,11 @@ pub(crate) fn filter_rows(result: &mut QueryResult, filters: &[Filter]) -> Resul
         if lf.exprs.is_empty() {
             keep.push(true);
         } else {
-            let typed_doc = row_to_typed_value(&columns, row);
+            let typed_doc = row_to_typed_value(columns, row);
             keep.push(lf.eval_exprs(&typed_doc)?);
         }
     }
-    let mut iter = keep.into_iter();
-    result.rows.retain(|_| iter.next().unwrap_or(true));
-    Ok(())
+    Ok(keep)
 }
 
 /// Deduplicate rows on the *would-be projected* shape, so SQL `DISTINCT`

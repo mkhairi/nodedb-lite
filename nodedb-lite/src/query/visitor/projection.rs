@@ -11,7 +11,7 @@
 
 use nodedb_physical::physical_plan::query::JoinProjection;
 use nodedb_query::expr::types::SqlExpr as QExpr;
-use nodedb_sql::types::query::Projection;
+use nodedb_sql::types::query::{Projection, WindowSpec};
 use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
@@ -76,9 +76,14 @@ enum Item {
 
 /// Reshape `result` to `projection`. An empty list or a bare `*` leaves the
 /// scan shape untouched.
+///
+/// A `Computed` item whose alias names a window spec is the column the
+/// window pass already appended, read by name, never a call to evaluate.
+/// This is Origin's rule: a window alias is served by its window spec.
 pub(crate) fn project_scan_result(
     result: &mut QueryResult,
     projection: &[Projection],
+    window_specs: &[WindowSpec],
     sequences: &LiteSequenceRegistry,
 ) -> Result<(), LiteError> {
     if projection.is_empty()
@@ -88,7 +93,7 @@ pub(crate) fn project_scan_result(
     {
         return Ok(());
     }
-    let items = convert_items(projection)?;
+    let items = convert_items(projection, window_specs)?;
     let scan_columns = std::mem::take(&mut result.columns);
 
     let mut out_columns = Vec::with_capacity(items.len());
@@ -133,10 +138,21 @@ pub(crate) fn project_scan_result(
     Ok(())
 }
 
-fn convert_items(projection: &[Projection]) -> Result<Vec<Item>, LiteError> {
+fn convert_items(
+    projection: &[Projection],
+    window_specs: &[WindowSpec],
+) -> Result<Vec<Item>, LiteError> {
     let mut items = Vec::with_capacity(projection.len());
     for p in projection {
         items.push(match p {
+            Projection::Computed { alias, .. }
+                if window_specs.iter().any(|spec| spec.alias == *alias) =>
+            {
+                Item::Column {
+                    name: alias.clone(),
+                    bare: alias.clone(),
+                }
+            }
             Projection::Column(name) => Item::Column {
                 name: name.clone(),
                 bare: name.rsplit('.').next().unwrap_or(name).to_string(),
@@ -394,7 +410,7 @@ mod tests {
                 alias: "total".into(),
             },
         ];
-        project_scan_result(&mut result, &projection, &LiteSequenceRegistry::new())
+        project_scan_result(&mut result, &projection, &[], &LiteSequenceRegistry::new())
             .expect("project");
         assert_eq!(result.columns, vec!["id".to_string(), "total".to_string()]);
         assert_eq!(result.rows[0], vec![Value::Integer(1), Value::Integer(20)]);
@@ -416,7 +432,7 @@ mod tests {
             Projection::Column("t.name".into()),
             Projection::Column("id".into()),
         ];
-        project_scan_result(&mut result, &projection, &LiteSequenceRegistry::new())
+        project_scan_result(&mut result, &projection, &[], &LiteSequenceRegistry::new())
             .expect("project");
         assert_eq!(result.columns, vec!["name".to_string(), "id".to_string()]);
         assert_eq!(
@@ -435,7 +451,7 @@ mod tests {
             },
             Projection::Column("id".into()),
         ];
-        project_scan_result(&mut result, &projection, &registry_with("s")).expect("project");
+        project_scan_result(&mut result, &projection, &[], &registry_with("s")).expect("project");
         assert_eq!(result.columns, vec!["n".to_string(), "id".to_string()]);
         assert_eq!(result.rows[0], vec![Value::Integer(1), Value::Integer(1)]);
         assert_eq!(result.rows[1], vec![Value::Integer(2), Value::Integer(2)]);
@@ -454,7 +470,7 @@ mod tests {
                 alias: "c".into(),
             },
         ];
-        project_scan_result(&mut result, &projection, &registry_with("s")).expect("project");
+        project_scan_result(&mut result, &projection, &[], &registry_with("s")).expect("project");
         assert_eq!(result.rows[1], vec![Value::Integer(2), Value::Integer(2)]);
     }
 
@@ -465,7 +481,7 @@ mod tests {
             expr: accessor("nextval", "missing"),
             alias: "n".into(),
         }];
-        let err = project_scan_result(&mut result, &projection, &LiteSequenceRegistry::new())
+        let err = project_scan_result(&mut result, &projection, &[], &LiteSequenceRegistry::new())
             .expect_err("unknown sequence");
         assert!(err.to_string().contains("does not exist"), "{err}");
     }
@@ -476,6 +492,7 @@ mod tests {
         project_scan_result(
             &mut result,
             &[Projection::Star],
+            &[],
             &LiteSequenceRegistry::new(),
         )
         .expect("project");

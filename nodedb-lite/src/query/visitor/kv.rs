@@ -12,6 +12,7 @@ use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::expr_convert::convert_sql_expr;
 use crate::query::filter_convert::sql_value_to_value;
+use crate::query::kv_ops::sql_read::kv_key_bytes;
 use crate::query::physical_visitor::LiteDataPlaneVisitor;
 use crate::storage::engine::StorageEngine;
 
@@ -19,37 +20,80 @@ use super::adapter::LiteFut;
 
 // ── Value encoding ────────────────────────────────────────────────────────────
 
-/// Encode a `SqlValue` as raw bytes for use as a KV key.
-/// Mirrors Origin's `sql_value_to_bytes`: strings and bytes are returned
-/// as-is; integers are stringified; everything else uses the debug string.
-fn sql_value_to_bytes(v: &SqlValue) -> Vec<u8> {
+/// Raw bytes for a lone `value` column, by Origin's rule: a scalar encodes
+/// as `nodedb_types::scalar_to_raw_bytes` writes it, and an array is
+/// PostgreSQL array text.
+fn sql_value_raw_bytes(v: &SqlValue) -> Vec<u8> {
     match v {
-        SqlValue::String(s) => s.as_bytes().to_vec(),
         SqlValue::Bytes(b) => b.clone(),
-        SqlValue::Int(i) => i.to_string().into_bytes(),
-        _ => format!("{v:?}").into_bytes(),
+        SqlValue::Array(values) => pg_array_text(values).into_bytes(),
+        SqlValue::Int(_)
+        | SqlValue::Float(_)
+        | SqlValue::Decimal(_)
+        | SqlValue::String(_)
+        | SqlValue::Bool(_)
+        | SqlValue::Null
+        | SqlValue::Timestamp(_)
+        | SqlValue::Timestamptz(_) => pg_text(v).into_bytes(),
     }
 }
 
-/// Encode a KV value column set as a MessagePack map.
+/// The text form of one SQL value, as Origin's `sql_value_to_string` writes
+/// it.
+fn pg_text(v: &SqlValue) -> String {
+    match v {
+        SqlValue::String(s) => s.clone(),
+        SqlValue::Int(i) => i.to_string(),
+        SqlValue::Float(f) => f.to_string(),
+        SqlValue::Decimal(d) => d.to_string(),
+        SqlValue::Bool(b) => b.to_string(),
+        SqlValue::Timestamp(at) | SqlValue::Timestamptz(at) => at.to_iso8601(),
+        SqlValue::Bytes(b) => {
+            let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!("\\x{hex}")
+        }
+        SqlValue::Array(values) => pg_array_text(values),
+        SqlValue::Null => String::new(),
+    }
+}
+
+/// PostgreSQL array text: `{a,"two words",NULL}`.
+fn pg_array_text(values: &[SqlValue]) -> String {
+    let elements: Vec<String> = values
+        .iter()
+        .map(|value| match value {
+            SqlValue::Null => "NULL".to_string(),
+            SqlValue::String(s) if pg_array_string_needs_quotes(s) => {
+                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+            }
+            other => pg_text(other),
+        })
+        .collect();
+    format!("{{{}}}", elements.join(","))
+}
+
+fn pg_array_string_needs_quotes(value: &str) -> bool {
+    value.is_empty()
+        || value.eq_ignore_ascii_case("null")
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, ',' | '{' | '}' | '"' | '\\'))
+}
+
+/// Encode a KV insert's value columns as the stored body.
 ///
-/// When a single `value` column is present its bytes are stored directly
-/// (plain-value path). Otherwise a msgpack map `{col: val, ...}` is stored.
+/// A lone `value` column stores its raw bytes. Any other column set stores
+/// the map body `kv_ops::body::encode_kv_body` writes, the same body an
+/// Origin row apply stores.
 fn encode_kv_value(value_cols: &[(String, SqlValue)]) -> Result<Vec<u8>, LiteError> {
     if value_cols.len() == 1 && value_cols[0].0 == "value" {
-        return Ok(sql_value_to_bytes(&value_cols[0].1));
+        return Ok(sql_value_raw_bytes(&value_cols[0].1));
     }
-    // Build a msgpack map with one entry per column.
-    use nodedb_types::value::Value;
-    use std::collections::HashMap;
-    let mut map: HashMap<String, Value> = HashMap::with_capacity(value_cols.len());
+    let mut map = std::collections::HashMap::with_capacity(value_cols.len());
     for (col, sv) in value_cols {
-        let v = crate::query::filter_convert::sql_value_to_value(sv)?;
-        map.insert(col.clone(), v);
+        map.insert(col.clone(), sql_value_to_value(sv)?);
     }
-    zerompk::to_msgpack_vec(&map).map_err(|e| LiteError::Serialization {
-        detail: format!("encode KV value map: {e}"),
-    })
+    crate::query::kv_ops::body::encode_kv_body(map, nodedb_query::msgpack_scan::KvBodyShape::Map)
 }
 
 /// Convert one `ON CONFLICT DO UPDATE SET col = <expr>` assignment.
@@ -119,7 +163,7 @@ pub(super) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
     let mut ops: Vec<KvOp> = Vec::with_capacity(entries.len());
 
     for (key_val, value_cols) in entries {
-        let key = sql_value_to_bytes(key_val);
+        let key = kv_key_bytes(key_val);
         let value = encode_kv_value(value_cols)?;
         let updates = updates.clone();
 
@@ -162,6 +206,7 @@ pub(super) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
                 surrogate: Surrogate::ZERO,
                 returning: None,
                 rls_filters: Vec::new(),
+                provenance: None,
             },
         };
         ops.push(op);
@@ -265,6 +310,29 @@ mod tests {
         })
     }
 
+    #[test]
+    fn a_lone_value_column_stores_origin_raw_bytes() {
+        let cases = [
+            (SqlValue::String("v1".into()), b"v1".to_vec()),
+            (SqlValue::Int(7), b"7".to_vec()),
+            (SqlValue::Float(1.5), b"1.5".to_vec()),
+            (SqlValue::Bool(false), b"false".to_vec()),
+            (SqlValue::Bytes(vec![0xff]), vec![0xff]),
+            (SqlValue::Null, Vec::new()),
+            (
+                SqlValue::Array(vec![
+                    SqlValue::String("public".into()),
+                    SqlValue::String("two words".into()),
+                    SqlValue::Null,
+                ]),
+                b"{public,\"two words\",NULL}".to_vec(),
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(super::sql_value_raw_bytes(&sql), expected, "{sql:?}");
+        }
+    }
+
     #[tokio::test]
     async fn test_kv_insert_plain() {
         let engine = make_engine().await;
@@ -339,6 +407,43 @@ mod tests {
         assert_eq!(r.rows_affected, 1);
     }
 
+    /// A typed row a SQL insert stores takes an `INCR` on its integer
+    /// column: the insert and the shared atomics use one body encoding.
+    #[tokio::test]
+    async fn a_sql_inserted_typed_row_takes_an_incr() {
+        use nodedb_physical::physical_plan::KvCounterShape;
+        use nodedb_types::value::Value;
+
+        let engine = make_engine().await;
+        let entries = vec![(
+            SqlValue::String("k".to_string()),
+            vec![
+                ("n".to_string(), SqlValue::Int(5)),
+                ("label".to_string(), SqlValue::String("x".to_string())),
+            ],
+        )];
+        super::lower_kv_insert(&engine, "ctr", &entries, 0, KvInsertIntent::Put, &[])
+            .expect("lower insert")
+            .await
+            .expect("insert");
+
+        crate::query::kv_ops::writes::kv_incr(&engine, "ctr", b"k", 3, 0, &KvCounterShape::Raw)
+            .await
+            .expect("incr on the integer column");
+
+        let stored = crate::query::kv_ops::reads::kv_get(&engine, "ctr", b"k", None)
+            .await
+            .expect("get");
+        let Value::Bytes(bytes) = &stored.rows[0][1] else {
+            panic!("value column is not bytes");
+        };
+        let row = crate::query::kv_ops::body::decode_kv_map(bytes)
+            .expect("decode")
+            .expect("map body");
+        assert_eq!(row.get("n"), Some(&Value::Integer(8)));
+        assert_eq!(row.get("label"), Some(&Value::String("x".into())));
+    }
+
     /// `ON CONFLICT DO UPDATE SET n = n + 1` evaluates against the existing
     /// row, not the incoming one. End-to-end through
     /// `lower_kv_insert` → `KvOp::InsertOnConflictUpdate` → the KV engine.
@@ -390,8 +495,9 @@ mod tests {
         let nodedb_types::value::Value::Bytes(bytes) = &stored.rows[0][1] else {
             panic!("value column is not bytes");
         };
-        let map: std::collections::HashMap<String, nodedb_types::value::Value> =
-            zerompk::from_msgpack(bytes).expect("decode row");
+        let map = crate::query::kv_ops::body::decode_kv_map(bytes)
+            .expect("decode row")
+            .expect("map body");
         // `n + 1` against the existing row (1), not the incoming row (99).
         assert_eq!(map.get("n"), Some(&nodedb_types::value::Value::Integer(2)));
     }

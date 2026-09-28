@@ -663,7 +663,8 @@ impl<S: StorageEngine> ColumnarEngine<S> {
             });
         }
 
-        match s.mutation.update(old_pk, new_values) {
+        // Lite keeps no per-row surrogate sidecar for flushed segments.
+        match s.mutation.update(old_pk, new_values, None) {
             Ok(_) => Ok(true),
             Err(nodedb_columnar::ColumnarError::PrimaryKeyNotFound) => Ok(false),
             Err(e) => Err(columnar_err_to_lite(e)),

@@ -99,6 +99,7 @@ async fn columnar_insert_and_flush() {
                 Value::Float(i as f64 * 0.5),
             ],
         )
+        .await
         .unwrap();
     }
 
@@ -137,6 +138,7 @@ async fn columnar_delete_bitmap_persists() {
             "items",
             &[Value::Integer(i), Value::String(format!("item_{i}"))],
         )
+        .await
         .unwrap();
     }
 
@@ -182,6 +184,7 @@ async fn compaction_produces_valid_segment() {
             "orders",
             &[Value::Integer(i), Value::Float(i as f64 * 10.0)],
         )
+        .await
         .unwrap();
     }
 

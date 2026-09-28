@@ -49,3 +49,17 @@ pub(super) fn predicate_delete(collection: &str) -> LiteError {
         ),
     }
 }
+
+/// `KvOp::SortedIndexTxnRead` is how Origin's Control Plane reads a sorted
+/// index inside an explicit transaction block, over its Data Plane staging
+/// overlay. Lite's SQL visitor builds the autocommit sorted-index reads and
+/// never emits this variant.
+pub(super) fn sorted_index_txn_read(collection: &str) -> LiteError {
+    LiteError::Unsupported {
+        detail: format!(
+            "KvOp::SortedIndexTxnRead on {collection}: the transaction-local \
+             sorted-index read runs over Origin's Data Plane staging overlay, \
+             which Lite's single-node engine does not have"
+        ),
+    }
+}

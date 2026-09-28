@@ -19,9 +19,10 @@ pub use compensation::{CompensationEvent, CompensationHandler, CompensationRegis
 pub use flow_control::{FlowControlConfig, FlowController, SyncMetrics, SyncMetricsSnapshot};
 pub(crate) use outbound::reconcile_outbound_enqueue;
 pub use outbound::{
-    ColumnarOutbound, DurableOutboundQueue, FtsOutbound, PendingColumnarBatch, PendingFtsDelete,
-    PendingFtsIndex, PendingSpatialDelete, PendingSpatialInsert, PendingTimeseriesBatch,
-    PendingVectorDelete, PendingVectorInsert, SpatialOutbound, TimeseriesOutbound, VectorOutbound,
+    ColumnarOutbound, DurableOutboundQueue, FtsOutbound, KvOutbound, PendingColumnarBatch,
+    PendingFtsDelete, PendingFtsIndex, PendingKvOp, PendingKvWrite, PendingSpatialDelete,
+    PendingSpatialInsert, PendingTimeseriesBatch, PendingVectorDelete, PendingVectorInsert,
+    SpatialOutbound, TimeseriesOutbound, VectorOutbound,
 };
 pub use shapes::ShapeManager;
 pub use stream_seq::StreamSeqTracker;

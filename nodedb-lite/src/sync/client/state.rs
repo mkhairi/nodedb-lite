@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex;
 
-use nodedb_types::sync::wire::{ArrayAckMsg, ResyncRequestMsg};
+use nodedb_types::sync::wire::{ArrayAckMsg, ResyncRequestMsg, RowPushRejectMsg};
 
 /// Pending array acks keyed by array name.
 ///
@@ -119,6 +119,9 @@ pub struct SyncClient {
     /// mutation is acknowledged or rejected, so the map tracks the in-flight
     /// window rather than growing with the session.
     pub(super) delta_targets: Arc<Mutex<std::collections::HashMap<u64, (String, String)>>>,
+    /// `RowPushReject` frames waiting for the next push tick, one per
+    /// `RowPush` this replica refused. Bounded by `ROW_PUSH_REJECT_CAP`.
+    pub(super) pending_row_push_rejects: Arc<Mutex<Vec<RowPushRejectMsg>>>,
 }
 
 impl SyncClient {
@@ -161,6 +164,7 @@ impl SyncClient {
             announced_collections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             row_push_watermark: Arc::new(Mutex::new(std::collections::HashMap::new())),
             delta_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending_row_push_rejects: Arc::new(Mutex::new(Vec::new())),
         }
     }
 

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use nodedb_types::Namespace;
 
+use crate::engine::vector::resident::lock_resident;
 use crate::engine::vector::{HnswIndex, VectorState};
 use crate::error::LiteError;
 use crate::nodedb::LockExt;
@@ -37,7 +38,7 @@ where
     let crdt = Arc::clone(&engine.crdt);
     Box::pin(async move {
         for (doc_id, _) in read_all_rows(&crdt, &collection) {
-            remove_live_node(&vector_state, &key, &doc_id);
+            remove_live_node(&vector_state, &key, &doc_id).await?;
             remove_durable(&vector_state, &key, &doc_id, "DirectTruncate").await?;
             delete_row(&crdt, &collection, &doc_id, "DirectTruncate")?;
         }
@@ -49,25 +50,25 @@ where
 /// Remove every durable vector and live node under `index_key`, then reset
 /// the bucket.
 pub(crate) async fn clear_index<S: StorageEngine>(
-    vector_state: &VectorState<S>,
+    vector_state: &Arc<VectorState<S>>,
     index_key: &str,
 ) -> Result<(), LiteError> {
     let rows =
         crate::engine::vector::durable::load_collection(&*vector_state.storage, index_key).await?;
     for (doc_id, _) in rows {
-        remove_live_node(vector_state, index_key, &doc_id);
+        remove_live_node(vector_state, index_key, &doc_id).await?;
         remove_durable(vector_state, index_key, &doc_id, "Truncate").await?;
     }
     reset_index(vector_state, index_key).await
 }
 
 /// Clear every index bucket `collection` owns: its base key and each
-/// `collection:<field>` key that is live or configured. The base key is
+/// `collection:<field>` key that is live, evicted or configured. The base key is
 /// always cleared: its durable prefix `v:<collection>:` covers the rows of
 /// every named bucket too, so no durable row survives for a bucket that is
 /// not in memory.
 pub(crate) async fn clear_collection_indexes<S: StorageEngine>(
-    vector_state: &VectorState<S>,
+    vector_state: &Arc<VectorState<S>>,
     collection: &str,
 ) -> Result<(), LiteError> {
     let owned = |key: &str| {
@@ -78,6 +79,8 @@ pub(crate) async fn clear_collection_indexes<S: StorageEngine>(
     {
         let indices = vector_state.hnsw_indices.lock_or_recover();
         keys.extend(indices.keys().filter(|k| owned(k)).cloned());
+        let evicted = vector_state.evicted.lock_or_recover();
+        keys.extend(evicted.iter().filter(|k| owned(k)).cloned());
     }
     {
         let configs = vector_state.per_index_config.lock_or_recover();
@@ -92,13 +95,14 @@ pub(crate) async fn clear_collection_indexes<S: StorageEngine>(
 }
 
 /// Replace the HNSW bucket with an empty one of the same shape, drop its
-/// id-map entries, codec sidecar, and persisted checkpoint.
+/// id-map entries, codec sidecar, and persisted checkpoint. An evicted
+/// bucket is loaded back first, so its shape is kept too.
 async fn reset_index<S: StorageEngine>(
-    vector_state: &VectorState<S>,
+    vector_state: &Arc<VectorState<S>>,
     index_key: &str,
 ) -> Result<(), LiteError> {
     {
-        let mut indices = vector_state.hnsw_indices.lock_or_recover();
+        let mut indices = lock_resident(vector_state, index_key).await?;
         if let Some(index) = indices.get_mut(index_key) {
             *index = HnswIndex::new(index.dim(), index.params().clone());
         }

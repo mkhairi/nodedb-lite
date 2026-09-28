@@ -14,6 +14,7 @@ use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::visitor::adapter::basic::{lower_delete, lower_insert, lower_update};
 use crate::query::visitor::dml::{lower_insert_select, lower_merge, lower_update_from};
+use crate::query::visitor::kv_dml::{lower_kv_delete, lower_kv_update};
 use crate::query::visitor::timeseries::lower_timeseries_ingest;
 use crate::storage::engine::StorageEngine;
 
@@ -72,21 +73,41 @@ pub(super) fn update<'a, S: StorageEngine + 'a>(
     collection: &str,
     engine_type: EngineType,
     assignments: &[(String, SqlExpr)],
-    _filters: &[Filter],
+    filters: &[Filter],
     target_keys: &[SqlValue],
     _returning: bool,
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_update(engine, collection, engine_type, assignments, target_keys)
+    match engine_type {
+        EngineType::KeyValue => {
+            lower_kv_update(engine, collection, assignments, filters, target_keys)
+        }
+        EngineType::DocumentSchemaless
+        | EngineType::DocumentStrict
+        | EngineType::Columnar
+        | EngineType::Timeseries
+        | EngineType::Spatial
+        | EngineType::Array => {
+            lower_update(engine, collection, engine_type, assignments, target_keys)
+        }
+    }
 }
 
 pub(super) fn delete<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     collection: &str,
     engine_type: EngineType,
-    _filters: &[Filter],
+    filters: &[Filter],
     target_keys: &[SqlValue],
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_delete(engine, collection, engine_type, target_keys)
+    match engine_type {
+        EngineType::KeyValue => lower_kv_delete(engine, collection, filters, target_keys),
+        EngineType::DocumentSchemaless
+        | EngineType::DocumentStrict
+        | EngineType::Columnar
+        | EngineType::Timeseries
+        | EngineType::Spatial
+        | EngineType::Array => lower_delete(engine, collection, engine_type, target_keys),
+    }
 }
 
 pub(super) fn insert_select<'a, S: StorageEngine + 'a>(
