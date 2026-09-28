@@ -5,8 +5,8 @@
 use nodedb_sql::types::query::EngineType;
 
 use crate::error::LiteError;
+use crate::query::document_ops::indexes::{self, CreateIndexRequest};
 use crate::query::engine::LiteQueryEngine;
-use crate::query::visitor::adapter::basic::{lower_create_index, lower_drop_index};
 use crate::storage::engine::StorageEngine;
 
 use super::LiteFut;
@@ -28,23 +28,47 @@ pub(super) fn truncate<'a, S: StorageEngine + 'a>(
     }))
 }
 
+/// `SqlPlan::CreateIndex`. The planner refuses partial (`WHERE`) indexes;
+/// those arrive through the DDL path, which reaches the same handler.
 pub(super) fn create_index<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
-    _index_name: Option<&str>,
+    index_name: Option<&str>,
     collection: &str,
     field: &str,
     unique: bool,
-    _if_not_exists: bool,
+    if_not_exists: bool,
     case_insensitive: bool,
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_create_index(engine, collection, field, unique, case_insensitive)
+    let name = index_name.map(str::to_string);
+    let collection = collection.to_string();
+    let field = field.to_string();
+    Ok(Box::pin(async move {
+        indexes::create_index(
+            engine,
+            CreateIndexRequest {
+                name: name.as_deref(),
+                collection: &collection,
+                field: &field,
+                unique,
+                case_insensitive,
+                predicate: None,
+                if_not_exists,
+            },
+        )
+        .await
+    }))
 }
 
+/// `SqlPlan::DropIndex`. Index names are unique across the database, so the
+/// collection is not needed to find the index.
 pub(super) fn drop_index<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     index_name: &str,
-    collection: Option<&str>,
-    _if_exists: bool,
+    _collection: Option<&str>,
+    if_exists: bool,
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_drop_index(engine, index_name, collection)
+    let name = index_name.to_string();
+    Ok(Box::pin(async move {
+        indexes::drop_index(engine, &name, if_exists).await
+    }))
 }

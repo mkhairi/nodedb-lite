@@ -134,3 +134,29 @@ async fn unsupported_engine_is_reported() {
         "the error must name the engine it could not honor, got: {msg}"
     );
 }
+
+/// DROP COLLECTION reaches the engine the collection was created on, once:
+/// a strict collection is dropped and is gone afterwards.
+#[tokio::test]
+async fn strict_collection_drops_once() {
+    let db = open_lite().await;
+    db.execute_sql(
+        "CREATE COLLECTION strict_drop (
+            id BIGINT NOT NULL PRIMARY KEY,
+            name TEXT NOT NULL
+        ) WITH storage = 'strict'",
+        &[],
+    )
+    .await
+    .expect("create strict collection");
+
+    db.execute_sql("DROP COLLECTION strict_drop", &[])
+        .await
+        .expect("drop strict collection");
+
+    let collections = db.list_collections().await.expect("list_collections");
+    assert!(
+        !collections.iter().any(|c| c.name == "strict_drop"),
+        "a dropped collection must not be listed"
+    );
+}

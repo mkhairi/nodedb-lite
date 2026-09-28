@@ -287,3 +287,76 @@ async fn batch_same_collection_keeps_document_fields() {
         Some(&nodedb_types::value::Value::String("body text".to_owned()))
     );
 }
+
+/// Documents written by a batch enter the secondary indexes of their
+/// collection, and a batch is checked against a unique index before any of
+/// it is written.
+#[tokio::test]
+async fn batch_ingested_docs_are_index_reachable() {
+    let db = open_db().await;
+    db.document_put("docs", make_doc("seed", "seed"))
+        .await
+        .expect("seed");
+    db.execute_sql("CREATE UNIQUE INDEX idx_content ON docs (content)", &[])
+        .await
+        .expect("create index");
+
+    let docs: Vec<Document> = (0..20)
+        .map(|i| make_doc(&format!("doc{i:02}"), &format!("content {i}")))
+        .collect();
+    let items: Vec<BatchItem<'_>> = docs
+        .iter()
+        .map(|doc| BatchItem {
+            doc_collection: "docs",
+            doc: doc.clone(),
+            vector_collection: "vecs",
+            id: doc.id.as_str(),
+            embedding: Some(&[1.0, 0.0]),
+        })
+        .collect();
+    db.document_put_with_vector_batch_impl(&items)
+        .await
+        .expect("batch put");
+
+    for i in [0, 7, 19] {
+        let r = db
+            .execute_sql(
+                &format!("SELECT id FROM docs WHERE content = 'content {i}'"),
+                &[],
+            )
+            .await
+            .expect("indexed lookup");
+        assert_eq!(
+            r.rows,
+            vec![vec![nodedb_types::value::Value::String(format!(
+                "doc{i:02}"
+            ))]],
+            "content {i}"
+        );
+    }
+
+    // Two rows of one batch sharing a unique value: the batch is refused whole.
+    let clash = [make_doc("x1", "same"), make_doc("x2", "same")];
+    let items: Vec<BatchItem<'_>> = clash
+        .iter()
+        .map(|doc| BatchItem {
+            doc_collection: "docs",
+            doc: doc.clone(),
+            vector_collection: "vecs",
+            id: doc.id.as_str(),
+            embedding: None,
+        })
+        .collect();
+    let err = db
+        .document_put_with_vector_batch_impl(&items)
+        .await
+        .expect_err("duplicate within the batch");
+    assert!(err.to_string().contains("unique"), "{err}");
+    assert!(
+        db.document_get("docs", "x1")
+            .await
+            .expect("document_get")
+            .is_none(),
+        "no row of a refused batch is written"
+    );
+}

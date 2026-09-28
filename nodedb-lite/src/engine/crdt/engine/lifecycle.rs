@@ -63,6 +63,7 @@ impl CrdtEngine {
             state_epochs: HashMap::new(),
             delta_writes: 0,
             snapshot_exports: AtomicU64::new(0),
+            indexes: None,
         })
     }
 
@@ -157,6 +158,7 @@ impl CrdtEngine {
                     detail: format!("rows changed by remote delta for '{collection}': {e}"),
                 })?;
         warn_if_fully_trimmed(collection, "remote delta", &admission);
+        self.sync_indexes(collection, changed_rows.iter().map(String::as_str));
         Ok(TrackedImport {
             admission,
             changed_rows,
@@ -219,6 +221,7 @@ impl CrdtEngine {
                     detail: format!("rows changed by update for '{collection}': {e}"),
                 })?;
         warn_if_fully_trimmed(collection, "update", &admission);
+        self.sync_indexes(collection, changed_rows.iter().map(String::as_str));
         Ok(TrackedImport {
             admission,
             changed_rows,

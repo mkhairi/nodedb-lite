@@ -52,8 +52,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         let mut count = 0u64;
         for id in &matching_ids {
-            crdt.upsert(collection, id, &update_fields)
-                .map_err(NodeDbError::storage)?;
+            // A merge: fields the update does not name keep their values.
+            crdt.set_fields(collection, id, &update_fields)
+                .map_err(NodeDbError::from)?;
             count += 1;
         }
         drop(crdt);

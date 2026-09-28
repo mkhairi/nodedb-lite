@@ -149,7 +149,11 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             rls_filters,
         )?,
 
-        GraphOp::Algo { algorithm, params } => analytics::algo(engine, *algorithm, params),
+        // Lite holds its whole graph in one engine, so every stage runs over
+        // it. The export and gathered stages are Origin's cross-core plans.
+        GraphOp::Algo {
+            algorithm, params, ..
+        } => analytics::algo(engine, *algorithm, params),
 
         GraphOp::SetNodeLabels { node_id, labels } => {
             analytics::set_node_labels(engine, node_id, labels)

@@ -159,6 +159,10 @@ pub struct CrdtEngine {
     /// Exposed through [`CrdtEngine::snapshot_export_count`] so callers can
     /// assert on export volume directly instead of inferring it from timings.
     pub(in crate::engine::crdt) snapshot_exports: AtomicU64,
+    /// Secondary indexes maintained from every row write, once open wires
+    /// them in. Each write updates them under the same engine borrow, so the
+    /// entries a flush stages always match the rows it stages.
+    pub(in crate::engine::crdt) indexes: Option<std::sync::Arc<crate::index::IndexCatalog>>,
 }
 
 /// One deferred write awaiting `flush_deltas`, with the exact counter range

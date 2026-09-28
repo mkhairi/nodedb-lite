@@ -131,7 +131,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             }
             // A merge: the vector attaches to the row and keeps its fields.
             crdt.set_fields(collection, id, &fields)
-                .map_err(NodeDbError::storage)?;
+                .map_err(NodeDbError::from)?;
         }
 
         // Enqueue for sync to Origin (no-op when sync is disabled).
@@ -318,7 +318,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             }
             // A merge: the vector attaches to the row and keeps its fields.
             crdt.set_fields(collection, id, &fields)
-                .map_err(NodeDbError::storage)?;
+                .map_err(NodeDbError::from)?;
         }
 
         // Enqueue for sync to Origin (no-op when sync is disabled).

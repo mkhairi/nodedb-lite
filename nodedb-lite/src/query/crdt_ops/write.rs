@@ -33,7 +33,7 @@ pub async fn handle_apply<S: StorageEngine>(
             crate::engine::fts::maintain::reindex_crdt_documents(
                 &engine.fts_state,
                 &engine.crdt,
-                None::<&crate::sync::FtsOutbound<S>>,
+                None::<&crate::engine::fts::maintain::FtsOutbound<S>>,
                 collection,
                 imported.changed_rows.iter().map(String::as_str),
             )?;
@@ -74,7 +74,7 @@ pub async fn handle_import_snapshot<S: StorageEngine>(
     crate::engine::fts::maintain::reindex_crdt_documents(
         &engine.fts_state,
         &engine.crdt,
-        None::<&crate::sync::FtsOutbound<S>>,
+        None::<&crate::engine::fts::maintain::FtsOutbound<S>>,
         collection,
         imported.changed_rows.iter().map(String::as_str),
     )?;

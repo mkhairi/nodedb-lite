@@ -13,8 +13,17 @@ mod common;
 #[path = "sql_parity/document.rs"]
 mod document;
 
+#[path = "sql_parity/document_index.rs"]
+mod document_index;
+
+#[path = "sql_parity/document_index_writes.rs"]
+mod document_index_writes;
+
 #[path = "sql_parity/strict.rs"]
 mod strict;
+
+#[path = "sql_parity/strict_index.rs"]
+mod strict_index;
 
 #[path = "sql_parity/columnar.rs"]
 mod columnar;

@@ -303,7 +303,8 @@ async fn create_index() {
 #[tokio::test]
 async fn drop_index() {
     let db = open_db().await;
-    // DROP INDEX does not require the collection to have any indexed rows.
+    seed(&db, "ng_idx", "i1").await;
+    assert_ok(&db, "CREATE INDEX idx_name ON ng_idx (name)").await;
     assert_ok(&db, "DROP INDEX idx_name ON ng_idx").await;
 }
 

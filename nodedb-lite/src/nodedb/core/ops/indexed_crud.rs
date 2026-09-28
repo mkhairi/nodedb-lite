@@ -7,7 +7,6 @@
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
 use crate::nodedb::core::types::NodeDbLite;
-use crate::nodedb::lock_ext::LockExt;
 use crate::storage::engine::StorageEngine;
 
 impl<S: StorageEngine> NodeDbLite<S> {
@@ -52,21 +51,6 @@ impl<S: StorageEngine> NodeDbLite<S> {
             values,
         )
         .await?;
-
-        // Update secondary B-tree indexes on non-PK columns.
-        {
-            use crate::engine::strict::secondary_index::SecondaryIndex;
-            let mut sec = self.secondary_indices.lock_or_recover();
-            for (i, col) in schema.columns.iter().enumerate() {
-                if col.primary_key || i >= values.len() {
-                    continue;
-                }
-                let key = format!("{collection}:{}", col.name);
-                sec.entry(key)
-                    .or_insert_with(|| SecondaryIndex::new(&col.name))
-                    .insert(&values[i], &row_id);
-            }
-        }
 
         // Replicate to materialized columnar views (HTAP CDC).
         self.htap

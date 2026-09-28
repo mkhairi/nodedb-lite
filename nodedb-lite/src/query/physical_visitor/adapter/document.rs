@@ -10,6 +10,7 @@ use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
 use super::LitePhysicalFut;
+use super::document_index;
 use super::policy::deny_policy;
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
@@ -90,36 +91,14 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             offset,
             ..
         } => {
-            let col = collection.clone();
-            let path = path.clone();
-            let value = value.clone();
-            let limit = *limit;
-            let offset = *offset;
-            Ok(Box::pin(async move {
-                document_ops::reads::indexed_fetch(
-                    engine,
-                    col.as_str(),
-                    &path,
-                    &value,
-                    limit,
-                    offset,
-                )
-                .await
-            }))
+            document_index::indexed_fetch(engine, collection.as_str(), path, value, *limit, *offset)
         }
 
         DocumentOp::IndexLookup {
             collection,
             path,
             value,
-        } => {
-            let col = collection.clone();
-            let path = path.clone();
-            let value = value.clone();
-            Ok(Box::pin(async move {
-                document_ops::reads::index_lookup(engine, col.as_str(), &path, &value).await
-            }))
-        }
+        } => document_index::index_lookup(engine, collection.as_str(), path, value),
 
         DocumentOp::EstimateCount { collection, .. } => {
             let col = collection.clone();
@@ -338,22 +317,27 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }
 
         DocumentOp::DropIndex { collection, field } => {
-            let col = collection.clone();
-            let field = field.clone();
-            Ok(Box::pin(async move {
-                document_ops::indexes::drop_index(engine, col.as_str(), &field).await
-            }))
+            document_index::drop_index(engine, collection.as_str(), field)
         }
 
         DocumentOp::BackfillIndex {
-            collection, path, ..
-        } => {
-            let col = collection.clone();
-            let path = path.clone();
-            Ok(Box::pin(async move {
-                document_ops::indexes::backfill_index(engine, col.as_str(), &path).await
-            }))
-        }
+            collection,
+            path,
+            is_array,
+            unique,
+            case_insensitive,
+            predicate,
+        } => document_index::backfill_index(
+            engine,
+            collection.as_str(),
+            document_index::BackfillFlags {
+                path,
+                is_array: *is_array,
+                unique: *unique,
+                case_insensitive: *case_insensitive,
+                predicate: predicate.as_deref(),
+            },
+        ),
 
         DocumentOp::InsertSelect {
             target_collection,

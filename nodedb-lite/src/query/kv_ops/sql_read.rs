@@ -74,6 +74,21 @@ pub(crate) async fn kv_select_key<S: StorageEngine>(
     shape_rows(&entries_of(found)?)
 }
 
+/// The live rows at `keys` in `collection`, in key order given; a key with
+/// no live row contributes nothing.
+pub(crate) async fn kv_select_keys<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    collection: &str,
+    keys: &[Vec<u8>],
+) -> Result<QueryResult, LiteError> {
+    engine.kv_local.flush_to(&*engine.storage).await?;
+    let mut entries = Vec::with_capacity(keys.len());
+    for key in keys {
+        entries.extend(entries_of(kv_get(engine, collection, key, None).await?)?);
+    }
+    shape_rows(&entries)
+}
+
 /// One stored entry: its key bytes and its body bytes.
 type KvEntry = (Vec<u8>, Vec<u8>);
 

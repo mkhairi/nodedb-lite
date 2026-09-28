@@ -187,6 +187,7 @@ impl CrdtEngine {
             },
             CompensationHint::IntegrityViolation => {
                 self.delete_local_row(&collection, &doc_id);
+                self.sync_indexes(&collection, [doc_id.as_str()]);
                 self.pending_deltas.remove(pos);
                 return Some(PolicyResolution::Escalate {
                     violations: violation_from_hint(hint),
@@ -207,6 +208,8 @@ impl CrdtEngine {
             }
             PolicyResolution::Deferred { .. } | PolicyResolution::WebhookRequired { .. } => {}
         }
+        // A rename or a rollback changed the row; its index entries follow.
+        self.sync_indexes(&collection, [doc_id.as_str()]);
 
         Some(resolution)
     }

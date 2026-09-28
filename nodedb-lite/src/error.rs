@@ -21,6 +21,14 @@ pub enum LiteError {
     #[error("bad request: {detail}")]
     BadRequest { detail: String },
 
+    /// A statement named a collection the engine it addressed does not
+    /// hold. Maps to `collection_not_found` at the public API boundary.
+    #[error("{engine} collection '{collection}' does not exist")]
+    CollectionNotFound {
+        engine: &'static str,
+        collection: String,
+    },
+
     /// A write that would duplicate a declared unique key. Maps to SQLSTATE
     /// `23505` at the SQL boundary.
     #[error("duplicate key value violates unique constraint on '{collection}': {detail}")]
@@ -117,6 +125,17 @@ pub enum LiteError {
     DataException { detail: String },
 }
 
+impl LiteError {
+    /// `collection` is not a collection of `engine` (`"strict"`,
+    /// `"columnar"`).
+    pub fn collection_not_found(engine: &'static str, collection: impl Into<String>) -> Self {
+        Self::CollectionNotFound {
+            engine,
+            collection: collection.into(),
+        }
+    }
+}
+
 /// A vector engine error, classified as Origin classifies it: an input
 /// vector of the wrong dimension, or index input the engine cannot use, is
 /// the caller's data error; a memory budget refusal is backpressure; a
@@ -177,6 +196,12 @@ impl From<LiteError> for nodedb_types::error::NodeDbError {
                 NodeDbError::type_mismatch(collection, detail)
             }
             LiteError::DataException { detail } => NodeDbError::data_exception(detail),
+            LiteError::CollectionNotFound { collection, .. } => {
+                NodeDbError::collection_not_found(collection)
+            }
+            LiteError::UniqueViolation { collection, detail } => {
+                NodeDbError::constraint_violation(collection, "unique", detail)
+            }
             e @ (LiteError::TextIndexMissing { .. } | LiteError::FtsQueryInvalid { .. }) => {
                 NodeDbError::bad_request(e)
             }
@@ -208,6 +233,17 @@ mod tests {
     }
 
     #[test]
+    fn a_unique_violation_is_a_constraint_violation() {
+        let e = LiteError::UniqueViolation {
+            collection: "users".into(),
+            detail: "key ($.email)=(a@x) already exists".into(),
+        };
+        let ndb: nodedb_types::error::NodeDbError = e.into();
+        assert!(ndb.is_constraint_violation(), "{ndb}");
+        assert!(ndb.to_string().contains("unique"), "{ndb}");
+    }
+
+    #[test]
     fn lite_error_encryption_display_and_convert() {
         let e = LiteError::Encryption {
             detail: "argon2 key derivation failed".into(),
@@ -218,6 +254,19 @@ mod tests {
 
         let ndb: nodedb_types::error::NodeDbError = e.into();
         assert!(ndb.to_string().contains("argon2 key derivation failed"));
+    }
+
+    #[test]
+    fn a_missing_collection_is_collection_not_found() {
+        let e = LiteError::collection_not_found("strict", "users");
+        assert_eq!(e.to_string(), "strict collection 'users' does not exist");
+
+        let ndb: nodedb_types::error::NodeDbError = e.into();
+        assert_eq!(
+            ndb.code(),
+            nodedb_types::error::ErrorCode::COLLECTION_NOT_FOUND,
+            "{ndb}"
+        );
     }
 
     #[test]

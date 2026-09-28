@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Lowerings for direct-to-engine CRUD ops: `Scan`, `PointGet`, `Insert`,
-//! `Upsert`, `Update`, `Delete`, `ConstantResult`, `CreateIndex`,
-//! `DropIndex`. These dispatch straight to `LiteQueryEngine` methods or the
-//! `LiteDataPlaneVisitor` without intermediate planning helpers.
+//! `Upsert`, `Update`, `Delete`, `ConstantResult`. These dispatch straight to
+//! `LiteQueryEngine` methods without intermediate planning helpers.
 
-use nodedb_physical::PhysicalTaskVisitor;
 use nodedb_sql::ScanVisitArgs;
 use nodedb_sql::types::filter::Filter;
 use nodedb_sql::types::query::EngineType;
@@ -13,8 +11,10 @@ use nodedb_sql::types::{SqlValue, WriteRoute};
 use nodedb_sql::types_expr::SqlExpr;
 
 use crate::error::LiteError;
+use crate::index::IndexEngine;
+use crate::query::document_ops::index_reads::index_range_fetch;
 use crate::query::engine::LiteQueryEngine;
-use crate::query::physical_visitor::LiteDataPlaneVisitor;
+use crate::query::visitor::index_range::index_range;
 use crate::query::visitor::scan_post::{ScanPostArgs, apply_scan_post_processing};
 use crate::storage::engine::StorageEngine;
 
@@ -45,8 +45,27 @@ pub(super) fn lower_scan<'a, S: StorageEngine + 'a>(
     let limit = args.limit;
     let offset = args.offset;
     let distinct = args.distinct;
+    let index_engine = match engine_type {
+        EngineType::DocumentSchemaless => Some(IndexEngine::Document),
+        EngineType::DocumentStrict => Some(IndexEngine::Strict),
+        EngineType::KeyValue => Some(IndexEngine::KeyValue),
+        _ => None,
+    };
+    let range =
+        index_engine.and_then(|kind| index_range(&engine.indexes, &collection, kind, &filters));
     Ok(Box::pin(async move {
-        let raw = engine.execute_scan(&collection, &engine_type).await?;
+        // A bounded indexed field lets the index list the candidate rows;
+        // every filter below still applies to them.
+        let indexed = match &range {
+            Some(r) => {
+                index_range_fetch(engine, &r.def, r.lower.as_ref(), r.upper.as_ref()).await?
+            }
+            None => None,
+        };
+        let raw = match indexed {
+            Some(raw) => raw,
+            None => engine.execute_scan(&collection, &engine_type).await?,
+        };
         apply_scan_post_processing(
             raw,
             ScanPostArgs {
@@ -146,50 +165,4 @@ pub(super) fn lower_delete<'a, S: StorageEngine + 'a>(
             .execute_delete(&collection, &engine_type, &filters, &target_keys)
             .await
     }))
-}
-
-pub(super) fn lower_create_index<'a, S: StorageEngine + 'a>(
-    engine: &'a LiteQueryEngine<S>,
-    collection: &str,
-    field: &str,
-    unique: bool,
-    case_insensitive: bool,
-) -> Result<LiteFut<'a>, LiteError> {
-    use nodedb_physical::physical_plan::document::DocumentOp;
-    let op = DocumentOp::BackfillIndex {
-        // Lite holds a bare collection name; DatabaseId::DEFAULT keeps it unqualified.
-        collection: nodedb_types::QualifiedCollection::new(
-            nodedb_types::DatabaseId::DEFAULT,
-            collection,
-        ),
-        path: field.to_string(),
-        is_array: false,
-        unique,
-        case_insensitive,
-        predicate: None,
-    };
-    let mut phys = LiteDataPlaneVisitor { engine };
-    phys.document(&op)
-}
-
-/// Lite persists index entries under `collection:field:value:id`. Without a
-/// catalog lookup the field name is not known from the index name alone, so
-/// the caller must supply the collection via the ON clause. The drop is
-/// best-effort at field-level granularity using the index-name as the field.
-pub(super) fn lower_drop_index<'a, S: StorageEngine + 'a>(
-    engine: &'a LiteQueryEngine<S>,
-    index_name: &str,
-    collection: Option<&str>,
-) -> Result<LiteFut<'a>, LiteError> {
-    use nodedb_physical::physical_plan::document::DocumentOp;
-    let op = DocumentOp::DropIndex {
-        // Lite holds a bare collection name; DatabaseId::DEFAULT keeps it unqualified.
-        collection: nodedb_types::QualifiedCollection::new(
-            nodedb_types::DatabaseId::DEFAULT,
-            collection.unwrap_or(""),
-        ),
-        field: index_name.to_string(),
-    };
-    let mut phys = LiteDataPlaneVisitor { engine };
-    phys.document(&op)
 }

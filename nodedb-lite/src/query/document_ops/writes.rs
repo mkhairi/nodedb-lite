@@ -7,6 +7,7 @@ use nodedb_types::Namespace;
 use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
+use crate::engine::crdt::{CrdtRowOp, CrdtRowWrite};
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::truncate::{clear_spatial, truncated};
@@ -53,10 +54,7 @@ pub async fn point_put<S: StorageEngine>(
             .crdt
             .lock()
             .map_err(|_| LiteError::LockPoisoned)?
-            .upsert(collection, document_id, &loro_fields)
-            .map_err(|e| LiteError::Storage {
-                detail: e.to_string(),
-            })?;
+            .upsert(collection, document_id, &loro_fields)?;
         reindex_documents(engine, collection, [document_id])?;
     }
     Ok(affected(1, "INSERT"))
@@ -104,10 +102,7 @@ pub async fn point_insert<S: StorageEngine>(
                 ),
             });
         }
-        crdt.upsert(collection, document_id, &loro_fields)
-            .map_err(|e| LiteError::Storage {
-                detail: e.to_string(),
-            })?;
+        crdt.upsert(collection, document_id, &loro_fields)?;
         drop(crdt);
         reindex_documents(engine, collection, [document_id])?;
     }
@@ -165,10 +160,7 @@ pub async fn point_update<S: StorageEngine>(
             .crdt
             .lock()
             .map_err(|_| LiteError::LockPoisoned)?
-            .upsert(collection, document_id, &loro_fields)
-            .map_err(|e| LiteError::Storage {
-                detail: e.to_string(),
-            })?;
+            .upsert(collection, document_id, &loro_fields)?;
         reindex_documents(engine, collection, [document_id])?;
         Ok(affected(1, "UPDATE"))
     }
@@ -226,16 +218,32 @@ pub async fn batch_insert<S: StorageEngine>(
             decoded.push((doc_id.clone(), crdt_fields));
         }
         let affected_n = decoded.len() as u64;
+        let slices: Vec<Vec<(&str, loro::LoroValue)>> = decoded
+            .iter()
+            .map(|(_, fields)| {
+                fields
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.clone()))
+                    .collect()
+            })
+            .collect();
+        let rows: Vec<CrdtRowOp<'_>> = decoded
+            .iter()
+            .zip(&slices)
+            .map(|((doc_id, _), f)| {
+                (
+                    CrdtRowWrite::Upsert,
+                    collection,
+                    doc_id.as_str(),
+                    f.as_slice(),
+                )
+            })
+            .collect();
         let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-        for (doc_id, fields) in &decoded {
-            let loro_slice: Vec<(&str, loro::LoroValue)> = fields
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.clone()))
-                .collect();
-            crdt.upsert_deferred(collection, doc_id, &loro_slice)
-                .map_err(|e| LiteError::Storage {
-                    detail: e.to_string(),
-                })?;
+        // The whole batch is checked before any document is written.
+        crdt.check_unique_writes(&rows)?;
+        for &(_, _, doc_id, fields) in &rows {
+            crdt.upsert_deferred(collection, doc_id, fields)?;
         }
         crdt.flush_deltas().map_err(|e| LiteError::Storage {
             detail: e.to_string(),
@@ -290,10 +298,7 @@ pub async fn upsert<S: StorageEngine>(
             .crdt
             .lock()
             .map_err(|_| LiteError::LockPoisoned)?
-            .upsert(collection, document_id, &loro_fields)
-            .map_err(|e| LiteError::Storage {
-                detail: e.to_string(),
-            })?;
+            .upsert(collection, document_id, &loro_fields)?;
         reindex_documents(engine, collection, [document_id])?;
     }
     Ok(affected(1, "UPSERT"))
@@ -320,9 +325,8 @@ pub async fn truncate<S: StorageEngine>(
                 key,
             });
         }
-        if !ops.is_empty() {
-            engine.storage.batch_write(&ops).await?;
-        }
+        // Each deleted row takes its index entries with it in the same batch.
+        engine.strict.commit(collection, ops).await?;
     } else {
         let ids = {
             let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
@@ -400,12 +404,22 @@ pub async fn bulk_update<S: StorageEngine>(
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
+        let rows: Vec<CrdtRowOp<'_>> = ids
+            .iter()
+            .map(|id| {
+                (
+                    CrdtRowWrite::SetFields,
+                    collection,
+                    id.as_str(),
+                    loro_slice.as_slice(),
+                )
+            })
+            .collect();
+        crdt.check_unique_writes(&rows)?;
         let mut affected_n: u64 = 0;
         for id in &ids {
-            crdt.upsert_deferred(collection, id, &loro_slice)
-                .map_err(|e| LiteError::Storage {
-                    detail: e.to_string(),
-                })?;
+            // A merge: fields the update does not assign keep their values.
+            crdt.set_fields_deferred(collection, id, &loro_slice)?;
             affected_n += 1;
         }
         crdt.flush_deltas().map_err(|e| LiteError::Storage {

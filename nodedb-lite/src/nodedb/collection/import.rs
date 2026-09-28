@@ -60,7 +60,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .map(|((id, _), fields)| (collection, id.as_str(), fields.as_slice()))
             .collect();
 
-        crdt.batch_upsert(&ops).map_err(NodeDbError::storage)?;
+        crdt.batch_upsert(&ops).map_err(NodeDbError::from)?;
         Ok(count)
     }
 

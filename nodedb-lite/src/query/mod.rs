@@ -1,4 +1,5 @@
 pub mod catalog;
+mod catalog_columns;
 pub mod coerce;
 pub mod columnar_dml;
 pub mod columnar_ops;
@@ -6,6 +7,7 @@ pub mod crdt_ops;
 pub mod ddl;
 pub(crate) mod dml_targets;
 pub mod document_ops;
+pub(crate) mod document_rows;
 pub mod engine;
 pub(crate) mod engine_dml;
 pub(crate) mod engine_read;

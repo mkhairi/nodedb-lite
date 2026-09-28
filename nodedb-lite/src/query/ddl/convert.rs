@@ -11,6 +11,7 @@ use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
 use crate::error::LiteError;
+use crate::index::IndexEngine;
 use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
@@ -65,12 +66,20 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             .create_collection(source_name, target_schema.clone())
             .await?;
 
+        // The collection's indexes cover the strict rows from here on, so
+        // each row inserted below enters them, unique checks included.
+        self.indexes
+            .move_collection(&*self.storage, source_name, IndexEngine::Strict)
+            .await?;
+
         // Convert each document to a row and insert.
         let mut inserted: Vec<Vec<Value>> = Vec::with_capacity(docs.len());
         for doc in &docs {
             let values = document_to_row(&doc.fields, &target_schema.columns);
             if let Err(e) = self.strict.insert(source_name, &values).await {
                 self.strict.drop_collection(source_name).await?;
+                self.restore_indexes(source_name, IndexEngine::Document)
+                    .await?;
                 return Err(conversion_refused(source_name, "strict", &doc.id, e));
             }
             inserted.push(values);
@@ -85,6 +94,8 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             .clear_collection(source_name);
         if let Err(e) = cleared {
             self.strict.drop_collection(source_name).await?;
+            self.restore_indexes(source_name, IndexEngine::Document)
+                .await?;
             return Err(e);
         }
 
@@ -202,6 +213,11 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
 
         if let Some(schema) = self.strict.schema(source_name) {
             let rows = self.decode_strict_rows(source_name, &schema).await?;
+            // The collection's indexes cover documents from here on, so each
+            // document written below enters them, unique checks included.
+            self.indexes
+                .move_collection(&*self.storage, source_name, IndexEngine::Document)
+                .await?;
             let upserted = {
                 let mut crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
                 let mut result = Ok(());
@@ -226,7 +242,11 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 }
                 result
             };
-            upserted?;
+            if let Err(e) = upserted {
+                self.restore_indexes(source_name, IndexEngine::Strict)
+                    .await?;
+                return Err(e);
+            }
 
             // Drop the strict collection.
             self.strict.drop_collection(source_name).await?;
@@ -256,6 +276,24 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             rows_affected: converted,
             command: None,
         })
+    }
+
+    /// Re-declare the indexes of `collection` over `engine` rows and build
+    /// them from those rows: a conversion that failed leaves its source
+    /// indexed as it was.
+    async fn restore_indexes(
+        &self,
+        collection: &str,
+        engine: IndexEngine,
+    ) -> Result<(), LiteError> {
+        for def in self
+            .indexes
+            .move_collection(&*self.storage, collection, engine)
+            .await?
+        {
+            crate::query::document_ops::indexes::rebuild_index(self, def).await?;
+        }
+        Ok(())
     }
 
     /// Decode every stored tuple of the strict collection `collection`.

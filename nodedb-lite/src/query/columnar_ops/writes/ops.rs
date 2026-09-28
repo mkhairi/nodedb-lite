@@ -55,9 +55,7 @@ pub async fn insert<S: StorageEngine>(
     let schema = engine
         .columnar
         .schema(collection)
-        .ok_or(LiteError::BadRequest {
-            detail: format!("columnar collection '{collection}' does not exist"),
-        })?;
+        .ok_or_else(|| LiteError::collection_not_found("columnar", collection))?;
 
     // If caller supplied a schema override, decode it and use it for column ordering.
     let effective_schema: ColumnarSchema = if !schema_bytes.is_empty() {
@@ -183,9 +181,7 @@ pub async fn update<S: StorageEngine>(
     let schema = engine
         .columnar
         .schema(collection)
-        .ok_or(LiteError::BadRequest {
-            detail: format!("columnar collection '{collection}' does not exist"),
-        })?;
+        .ok_or_else(|| LiteError::collection_not_found("columnar", collection))?;
 
     let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
     let pk_idx = schema
@@ -258,9 +254,7 @@ pub async fn delete<S: StorageEngine>(
     let schema = engine
         .columnar
         .schema(collection)
-        .ok_or(LiteError::BadRequest {
-            detail: format!("columnar collection '{collection}' does not exist"),
-        })?;
+        .ok_or_else(|| LiteError::collection_not_found("columnar", collection))?;
 
     let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
     let pk_idx = schema

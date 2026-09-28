@@ -24,6 +24,7 @@ impl CrdtEngine {
         doc_id: &str,
         fields: &[(&str, LoroValue)],
     ) -> Result<u64, LiteError> {
+        self.check_unique_writes(&[(CrdtRowWrite::Upsert, collection, doc_id, fields)])?;
         let (_, mutation_id) = self.with_delta_capture(collection, doc_id, "upsert", |state| {
             state
                 .upsert(collection, doc_id, fields)
@@ -46,6 +47,7 @@ impl CrdtEngine {
         doc_id: &str,
         fields: &[(&str, LoroValue)],
     ) -> Result<u64, LiteError> {
+        self.check_unique_writes(&[(CrdtRowWrite::SetFields, collection, doc_id, fields)])?;
         let (_, mutation_id) =
             self.with_delta_capture(collection, doc_id, "set_fields", |state| {
                 state
@@ -99,6 +101,11 @@ impl CrdtEngine {
     /// Returns the mutation ID of the last delta enqueued, or 0 if `ops` is
     /// empty.
     pub fn batch_upsert(&mut self, ops: &[CrdtBatchOp<'_>]) -> Result<u64, LiteError> {
+        let rows: Vec<CrdtRowOp<'_>> = ops
+            .iter()
+            .map(|&(collection, doc_id, fields)| (CrdtRowWrite::Upsert, collection, doc_id, fields))
+            .collect();
+        self.check_unique_writes(&rows)?;
         let mut last_mutation_id = 0;
         for &(collection, doc_id, fields) in ops {
             let (_, mutation_id) =
@@ -123,6 +130,7 @@ impl CrdtEngine {
     /// mutation ID of every delta enqueued, in op order. A row write that
     /// authored nothing enqueues no delta and contributes no ID.
     pub fn batch_write(&mut self, ops: &[CrdtRowOp<'_>]) -> Result<Vec<u64>, LiteError> {
+        self.check_unique_writes(ops)?;
         let mut mutation_ids = Vec::with_capacity(ops.len());
         for &(mode, collection, doc_id, fields) in ops {
             let (_, mutation_id) =
@@ -153,11 +161,30 @@ impl CrdtEngine {
         doc_id: &str,
         fields: &[(&str, LoroValue)],
     ) -> Result<(), LiteError> {
+        self.check_unique_writes(&[(CrdtRowWrite::Upsert, collection, doc_id, fields)])?;
         self.defer(collection, doc_id, |state| {
             state
                 .upsert(collection, doc_id, fields)
                 .map_err(|e| LiteError::Storage {
                     detail: format!("CRDT upsert failed: {e}"),
+                })
+        })
+    }
+
+    /// Field merge without generating a delta, as `set_fields` merges. Use
+    /// `flush_deltas()` later.
+    pub fn set_fields_deferred(
+        &mut self,
+        collection: &str,
+        doc_id: &str,
+        fields: &[(&str, LoroValue)],
+    ) -> Result<(), LiteError> {
+        self.check_unique_writes(&[(CrdtRowWrite::SetFields, collection, doc_id, fields)])?;
+        self.defer(collection, doc_id, |state| {
+            state
+                .set_fields(collection, doc_id, fields)
+                .map_err(|e| LiteError::Storage {
+                    detail: format!("CRDT set_fields failed: {e}"),
                 })
         })
     }
@@ -186,6 +213,7 @@ impl CrdtEngine {
             body(state)?;
             (from_counter, state.local_op_counter())
         };
+        self.sync_indexes(collection, [document_id]);
         self.deferred.push(DeferredOp {
             collection: collection.to_string(),
             document_id: document_id.to_string(),
@@ -248,6 +276,7 @@ impl CrdtEngine {
                     detail: format!("clear collection: {e}"),
                 })
         })?;
+        self.clear_index_entries(collection);
         Ok(count)
     }
 
@@ -289,6 +318,8 @@ impl CrdtEngine {
                     })?;
             (value, delta_bytes)
         };
+        // The row changed: its index entries follow under the same borrow.
+        self.sync_indexes(collection, [document_id]);
 
         if delta_bytes.is_empty() {
             return Ok((value, 0));

@@ -16,7 +16,6 @@
 //! config states hold on the library surface and not only through the FFI and
 //! WASM bindings.
 
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -262,7 +261,6 @@ impl<S: StorageEngine> NodeDbLite<S> {
             fts_state,
             sparse_state,
             spatial,
-            secondary_indices: Mutex::new(HashMap::new()),
             strict,
             columnar,
             htap,
@@ -299,6 +297,42 @@ impl<S: StorageEngine> NodeDbLite<S> {
             sync_gate: std::sync::RwLock::new(None),
             tasks: crate::tasks::TaskRegistry::default(),
         };
+
+        // Remove index entries of the pre-catalog layout, load the secondary
+        // indexes, then rebuild those whose stored entries may not match their
+        // rows (see `index::legacy` and `index::rebuild`).
+        {
+            let mut known: std::collections::BTreeSet<String> = db
+                .crdt
+                .lock_or_recover()
+                .collection_names()
+                .into_iter()
+                .collect();
+            known.extend(db.strict.collection_names());
+            known.extend(db.columnar.collection_names());
+            known.extend(
+                crate::nodedb::collection::ddl::load_persisted_collection_metas(&*db.storage)
+                    .await?
+                    .into_keys(),
+            );
+            crate::index::legacy::clear_legacy_entries(&*db.storage, &known)
+                .await
+                .map_err(NodeDbError::storage)?;
+            let indexes = &db.query_engine.indexes;
+            let loaded = indexes
+                .load(&*db.storage)
+                .await
+                .map_err(NodeDbError::storage)?;
+            crate::index::rebuild::rebuild_at_open(
+                indexes,
+                &*db.storage,
+                &db.crdt,
+                &db.strict,
+                loaded.rebuild_all,
+            )
+            .await
+            .map_err(NodeDbError::storage)?;
+        }
 
         // Rebuild text indices from CRDT state only when the checkpoint is
         // missing or incomplete. A complete checkpoint has already loaded the

@@ -21,7 +21,7 @@ use crate::engine::spatial::SpatialIndexManager;
 use crate::engine::strict::StrictEngine;
 use crate::engine::vector::VectorState;
 use crate::error::LiteError;
-use crate::nodedb::KvLocalState;
+use crate::nodedb::{KvLocalState, LockExt};
 use crate::sequence::LiteSequenceRegistry;
 use crate::storage::engine::StorageEngine;
 
@@ -55,6 +55,9 @@ pub struct LiteQueryEngine<S: StorageEngine> {
     /// The public KV API's write buffer and read cache. A SQL-path `TRUNCATE`
     /// forgets what they hold for the cleared collection.
     pub(in crate::query) kv_local: Arc<KvLocalState>,
+    /// Secondary-index definitions and entries. The CRDT store maintains them
+    /// on every row write; flush persists them with the CRDT state.
+    pub(crate) indexes: Arc<crate::index::IndexCatalog>,
     /// Durable outbound queue for FTS sync — `None` when sync is disabled.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fts_outbound: Option<Arc<crate::sync::FtsOutbound<S>>>,
@@ -86,6 +89,13 @@ pub struct LiteQueryEngineParams<S: StorageEngine> {
 
 impl<S: StorageEngine> LiteQueryEngine<S> {
     pub fn new(params: LiteQueryEngineParams<S>) -> Self {
+        let indexes = Arc::new(crate::index::IndexCatalog::new());
+        params
+            .crdt
+            .lock_or_recover()
+            .set_index_catalog(Arc::clone(&indexes));
+        params.strict.set_index_catalog(Arc::clone(&indexes));
+        params.kv_local.set_index_catalog(Arc::clone(&indexes));
         Self {
             crdt: params.crdt,
             strict: params.strict,
@@ -103,6 +113,7 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             governor: params.governor,
             sequences: Arc::new(LiteSequenceRegistry::new()),
             kv_local: params.kv_local,
+            indexes,
             #[cfg(not(target_arch = "wasm32"))]
             fts_outbound: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -182,7 +193,8 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             Arc::clone(&self.columnar),
             metas,
         )
-        .with_arrays(array_names);
+        .with_arrays(array_names)
+        .with_indexes(Arc::clone(&self.indexes));
 
         let sql_params: Vec<nodedb_sql::ParamValue> = params.iter().map(value_to_param).collect();
 

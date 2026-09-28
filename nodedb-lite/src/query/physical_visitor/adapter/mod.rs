@@ -32,6 +32,7 @@ mod array;
 mod columnar;
 mod crdt;
 mod document;
+mod document_index;
 mod graph;
 mod graph_resolve;
 mod kv;

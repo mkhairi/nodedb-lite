@@ -39,6 +39,9 @@ pub(super) const META_STRICT_COLLECTIONS: &[u8] = b"meta:strict_collections";
 pub struct StrictEngine<S: StorageEngine> {
     pub(super) storage: Arc<S>,
     pub(super) collections: RwLock<HashMap<String, Arc<CollectionState>>>,
+    /// Secondary indexes whose entries every row write commits in its own
+    /// storage batch. Set once by the query engine.
+    pub(super) indexes: std::sync::OnceLock<Arc<crate::index::IndexCatalog>>,
 }
 
 pub struct CollectionState {
@@ -136,6 +139,7 @@ impl<S: StorageEngine> StrictEngine<S> {
         Self {
             storage,
             collections: RwLock::new(HashMap::new()),
+            indexes: std::sync::OnceLock::new(),
         }
     }
 
@@ -183,8 +187,9 @@ impl<S: StorageEngine> StrictEngine<S> {
             .collections
             .read()
             .map_err(|_| LiteError::LockPoisoned)?;
-        guard.get(collection).cloned().ok_or(LiteError::BadRequest {
-            detail: format!("strict collection '{collection}' does not exist"),
-        })
+        guard
+            .get(collection)
+            .cloned()
+            .ok_or_else(|| LiteError::collection_not_found("strict", collection))
     }
 }

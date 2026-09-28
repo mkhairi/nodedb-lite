@@ -153,6 +153,7 @@ impl CrdtEngine {
             if let Some(state) = self.states.get(&delta.collection) {
                 let _ = state.delete(&delta.collection, &delta.document_id);
             }
+            self.sync_indexes(&delta.collection, [delta.document_id.as_str()]);
             Some(delta)
         } else {
             None

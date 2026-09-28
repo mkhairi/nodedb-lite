@@ -12,16 +12,20 @@ use std::sync::{Arc, Mutex};
 
 use nodedb_sql::types::*;
 use nodedb_types::collection::CollectionType;
-use nodedb_types::columnar::{
-    ColumnarProfile, ColumnarSchema, DocumentMode, FloatWidth, IntWidth, StrictSchema,
-};
+use nodedb_types::columnar::{ColumnarProfile, DocumentMode};
 use nodedb_types::sync::wire::CollectionDescriptor;
 
 use crate::engine::columnar::ColumnarEngine;
 use crate::engine::crdt::CrdtEngine;
 use crate::engine::strict::StrictEngine;
+use crate::index::IndexCatalog;
 use crate::nodedb::collection::CollectionMeta;
 use crate::storage::engine::StorageEngine;
+
+use super::catalog_columns::{
+    columns_from_columnar_schema, columns_from_fields, columns_from_strict_schema, parse_kv_config,
+    parse_strict_config,
+};
 
 /// Catalog adapter for Lite that resolves collections from local engines.
 pub struct LiteCatalog<S: StorageEngine> {
@@ -36,6 +40,8 @@ pub struct LiteCatalog<S: StorageEngine> {
     /// planning. The planner refuses table-shaped statements such as
     /// `TRUNCATE` on an array by name.
     array_names: Vec<String>,
+    /// Secondary indexes the planner may rewrite equality lookups onto.
+    indexes: Option<Arc<IndexCatalog>>,
 }
 
 impl<S: StorageEngine> LiteCatalog<S> {
@@ -51,7 +57,14 @@ impl<S: StorageEngine> LiteCatalog<S> {
             columnar,
             metas,
             array_names: Vec::new(),
+            indexes: None,
         }
+    }
+
+    /// Surface the document indexes of `indexes` to the planner.
+    pub fn with_indexes(mut self, indexes: Arc<IndexCatalog>) -> Self {
+        self.indexes = Some(indexes);
+        self
     }
 
     /// Register the array names the planner can see.
@@ -210,9 +223,26 @@ impl<S: StorageEngine> SqlCatalog for LiteCatalog<S> {
         _database_id: nodedb_types::id::DatabaseId,
         name: &str,
     ) -> Result<Option<CollectionInfo>, nodedb_sql::catalog::SqlCatalogError> {
+        let mut info = self.resolve_collection(name);
+        if let Some(info) = &mut info
+            && matches!(
+                info.engine,
+                EngineType::DocumentSchemaless | EngineType::DocumentStrict
+            )
+            && let Some(indexes) = &self.indexes
+        {
+            info.indexes = indexes.planner_specs(name);
+        }
+        Ok(info)
+    }
+}
+
+impl<S: StorageEngine> LiteCatalog<S> {
+    /// The collection named `name`, without its indexes.
+    fn resolve_collection(&self, name: &str) -> Option<CollectionInfo> {
         // Persisted metadata (DDL or synced) is authoritative.
         if let Some(meta) = self.metas.get(name) {
-            return Ok(Some(self.info_from_meta(name, meta)));
+            return Some(self.info_from_meta(name, meta));
         }
 
         // ── Backward-compat fallback: engine-based detection for collections
@@ -221,7 +251,7 @@ impl<S: StorageEngine> SqlCatalog for LiteCatalog<S> {
         // Strict collections: surface the real schema, including bitemporal.
         if let Some(schema) = self.strict.schema(name) {
             let (columns, pk) = columns_from_strict_schema(&schema);
-            return Ok(Some(CollectionInfo {
+            return Some(CollectionInfo {
                 name: name.into(),
                 engine: EngineType::DocumentStrict,
                 columns,
@@ -233,7 +263,7 @@ impl<S: StorageEngine> SqlCatalog for LiteCatalog<S> {
                 vector_primary: None,
                 partition_strategy: nodedb_types::PartitionStrategy::default(),
                 open_schema: CollectionInfo::open_schema_for(EngineType::DocumentStrict),
-            }));
+            });
         }
 
         // Columnar-family collections surface to the SQL planner as `Columnar`
@@ -243,7 +273,7 @@ impl<S: StorageEngine> SqlCatalog for LiteCatalog<S> {
         // bitemporal flag is surfaced from the engine.
         if let Some(schema) = self.columnar.schema(name) {
             let (columns, primary_key) = columns_from_columnar_schema(&schema);
-            return Ok(Some(CollectionInfo {
+            return Some(CollectionInfo {
                 name: name.into(),
                 engine: EngineType::Columnar,
                 columns,
@@ -255,14 +285,14 @@ impl<S: StorageEngine> SqlCatalog for LiteCatalog<S> {
                 vector_primary: None,
                 partition_strategy: nodedb_types::PartitionStrategy::default(),
                 open_schema: CollectionInfo::open_schema_for(EngineType::Columnar),
-            }));
+            });
         }
 
         // CRDT (schemaless) collections: dynamic schema, synthesize an id key.
         if let Ok(crdt) = self.crdt.lock()
             && crdt.collection_names().iter().any(|n| n == name)
         {
-            return Ok(Some(CollectionInfo {
+            return Some(CollectionInfo {
                 name: name.into(),
                 engine: EngineType::DocumentSchemaless,
                 columns: vec![ColumnInfo {
@@ -284,111 +314,10 @@ impl<S: StorageEngine> SqlCatalog for LiteCatalog<S> {
                 vector_primary: None,
                 partition_strategy: nodedb_types::PartitionStrategy::default(),
                 open_schema: CollectionInfo::open_schema_for(EngineType::DocumentSchemaless),
-            }));
+            });
         }
 
-        Ok(None)
-    }
-}
-
-/// Build column metadata + primary key from a slice of `ColumnDef`.
-///
-/// Shared by `StrictSchema`/`KvConfig::schema` and `ColumnarSchema`, which
-/// both carry `Vec<ColumnDef>` with identical (name, column_type, nullable,
-/// default, primary_key) shape.
-fn columns_from_column_defs(
-    columns: &[nodedb_types::columnar::ColumnDef],
-) -> (Vec<ColumnInfo>, Option<String>) {
-    let cols = columns
-        .iter()
-        .map(|c| {
-            // Resolve the declared width once here, at the catalog boundary,
-            // so the write path (range validation) and the read path (OID and
-            // binary payload width) cannot disagree.
-            let raw_type = format!("{:?}", c.column_type);
-            ColumnInfo {
-                name: c.name.clone(),
-                data_type: convert_column_type(&c.column_type),
-                nullable: c.nullable,
-                is_primary_key: c.primary_key,
-                default: c.default.clone(),
-                int_width: IntWidth::from_declared_type(&raw_type),
-                float_width: FloatWidth::from_declared_type(&raw_type),
-                raw_type: Some(raw_type),
-            }
-        })
-        .collect();
-    let pk = columns
-        .iter()
-        .find(|c| c.primary_key)
-        .map(|c| c.name.clone());
-    (cols, pk)
-}
-
-/// Build column metadata + primary key from a strict/KV schema.
-fn columns_from_strict_schema(schema: &StrictSchema) -> (Vec<ColumnInfo>, Option<String>) {
-    columns_from_column_defs(&schema.columns)
-}
-
-/// Build column metadata + primary key from a live `ColumnarSchema`.
-///
-/// This is the schema the columnar engine actually encodes rows against —
-/// the timeseries/spatial INSERT planner needs these exact columns, not the
-/// descriptor's field hints.
-fn columns_from_columnar_schema(schema: &ColumnarSchema) -> (Vec<ColumnInfo>, Option<String>) {
-    columns_from_column_defs(&schema.columns)
-}
-
-/// Build column metadata from `(name, type_hint)` descriptor field pairs.
-fn columns_from_fields(fields: &[(String, String)]) -> Vec<ColumnInfo> {
-    fields
-        .iter()
-        .map(|(fname, type_hint)| {
-            let ct = type_hint.parse::<nodedb_types::columnar::ColumnType>().ok();
-            let data_type = ct
-                .as_ref()
-                .map(convert_column_type)
-                .unwrap_or(SqlDataType::Bytes);
-            ColumnInfo {
-                name: fname.clone(),
-                data_type,
-                nullable: true,
-                is_primary_key: false,
-                default: None,
-                int_width: IntWidth::from_declared_type(type_hint),
-                float_width: FloatWidth::from_declared_type(type_hint),
-                raw_type: Some(type_hint.clone()),
-            }
-        })
-        .collect()
-}
-
-fn parse_strict_config(config_json: Option<&str>) -> Option<StrictSchema> {
-    config_json.and_then(|s| sonic_rs::from_str::<StrictSchema>(s).ok())
-}
-
-fn parse_kv_config(config_json: Option<&str>) -> Option<nodedb_types::KvConfig> {
-    config_json.and_then(|s| sonic_rs::from_str::<nodedb_types::KvConfig>(s).ok())
-}
-
-fn convert_column_type(ct: &nodedb_types::columnar::ColumnType) -> SqlDataType {
-    use nodedb_types::columnar::ColumnType;
-    match ct {
-        ColumnType::Int64 => SqlDataType::Int64,
-        ColumnType::Float64 => SqlDataType::Float64,
-        ColumnType::String => SqlDataType::String,
-        ColumnType::Bool => SqlDataType::Bool,
-        ColumnType::Bytes | ColumnType::Geometry | ColumnType::Json => SqlDataType::Bytes,
-        ColumnType::Timestamp | ColumnType::SystemTimestamp => SqlDataType::Timestamp,
-        ColumnType::Decimal { .. } | ColumnType::Uuid | ColumnType::Ulid | ColumnType::Regex => {
-            SqlDataType::String
-        }
-        ColumnType::Duration => SqlDataType::Int64,
-        ColumnType::Array | ColumnType::Set | ColumnType::Range | ColumnType::Record => {
-            SqlDataType::Bytes
-        }
-        ColumnType::Vector(dim) => SqlDataType::Vector(*dim as usize),
-        _ => SqlDataType::Bytes,
+        None
     }
 }
 

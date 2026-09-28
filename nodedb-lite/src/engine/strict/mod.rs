@@ -3,8 +3,8 @@ pub mod crdt_adapter;
 pub mod crud;
 pub mod engine;
 pub mod history;
+pub mod indexed;
 pub mod schema;
-pub mod secondary_index;
 #[cfg(test)]
 mod tests;
 

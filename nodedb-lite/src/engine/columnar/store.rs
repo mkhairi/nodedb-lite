@@ -278,9 +278,10 @@ impl<S: StorageEngine> ColumnarEngine<S> {
             .collections
             .read()
             .map_err(|_| LiteError::LockPoisoned)?;
-        guard.get(name).cloned().ok_or(LiteError::BadRequest {
-            detail: format!("columnar collection '{name}' does not exist"),
-        })
+        guard
+            .get(name)
+            .cloned()
+            .ok_or_else(|| LiteError::collection_not_found("columnar", name))
     }
 
     pub(super) fn lock_state<'a>(
@@ -384,9 +385,9 @@ impl<S: StorageEngine> ColumnarEngine<S> {
                 .collections
                 .write()
                 .map_err(|_| LiteError::LockPoisoned)?;
-            let state_arc = guard.remove(name).ok_or(LiteError::BadRequest {
-                detail: format!("columnar collection '{name}' does not exist"),
-            })?;
+            let state_arc = guard
+                .remove(name)
+                .ok_or_else(|| LiteError::collection_not_found("columnar", name))?;
             let segments = {
                 let s = state_arc.lock().map_err(|_| LiteError::LockPoisoned)?;
                 s.segments.clone()

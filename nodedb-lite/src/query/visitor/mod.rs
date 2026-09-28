@@ -3,6 +3,7 @@ mod adapter;
 mod array;
 mod dml;
 mod having_eval;
+mod index_range;
 mod kv;
 mod kv_dml;
 mod lateral;

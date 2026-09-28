@@ -83,32 +83,41 @@ impl<S: StorageEngine> StrictEngine<S> {
         Ok(())
     }
 
-    /// Drop a strict collection and all its data.
+    /// Drop a strict collection and all its rows. Its indexes stay: the
+    /// caller drops or moves them. Memory changes only once storage holds
+    /// the drop.
     pub async fn drop_collection(&self, name: &str) -> Result<(), LiteError> {
-        // Existence check under read lock.
-        {
+        let ops = self.drop_ops(name).await?;
+        self.storage.batch_write(&ops).await?;
+        self.forget_collection(name)
+    }
+
+    /// The storage writes that drop `name`: its rows, its schema, and its
+    /// place in the collection list. Changes nothing.
+    pub(crate) async fn drop_ops(&self, name: &str) -> Result<Vec<WriteOp>, LiteError> {
+        // Existence check and the remaining names, under the read lock.
+        let names: Vec<String> = {
             let guard = self
                 .collections
                 .read()
                 .map_err(|_| LiteError::LockPoisoned)?;
             if !guard.contains_key(name) {
-                return Err(LiteError::BadRequest {
-                    detail: format!("strict collection '{name}' does not exist"),
-                });
+                return Err(LiteError::collection_not_found("strict", name));
             }
-        }
+            guard.keys().filter(|k| *k != name).cloned().collect()
+        };
 
-        // Scan and delete all rows (lock dropped).
+        // Delete every row (lock dropped).
         let prefix = format!("{name}:");
         let rows = self
             .storage
             .scan_prefix(Namespace::Strict, prefix.as_bytes())
             .await?;
         let mut ops: Vec<WriteOp> = rows
-            .iter()
-            .map(|(k, _)| WriteOp::Delete {
+            .into_iter()
+            .map(|(key, _)| WriteOp::Delete {
                 ns: Namespace::Strict,
-                key: k.clone(),
+                key,
             })
             .collect();
 
@@ -119,16 +128,6 @@ impl<S: StorageEngine> StrictEngine<S> {
             key: meta_key.into_bytes(),
         });
 
-        // Take the write lock briefly to remove and snapshot the new name list.
-        let names: Vec<String> = {
-            let mut guard = self
-                .collections
-                .write()
-                .map_err(|_| LiteError::LockPoisoned)?;
-            guard.remove(name);
-            guard.keys().cloned().collect()
-        };
-
         let names_bytes =
             zerompk::to_msgpack_vec(&names).map_err(|e| LiteError::Serialization {
                 detail: e.to_string(),
@@ -138,8 +137,15 @@ impl<S: StorageEngine> StrictEngine<S> {
             key: META_STRICT_COLLECTIONS.to_vec(),
             value: names_bytes,
         });
+        Ok(ops)
+    }
 
-        self.storage.batch_write(&ops).await?;
+    /// Remove `name` from memory, once storage holds its [`Self::drop_ops`].
+    pub(crate) fn forget_collection(&self, name: &str) -> Result<(), LiteError> {
+        self.collections
+            .write()
+            .map_err(|_| LiteError::LockPoisoned)?
+            .remove(name);
         Ok(())
     }
 
@@ -169,9 +175,10 @@ impl<S: StorageEngine> StrictEngine<S> {
                 .collections
                 .read()
                 .map_err(|_| LiteError::LockPoisoned)?;
-            guard.get(name).cloned().ok_or(LiteError::BadRequest {
-                detail: format!("strict collection '{name}' does not exist"),
-            })?
+            guard
+                .get(name)
+                .cloned()
+                .ok_or_else(|| LiteError::collection_not_found("strict", name))?
         };
 
         // Check for duplicate column name.

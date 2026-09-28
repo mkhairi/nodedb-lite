@@ -166,8 +166,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         let count = delete_ops.len();
         if count > 0 {
-            self.storage
-                .batch_write(&delete_ops)
+            self.kv_local
+                .commit(&*self.storage, delete_ops)
                 .await
                 .map_err(NodeDbError::storage)?;
         }

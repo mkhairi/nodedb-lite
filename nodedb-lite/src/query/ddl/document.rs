@@ -63,10 +63,10 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
 
     /// Handle: `DROP COLLECTION <name>` for a schemaless document collection.
     ///
-    /// Clears the collection's CRDT state, drops its text index and removes the
-    /// persisted metadata — the same three steps the programmatic
-    /// `drop_collection` performs, so the SQL and API paths leave the store in
-    /// the same state.
+    /// Clears the collection's CRDT state, drops its secondary and text
+    /// indexes and removes the persisted metadata — the same steps the
+    /// programmatic `drop_collection` performs, so the SQL and API paths leave
+    /// the store in the same state.
     pub(in crate::query) async fn handle_drop_document(
         &self,
         name: &str,
@@ -76,6 +76,7 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             .map_err(|_| LiteError::LockPoisoned)?
             .clear_collection(name)
             .map_err(|e| LiteError::Query(e.to_string()))?;
+        self.indexes.drop_collection(&*self.storage, name).await?;
 
         self.fts_state
             .manager

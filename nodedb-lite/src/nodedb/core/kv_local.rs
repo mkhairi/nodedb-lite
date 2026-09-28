@@ -54,6 +54,9 @@ pub struct KvLocalState {
     /// enqueue in the other, and Origin would keep the value Lite overwrote.
     /// It also makes a read-modify-write such as `kv_increment` atomic.
     pub(crate) write_order: tokio::sync::Mutex<()>,
+    /// Secondary indexes every commit of the buffer maintains. Set once by
+    /// the query engine.
+    indexes: std::sync::OnceLock<std::sync::Arc<crate::index::IndexCatalog>>,
 }
 
 impl KvLocalState {
@@ -65,6 +68,49 @@ impl KvLocalState {
             }),
             cache: Mutex::new(lru::LruCache::new(cache_capacity)),
             write_order: tokio::sync::Mutex::new(()),
+            indexes: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Maintain `catalog`'s key-value indexes from every buffer commit.
+    pub(crate) fn set_index_catalog(&self, catalog: std::sync::Arc<crate::index::IndexCatalog>) {
+        // Set once, when the query engine is built; a second call keeps the
+        // first catalog.
+        let _ = self.indexes.set(catalog);
+    }
+
+    /// Whether writes to `collection` maintain a key-value index. Such writes
+    /// commit directly rather than wait in the buffer, so a unique index
+    /// refuses the write that breaks it instead of the batch it lands in.
+    pub(crate) fn is_indexed(&self, collection: &str) -> bool {
+        self.indexes
+            .get()
+            .is_some_and(|c| c.has_defs(collection, crate::index::IndexEngine::KeyValue))
+    }
+
+    /// Refuse KV writes `ops` a unique index forbids, writing nothing.
+    pub(crate) async fn check<S: StorageEngine>(
+        &self,
+        storage: &S,
+        ops: &[WriteOp],
+    ) -> Result<(), LiteError> {
+        match self.indexes.get() {
+            Some(catalog) => crate::query::kv_ops::indexes::kv_check(storage, catalog, ops).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Commit KV writes `ops` with the index entries they imply. Every KV
+    /// write reaches storage through here.
+    pub(crate) async fn commit<S: StorageEngine>(
+        &self,
+        storage: &S,
+        ops: Vec<WriteOp>,
+    ) -> Result<(), LiteError> {
+        match self.indexes.get() {
+            Some(catalog) => crate::query::kv_ops::indexes::kv_commit(storage, catalog, ops).await,
+            None if ops.is_empty() => Ok(()),
+            None => storage.batch_write(&ops).await,
         }
     }
 
@@ -84,7 +130,7 @@ impl KvLocalState {
             ops
         };
         let count = ops.len();
-        storage.batch_write(&ops).await?;
+        self.commit(storage, ops).await?;
         Ok(count)
     }
 

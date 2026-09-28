@@ -13,6 +13,7 @@ use nodedb_sql::ddl_ast::statement::{CollectionStmt, NodedbStatement};
 use nodedb_types::result::QueryResult;
 
 use crate::error::LiteError;
+use crate::query::document_ops::indexes;
 use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
@@ -185,6 +186,43 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 }
                 Some(self.handle_drop_document(&name).await)
             }
+
+            // Index DDL routes here rather than through the planner so a
+            // partial index keeps its `WHERE` predicate, which the planner's
+            // `CREATE INDEX` does not accept.
+            CollectionStmt::CreateIndex {
+                unique,
+                index_name,
+                collection,
+                field,
+                case_insensitive,
+                where_condition,
+                if_not_exists,
+            } => Some(
+                indexes::create_index(
+                    self,
+                    indexes::CreateIndexRequest {
+                        name: index_name.as_deref(),
+                        collection: &collection,
+                        field: &field,
+                        unique,
+                        case_insensitive,
+                        predicate: where_condition.as_deref(),
+                        if_not_exists,
+                    },
+                )
+                .await,
+            ),
+
+            CollectionStmt::DropIndex {
+                name, if_exists, ..
+            } => Some(indexes::drop_index(self, &name, if_exists).await),
+
+            CollectionStmt::Reindex {
+                collection,
+                index_name,
+                ..
+            } => Some(indexes::reindex(self, &collection, index_name.as_deref()).await),
 
             CollectionStmt::DescribeCollection { name } => {
                 let name = name.to_lowercase();

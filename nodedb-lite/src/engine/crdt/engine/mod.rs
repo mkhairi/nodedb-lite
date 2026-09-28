@@ -14,6 +14,7 @@
 //! delta that will eventually sync to Origin.
 
 mod checkpoint;
+mod index_hook;
 mod lifecycle;
 mod list_ops;
 mod mutate;

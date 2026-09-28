@@ -14,7 +14,7 @@ use crate::storage::engine::StorageEngine;
 
 const DEADLINE_PREFIX_LEN: usize = 8;
 
-pub(super) fn kv_key(collection: &str, key: &[u8]) -> Vec<u8> {
+pub(crate) fn kv_key(collection: &str, key: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(collection.len() + 1 + key.len());
     k.extend_from_slice(collection.as_bytes());
     k.push(0);
@@ -22,14 +22,14 @@ pub(super) fn kv_key(collection: &str, key: &[u8]) -> Vec<u8> {
     k
 }
 
-pub(super) fn encode_value(deadline_ms: u64, value: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_value(deadline_ms: u64, value: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(DEADLINE_PREFIX_LEN + value.len());
     encoded.extend_from_slice(&deadline_ms.to_le_bytes());
     encoded.extend_from_slice(value);
     encoded
 }
 
-pub(super) fn decode_value(stored: &[u8]) -> Option<(u64, &[u8])> {
+pub(crate) fn decode_value(stored: &[u8]) -> Option<(u64, &[u8])> {
     if stored.len() < DEADLINE_PREFIX_LEN {
         return None;
     }
@@ -37,11 +37,11 @@ pub(super) fn decode_value(stored: &[u8]) -> Option<(u64, &[u8])> {
     Some((deadline, &stored[DEADLINE_PREFIX_LEN..]))
 }
 
-pub(super) fn is_expired(deadline_ms: u64) -> bool {
+pub(crate) fn is_expired(deadline_ms: u64) -> bool {
     deadline_ms != 0 && crate::runtime::now_millis() >= deadline_ms
 }
 
-pub(super) fn split_kv_key(composite: &[u8]) -> Option<(&str, &[u8])> {
+pub(crate) fn split_kv_key(composite: &[u8]) -> Option<(&str, &[u8])> {
     let sep = composite.iter().position(|&b| b == 0)?;
     let coll = std::str::from_utf8(&composite[..sep]).ok()?;
     let key = &composite[sep + 1..];

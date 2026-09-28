@@ -11,13 +11,13 @@
 use nodedb_types::value::Value;
 
 use crate::engine::fts::maintain;
+use crate::engine::fts::maintain::FtsOutbound;
 use crate::engine::index_integration::{
     deindex_row_text, index_geohash, index_row_text, pk_row_id, row_id,
 };
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
-use crate::sync::FtsOutbound;
 
 /// The queue a SQL write's text is staged on for Origin, like the CRDT delta
 /// the same write produces.

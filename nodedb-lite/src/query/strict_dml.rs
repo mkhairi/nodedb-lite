@@ -34,9 +34,7 @@ pub async fn insert_strict<S: StorageEngine>(
     let strict = &engine.strict;
     let schema = strict
         .schema(collection)
-        .ok_or_else(|| LiteError::BadRequest {
-            detail: format!("strict collection '{collection}' does not exist"),
-        })?;
+        .ok_or_else(|| LiteError::collection_not_found("strict", collection))?;
 
     // Cache the PK column position — `if_absent` requires a real PK; without one
     // we'd silently treat column 0 as the key and corrupt rows.
@@ -57,34 +55,25 @@ pub async fn insert_strict<S: StorageEngine>(
         None
     };
 
-    let mut affected: u64 = 0;
+    // Every row is checked before any is written, so a statement that fails
+    // writes nothing.
+    let mut planned: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
     for row_pairs in rows {
         let values = build_row(row_pairs, &schema.columns)?;
-
         if let Some(idx) = pk_idx {
             let pk_val = &values[idx];
-            // Check for duplicate by attempting a point read.
-            if strict.get(collection, pk_val).await?.is_some() {
+            // ON CONFLICT DO NOTHING skips a key stored or already inserted.
+            if planned.iter().any(|p| p[idx] == *pk_val)
+                || strict.get(collection, pk_val).await?.is_some()
+            {
                 continue;
             }
         }
-
-        strict
-            .insert(collection, &values)
-            .await
-            .map_err(|e| match e {
-                LiteError::BadRequest { detail }
-                    if detail.contains("duplicate primary key") && if_absent =>
-                {
-                    // Race: another insert won between our check and insert.
-                    // if_absent semantics: skip.
-                    LiteError::BadRequest { detail }
-                }
-                other => other,
-            })?;
-        index_strict_rows(engine, collection, [values.as_slice()])?;
-        affected += 1;
+        planned.push(values);
     }
+    strict.insert_rows(collection, &planned).await?;
+    index_strict_rows(engine, collection, planned.iter().map(Vec::as_slice))?;
+    let affected = planned.len() as u64;
     Ok(QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
@@ -105,9 +94,7 @@ pub async fn update_strict<S: StorageEngine>(
     let strict = &engine.strict;
     let schema = strict
         .schema(collection)
-        .ok_or_else(|| LiteError::BadRequest {
-            detail: format!("strict collection '{collection}' does not exist"),
-        })?;
+        .ok_or_else(|| LiteError::collection_not_found("strict", collection))?;
     let (pk_idx, pk_col) = schema
         .columns
         .iter()
@@ -135,12 +122,11 @@ pub async fn update_strict<S: StorageEngine>(
         .map(|key| parse_pk_value(&sql_value_to_string(key), &pk_col.column_type))
         .collect();
     let pks = strict_targets(engine, collection, filters, named, pk_idx).await?;
-    let mut affected: u64 = 0;
-    for pk_value in &pks {
-        if strict.update(collection, pk_value, &updates).await? {
-            affected += 1;
-        }
-    }
+    // One batch for the statement: a unique index it would break refuses
+    // every row.
+    let changes: Vec<(Value, HashMap<String, Value>)> =
+        pks.iter().map(|pk| (pk.clone(), updates.clone())).collect();
+    let affected = strict.update_many(collection, &changes).await?;
     reindex_strict_rows(engine, collection, &pks).await?;
     Ok(QueryResult {
         columns: Vec::new(),
@@ -161,9 +147,7 @@ pub async fn delete_strict<S: StorageEngine>(
     let strict = &engine.strict;
     let schema = strict
         .schema(collection)
-        .ok_or_else(|| LiteError::BadRequest {
-            detail: format!("strict collection '{collection}' does not exist"),
-        })?;
+        .ok_or_else(|| LiteError::collection_not_found("strict", collection))?;
     let (pk_idx, pk_col) = schema
         .columns
         .iter()

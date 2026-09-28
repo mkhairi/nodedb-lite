@@ -12,6 +12,7 @@ use nodedb_sql::types::*;
 use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
+use super::document_rows;
 use super::engine::{LiteQueryEngine, sql_value_to_string, sql_value_to_value};
 use super::kv_ops::sql_read::{kv_key_bytes, kv_select_all, kv_select_key};
 use crate::error::LiteError;
@@ -42,30 +43,12 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                     )
                     .await
                     .map_err(|e| LiteError::Query(e.to_string()))?;
-                    let mut rows = Vec::with_capacity(live_docs.len());
-                    for (id, body) in &live_docs {
-                        // Decode the msgpack body to a JSON string for the
-                        // document column so post-scan filters can match fields.
-                        let doc_str = if body.is_empty() {
-                            "{}".to_owned()
-                        } else {
-                            match nodedb_types::json_msgpack::value_from_msgpack(body) {
-                                Ok(nodedb_types::value::Value::Object(fields)) => {
-                                    let json_map: serde_json::Map<String, serde_json::Value> =
-                                        fields
-                                            .into_iter()
-                                            .map(|(k, v)| (k, value_to_serde_json(v)))
-                                            .collect();
-                                    sonic_rs::to_string(&serde_json::Value::Object(json_map))
-                                        .unwrap_or_else(|_| "{}".to_owned())
-                                }
-                                _ => "{}".to_owned(),
-                            }
-                        };
-                        rows.push(vec![Value::String(id.clone()), Value::String(doc_str)]);
-                    }
+                    let rows = live_docs
+                        .iter()
+                        .map(|(id, body)| document_rows::body_row(id, body))
+                        .collect();
                     return Ok(QueryResult {
-                        columns: vec!["id".into(), "document".into()],
+                        columns: document_rows::columns(),
                         rows,
                         rows_affected: 0,
                         command: None,
@@ -74,28 +57,25 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
 
                 let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
                 let ids = crdt.list_ids(collection);
-                let mut rows = Vec::with_capacity(ids.len());
-                for id in &ids {
-                    if let Some(val) = crdt.read(collection, id) {
-                        let json = loro_value_to_json(&val);
-                        let doc_str = sonic_rs::to_string(&json).unwrap_or_default();
-                        rows.push(vec![Value::String(id.clone()), Value::String(doc_str)]);
-                    }
-                }
+                let rows = ids
+                    .iter()
+                    .filter_map(|id| {
+                        let val = crdt.read(collection, id)?;
+                        Some(document_rows::crdt_row(id, &val))
+                    })
+                    .collect();
                 Ok(QueryResult {
-                    columns: vec!["id".into(), "document".into()],
+                    columns: document_rows::columns(),
                     rows,
                     rows_affected: 0,
                     command: None,
                 })
             }
             EngineType::DocumentStrict => {
-                let schema =
-                    self.strict
-                        .schema(collection)
-                        .ok_or_else(|| LiteError::BadRequest {
-                            detail: format!("strict collection '{collection}' does not exist"),
-                        })?;
+                let schema = self
+                    .strict
+                    .schema(collection)
+                    .ok_or_else(|| LiteError::collection_not_found("strict", collection))?;
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 let rows = self.strict.list_rows(collection).await?;
                 Ok(QueryResult {
@@ -108,12 +88,10 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             // Every columnar-family profile keeps its rows in the columnar
             // engine, which applies the timeseries or spatial profile itself.
             EngineType::Columnar | EngineType::Timeseries | EngineType::Spatial => {
-                let schema =
-                    self.columnar
-                        .schema(collection)
-                        .ok_or_else(|| LiteError::BadRequest {
-                            detail: format!("columnar collection '{collection}' does not exist"),
-                        })?;
+                let schema = self
+                    .columnar
+                    .schema(collection)
+                    .ok_or_else(|| LiteError::collection_not_found("columnar", collection))?;
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 let rows = self.columnar.list_rows(collection).await?;
                 Ok(QueryResult {
@@ -142,11 +120,10 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
                 match crdt.read(collection, &key_str) {
                     Some(val) => {
-                        let json = loro_value_to_json(&val);
-                        let doc_str = sonic_rs::to_string(&json).unwrap_or_default();
+                        let row = document_rows::crdt_row(&key_str, &val);
                         Ok(QueryResult {
-                            columns: vec!["id".into(), "document".into()],
-                            rows: vec![vec![Value::String(key_str), Value::String(doc_str)]],
+                            columns: document_rows::columns(),
+                            rows: vec![row],
                             rows_affected: 0,
                             command: None,
                         })
@@ -155,12 +132,10 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 }
             }
             EngineType::DocumentStrict => {
-                let schema =
-                    self.strict
-                        .schema(collection)
-                        .ok_or_else(|| LiteError::BadRequest {
-                            detail: format!("strict collection '{collection}' does not exist"),
-                        })?;
+                let schema = self
+                    .strict
+                    .schema(collection)
+                    .ok_or_else(|| LiteError::collection_not_found("strict", collection))?;
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 // The PK column type determines how to parse the key string.
                 let pk_col = schema
@@ -238,48 +213,6 @@ pub(super) fn parse_pk_value(
             .unwrap_or_else(|_| Value::String(key_str.to_string())),
         ColumnType::Uuid => Value::Uuid(key_str.to_string()),
         _ => Value::String(key_str.to_string()),
-    }
-}
-
-fn value_to_serde_json(v: nodedb_types::value::Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(b),
-        Value::Integer(n) => serde_json::json!(n),
-        Value::Float(f) => serde_json::json!(f),
-        Value::String(s) => serde_json::Value::String(s),
-        Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(value_to_serde_json).collect())
-        }
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, val) in map {
-                out.insert(k, value_to_serde_json(val));
-            }
-            serde_json::Value::Object(out)
-        }
-        _ => serde_json::Value::Null,
-    }
-}
-
-fn loro_value_to_json(v: &loro::LoroValue) -> serde_json::Value {
-    match v {
-        loro::LoroValue::Null => serde_json::Value::Null,
-        loro::LoroValue::Bool(b) => serde_json::Value::Bool(*b),
-        loro::LoroValue::I64(n) => serde_json::json!(*n),
-        loro::LoroValue::Double(f) => serde_json::json!(*f),
-        loro::LoroValue::String(s) => serde_json::Value::String(s.to_string()),
-        loro::LoroValue::Map(m) => {
-            let mut obj = serde_json::Map::new();
-            for (k, val) in m.iter() {
-                obj.insert(k.to_string(), loro_value_to_json(val));
-            }
-            serde_json::Value::Object(obj)
-        }
-        loro::LoroValue::List(arr) => {
-            serde_json::Value::Array(arr.iter().map(loro_value_to_json).collect())
-        }
-        _ => serde_json::Value::Null,
     }
 }
 

@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Index management operations for the Document engine physical visitor.
+//! Collection registration and secondary-index DDL for the Document engine.
+
+use std::sync::Arc;
 
 use nodedb_types::Namespace;
 use nodedb_types::result::QueryResult;
 
 use crate::error::LiteError;
+use crate::index::rebuild::build_index;
+use crate::index::{
+    IndexDef, IndexEngine, IndexPredicate, canonical_field, default_index_name, field_spec,
+};
+use crate::nodedb::collection::CollectionMeta;
 use crate::query::engine::LiteQueryEngine;
-use crate::query::value_utils::{loro_value_to_string, value_to_string};
-use crate::storage::engine::{StorageEngine, WriteOp};
-
-use super::is_strict;
-use super::reads::index_insert_id;
+use crate::storage::engine::StorageEngine;
 
 /// Register: initialize a collection in the appropriate engine.
 ///
@@ -34,126 +37,236 @@ pub async fn register<S: StorageEngine>(
             // Schemaless collections are auto-discovered — no registration needed.
         }
     }
-    Ok(QueryResult {
-        columns: Vec::new(),
-        rows: Vec::new(),
-        rows_affected: 0,
-        command: None,
-    })
+    Ok(affected(0))
 }
 
-/// DropIndex: remove all sparse-index entries for a field on a collection.
+/// A `CREATE INDEX`, however it was spelled.
+pub struct CreateIndexRequest<'a> {
+    /// Index name; `None` derives `idx_<collection>_<field>`.
+    pub name: Option<&'a str>,
+    pub collection: &'a str,
+    /// The field as written: `email`, `$.a.b`, or `tags[]` for an array index.
+    pub field: &'a str,
+    pub unique: bool,
+    pub case_insensitive: bool,
+    /// The `WHERE` body of a partial index.
+    pub predicate: Option<&'a str>,
+    /// An index that already exists makes the statement a no-op.
+    pub if_not_exists: bool,
+}
+
+fn affected(n: u64) -> QueryResult {
+    QueryResult {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        rows_affected: n,
+        command: None,
+    }
+}
+
+/// The engine whose rows an index on `collection` covers.
+async fn index_engine_for<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    collection: &str,
+) -> Result<IndexEngine, LiteError> {
+    if engine.strict.schema(collection).is_some() {
+        return Ok(IndexEngine::Strict);
+    }
+    if engine.columnar.schema(collection).is_some() {
+        return Err(LiteError::Unsupported {
+            detail: format!(
+                "CREATE INDEX on columnar collection '{collection}': columnar collections \
+                 are filtered by block statistics, not secondary indexes"
+            ),
+        });
+    }
+    let meta_key = format!("collection:{collection}");
+    if let Some(bytes) = engine
+        .storage
+        .get(Namespace::Meta, meta_key.as_bytes())
+        .await?
+    {
+        let meta: CollectionMeta =
+            sonic_rs::from_slice(&bytes).map_err(|e| LiteError::Serialization {
+                detail: format!("metadata of collection '{collection}' does not decode: {e}"),
+            })?;
+        return Ok(match meta.collection_type.as_str() {
+            "kv" => IndexEngine::KeyValue,
+            "columnar" | "timeseries" | "spatial" => {
+                return Err(LiteError::Unsupported {
+                    detail: format!(
+                        "CREATE INDEX on {} collection '{collection}' is not supported",
+                        meta.collection_type
+                    ),
+                });
+            }
+            _ => IndexEngine::Document,
+        });
+    }
+    let known = engine
+        .crdt
+        .lock()
+        .map_err(|_| LiteError::LockPoisoned)?
+        .collection_names()
+        .iter()
+        .any(|n| n == collection);
+    if known {
+        Ok(IndexEngine::Document)
+    } else {
+        Err(LiteError::BadRequest {
+            detail: format!("CREATE INDEX: collection '{collection}' does not exist"),
+        })
+    }
+}
+
+/// `CREATE INDEX`: declare the index and build its entries from the rows the
+/// collection holds. A unique index over rows that already share a value is
+/// refused. Answers with the number of entries built.
+pub async fn create_index<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    req: CreateIndexRequest<'_>,
+) -> Result<QueryResult, LiteError> {
+    let index_engine = index_engine_for(engine, req.collection).await?;
+    declare_index(engine, req, index_engine).await
+}
+
+/// Declare an index over `index_engine` rows and build it: `CREATE INDEX`
+/// once the engine is known.
+pub(crate) async fn declare_index<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    req: CreateIndexRequest<'_>,
+    index_engine: IndexEngine,
+) -> Result<QueryResult, LiteError> {
+    let (path, is_array) = canonical_field(req.field);
+    let name = req
+        .name
+        .map(str::to_string)
+        .unwrap_or_else(|| default_index_name(req.collection, req.field));
+    if let Some(existing) = engine.indexes.def_named(&name) {
+        if req.if_not_exists {
+            return Ok(affected(0));
+        }
+        return Err(LiteError::BadRequest {
+            detail: format!("index '{name}' already exists on '{}'", existing.collection),
+        });
+    }
+    let spec = field_spec(&path, is_array);
+    if let Some(existing) = engine.indexes.def_on_field(req.collection, &spec) {
+        if req.if_not_exists {
+            return Ok(affected(0));
+        }
+        return Err(LiteError::BadRequest {
+            detail: format!(
+                "collection '{}' already has index '{}' on {spec}: \
+                 drop it before indexing the field again",
+                req.collection, existing.name
+            ),
+        });
+    }
+    let def = Arc::new(IndexDef {
+        name,
+        collection: req.collection.to_string(),
+        path,
+        unique: req.unique,
+        case_insensitive: req.case_insensitive,
+        is_array,
+        predicate: req.predicate.map(IndexPredicate::parse).transpose()?,
+        engine: index_engine,
+    });
+    Ok(affected(rebuild_index(engine, def).await?))
+}
+
+/// `DROP INDEX`: remove the index and its entries. A missing index is an
+/// error unless `if_exists`.
 pub async fn drop_index<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    name: &str,
+    if_exists: bool,
+) -> Result<QueryResult, LiteError> {
+    match engine.indexes.drop_index(&*engine.storage, name).await? {
+        Some(_) => Ok(affected(0)),
+        None if if_exists => Ok(affected(0)),
+        None => Err(LiteError::BadRequest {
+            detail: format!("index '{name}' does not exist"),
+        }),
+    }
+}
+
+/// The physical `DropIndex` op: drop the index on `field` of `collection`,
+/// or the index named `field`. Dropping an index that does not exist is a
+/// no-op.
+pub async fn drop_field_index<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
     field: &str,
 ) -> Result<QueryResult, LiteError> {
-    let prefix = format!("{collection}:{field}:");
-    let entries = engine
-        .storage
-        .scan_range_bounded(Namespace::Meta, Some(prefix.as_bytes()), None, None)
-        .await
-        .map_err(|e| LiteError::Storage {
-            detail: e.to_string(),
-        })?;
-    let mut ops: Vec<WriteOp> = Vec::with_capacity(entries.len());
-    for (key, _) in entries {
-        if key.starts_with(prefix.as_bytes()) {
-            ops.push(WriteOp::Delete {
-                ns: Namespace::Meta,
-                key,
-            });
-        }
-    }
-    let count = ops.len() as u64;
-    if !ops.is_empty() {
-        engine
-            .storage
-            .batch_write(&ops)
-            .await
-            .map_err(|e| LiteError::Storage {
-                detail: e.to_string(),
-            })?;
-    }
-    Ok(QueryResult {
-        columns: Vec::new(),
-        rows: Vec::new(),
-        rows_affected: count,
-        command: None,
-    })
+    let (path, is_array) = canonical_field(field);
+    let name = engine
+        .indexes
+        .def_on_field(collection, &field_spec(&path, is_array))
+        .map(|def| def.name.clone())
+        .unwrap_or_else(|| field.to_string());
+    drop_index(engine, &name, true).await
 }
 
-/// BackfillIndex: rebuild a secondary index from existing collection documents.
-pub async fn backfill_index<S: StorageEngine>(
+/// Rebuild the entries of one index from its collection's rows.
+pub async fn rebuild_index<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    def: Arc<IndexDef>,
+) -> Result<u64, LiteError> {
+    build_index(
+        &engine.indexes,
+        &*engine.storage,
+        &engine.crdt,
+        &engine.strict,
+        def,
+    )
+    .await
+}
+
+/// `REINDEX`: rebuild the index named `name`, or every index on
+/// `collection` when no name is given. Answers with the entries built.
+pub async fn reindex<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
-    path: &str,
+    name: Option<&str>,
 ) -> Result<QueryResult, LiteError> {
-    let mut indexed: u64 = 0;
-
-    if is_strict(engine, collection) {
-        let schema = engine
-            .strict
-            .schema(collection)
-            .ok_or_else(|| LiteError::BadRequest {
-                detail: format!("strict collection '{collection}' does not exist"),
-            })?;
-        let bare = bare_path(path);
-        let col_idx = schema
-            .columns
-            .iter()
-            .position(|c| c.name == bare || c.name == path);
-        let pk_idx = schema
-            .columns
-            .iter()
-            .position(|c| c.primary_key)
-            .ok_or_else(|| LiteError::BadRequest {
-                detail: format!("strict collection '{collection}' has no primary key"),
-            })?;
-        let all_rows = engine.strict.list_rows(collection).await?;
-
-        for row in &all_rows {
-            let pk = value_to_string(&row[pk_idx]);
-            if let Some(idx) = col_idx
-                && idx < row.len()
-            {
-                let val_str = value_to_string(&row[idx]);
-                index_insert_id(engine, collection, path, &val_str, &pk).await?;
-                indexed += 1;
-            }
+    let defs: Vec<Arc<IndexDef>> = match name {
+        Some(name) => {
+            let def = engine
+                .indexes
+                .def_named(name)
+                .ok_or_else(|| LiteError::BadRequest {
+                    detail: format!("index '{name}' does not exist"),
+                })?;
+            vec![def]
         }
-    } else {
-        let pairs: Vec<(String, String)> = {
-            let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-            let ids = crdt.list_ids(collection);
-            let bare = bare_path(path);
-            let mut out: Vec<(String, String)> = Vec::new();
-            for id in &ids {
-                if let Some(val) = crdt.read(collection, id)
-                    && let loro::LoroValue::Map(map) = &val
-                    && let Some(field_val) = map.get(bare)
-                {
-                    let val_str = loro_value_to_string(field_val);
-                    out.push((id.clone(), val_str));
-                }
-            }
-            out
-        };
-        for (id, val_str) in &pairs {
-            index_insert_id(engine, collection, path, val_str, id).await?;
-            indexed += 1;
-        }
+        None => engine
+            .indexes
+            .defs()
+            .into_iter()
+            .filter(|d| d.collection == collection)
+            .collect(),
+    };
+    let mut built = 0;
+    for def in defs {
+        built += rebuild_index(engine, def).await?;
     }
-
-    Ok(QueryResult {
-        columns: Vec::new(),
-        rows: Vec::new(),
-        rows_affected: indexed,
-        command: None,
-    })
+    Ok(affected(built))
 }
 
-/// Strip `$.` prefix from a JSON path expression to get the bare field name.
-fn bare_path(path: &str) -> &str {
-    path.trim_start_matches("$.").trim_start_matches('$')
+/// The physical `BackfillIndex` op: rebuild the index already declared on the
+/// field, or declare one under the derived name and build it.
+pub async fn backfill_index<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    req: CreateIndexRequest<'_>,
+) -> Result<QueryResult, LiteError> {
+    let (path, is_array) = canonical_field(req.field);
+    match engine
+        .indexes
+        .def_on_field(req.collection, &field_spec(&path, is_array))
+    {
+        Some(def) => Ok(affected(rebuild_index(engine, def).await?)),
+        None => create_index(engine, req).await,
+    }
 }

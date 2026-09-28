@@ -61,10 +61,6 @@ pub struct NodeDbLite<S: StorageEngine> {
     pub(crate) sparse_state: Arc<SparseVectorState>,
     /// Spatial R-tree indexes for geometry fields.
     pub(crate) spatial: Arc<Mutex<crate::engine::spatial::SpatialIndexManager>>,
-    /// Per-column secondary B-tree indexes for strict collections.
-    /// Key: `{collection}:{column}` → SecondaryIndex.
-    pub(crate) secondary_indices:
-        Mutex<HashMap<String, crate::engine::strict::secondary_index::SecondaryIndex>>,
     /// Strict document engine (Binary Tuple collections).
     /// Arc-wrapped for sharing with the query engine's StrictTableProvider.
     pub(crate) strict: Arc<StrictEngine<S>>,

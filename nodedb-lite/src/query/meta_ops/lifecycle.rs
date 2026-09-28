@@ -83,7 +83,11 @@ pub async fn handle_unregister_collection<S: StorageEngine>(
             })?;
         }
     }
-    // The collection's documents are gone, and so is every text index over them.
+    // The collection's documents are gone, and so is every index over them.
+    engine
+        .indexes
+        .drop_collection(&*engine.storage, name)
+        .await?;
     engine
         .fts_state
         .manager
@@ -150,6 +154,10 @@ pub async fn handle_rename_collection<S: StorageEngine>(
         engine.storage.delete(Namespace::Meta, old_key).await?;
         renamed += 1;
     }
+    engine
+        .indexes
+        .rename_collection(&*engine.storage, old_collection, new_collection)
+        .await?;
     Ok(QueryResult {
         columns: vec!["renamed_entries".into()],
         rows: vec![vec![Value::Integer(renamed as i64)]],

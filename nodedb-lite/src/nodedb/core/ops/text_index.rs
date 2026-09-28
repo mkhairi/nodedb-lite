@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use nodedb_types::Value;
 
 use crate::engine::fts::maintain;
+use crate::engine::fts::maintain::FtsOutbound;
 use crate::error::LiteError;
 use crate::nodedb::core::types::NodeDbLite;
 use crate::storage::engine::StorageEngine;
-use crate::sync::FtsOutbound;
 
 impl<S: StorageEngine> NodeDbLite<S> {
     /// The queue a local text-index change is staged on for Origin, or

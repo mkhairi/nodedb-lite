@@ -14,8 +14,25 @@ pub(crate) fn value_to_loro(v: &Value) -> LoroValue {
         Value::Float(f) => LoroValue::Double(*f),
         Value::String(s) => LoroValue::String(s.clone().into()),
         Value::Bytes(b) => LoroValue::Binary(b.clone().into()),
-        Value::Array(_) | Value::Object(_) | Value::Set(_) => {
-            // Serialize complex values as JSON string.
+        // Arrays and objects keep their structure, so an array index, the
+        // SQL document functions and a sync peer all see elements and keys.
+        // A row written before this stored them as JSON text; that text
+        // reads back as the string it is, as it always did.
+        Value::Array(items) => LoroValue::List(
+            items
+                .iter()
+                .map(value_to_loro)
+                .collect::<Vec<LoroValue>>()
+                .into(),
+        ),
+        Value::Object(map) => LoroValue::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), value_to_loro(v)))
+                .collect::<std::collections::HashMap<String, LoroValue>>()
+                .into(),
+        ),
+        Value::Set(_) => {
+            // A set has no Loro counterpart that reads back as a set.
             let json = sonic_rs::to_string(v).unwrap_or_default();
             LoroValue::String(json.into())
         }

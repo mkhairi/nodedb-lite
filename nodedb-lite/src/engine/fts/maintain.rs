@@ -19,7 +19,26 @@ use crate::error::LiteError;
 use crate::nodedb::convert::loro_value_to_document;
 use crate::nodedb::lock_ext::LockExt;
 use crate::storage::engine::StorageEngine;
-use crate::sync::FtsOutbound;
+
+/// Where whole-document text is staged for Origin.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use crate::sync::FtsOutbound;
+
+/// Targets without sync have no outbound queue. No value of this type
+/// exists, so every caller there passes `None`.
+#[cfg(target_arch = "wasm32")]
+pub(crate) struct FtsOutbound<S>(std::convert::Infallible, std::marker::PhantomData<S>);
+
+#[cfg(target_arch = "wasm32")]
+impl<S> FtsOutbound<S> {
+    fn stage_index(&self, _collection: &str, _doc_id: &str, _text: String) {
+        match self.0 {}
+    }
+
+    fn stage_delete(&self, _collection: &str, _doc_id: &str) {
+        match self.0 {}
+    }
+}
 
 /// Index a schemaless document whole and per string field, replacing what
 /// it held before, and stage its whole-document text on `outbound`.

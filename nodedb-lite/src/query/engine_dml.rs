@@ -8,6 +8,7 @@ use nodedb_types::result::QueryResult;
 use super::dml_targets::document_targets;
 use super::engine::{LiteQueryEngine, sql_value_to_string};
 use super::text_index::reindex_documents;
+use crate::engine::crdt::{CrdtRowOp, CrdtRowWrite};
 use crate::error::LiteError;
 use crate::storage::engine::StorageEngine;
 use nodedb_sql::types::filter::Filter;
@@ -53,8 +54,10 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         }
         // CRDT / schemaless path.
         let mut crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-        let mut affected = 0;
-        let mut written: Vec<String> = Vec::with_capacity(rows.len());
+        // Every row is checked before any is written, so a statement that
+        // fails writes nothing.
+        let mut planned: Vec<(String, Vec<(&str, loro::LoroValue)>)> =
+            Vec::with_capacity(rows.len());
         for row in rows {
             let id = row
                 .iter()
@@ -64,23 +67,39 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 })
                 .map(|(_, v)| sql_value_to_string(v))
                 .unwrap_or_default();
-            if crdt.exists(collection, &id) {
+            if crdt.exists(collection, &id) || planned.iter().any(|(p, _)| *p == id) {
                 if if_absent {
                     continue;
                 }
-                return Err(LiteError::Query(format!(
-                    "duplicate key value violates unique constraint on '{collection}' (id = '{id}')"
-                )));
+                return Err(LiteError::UniqueViolation {
+                    collection: collection.to_string(),
+                    detail: format!("primary key (id)=({id}) already exists"),
+                });
             }
-            let fields: Vec<(&str, loro::LoroValue)> = row
+            let fields = row
                 .iter()
                 .map(|(k, v)| (k.as_str(), sql_value_to_loro(v)))
                 .collect();
-            crdt.upsert(collection, &id, &fields)
-                .map_err(|e| LiteError::Query(format!("insert: {e}")))?;
-            affected += 1;
-            written.push(id);
+            planned.push((id, fields));
         }
+        let checks: Vec<CrdtRowOp<'_>> = planned
+            .iter()
+            .map(|(id, fields)| {
+                (
+                    CrdtRowWrite::Upsert,
+                    collection,
+                    id.as_str(),
+                    fields.as_slice(),
+                )
+            })
+            .collect();
+        crdt.check_unique_writes(&checks)?;
+        let mut written: Vec<String> = Vec::with_capacity(planned.len());
+        for (id, fields) in &planned {
+            crdt.upsert(collection, id, fields)?;
+            written.push(id.clone());
+        }
+        let affected = written.len() as u64;
         drop(crdt);
         reindex_documents(self, collection, written.iter().map(String::as_str))?;
         Ok(QueryResult {
@@ -122,28 +141,39 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         let targets = document_targets(self, collection, filters, target_keys)?;
         // CRDT / schemaless path.
         let mut crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-        let mut affected = 0;
-        let mut written: Vec<String> = Vec::with_capacity(targets.len());
-        for key_str in targets {
-            // UPDATE changes existing rows only, and only the assigned fields.
-            if !crdt.exists(collection, &key_str) {
-                continue;
-            }
-            let fields: Vec<(&str, loro::LoroValue)> = assignments
-                .iter()
-                .filter_map(|(field, expr)| {
-                    if let nodedb_sql::types::SqlExpr::Literal(val) = expr {
-                        Some((field.as_str(), sql_value_to_loro(val)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            crdt.set_fields(collection, &key_str, &fields)
-                .map_err(|e| LiteError::Query(format!("update: {e}")))?;
-            affected += 1;
-            written.push(key_str);
+        // UPDATE changes existing rows only, and only the assigned fields.
+        let fields: Vec<(&str, loro::LoroValue)> = assignments
+            .iter()
+            .filter_map(|(field, expr)| {
+                if let nodedb_sql::types::SqlExpr::Literal(val) = expr {
+                    Some((field.as_str(), sql_value_to_loro(val)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let written: Vec<String> = targets
+            .into_iter()
+            .filter(|key| crdt.exists(collection, key))
+            .collect();
+        // Every row is checked before any is written, so a statement that
+        // fails writes nothing.
+        let checks: Vec<CrdtRowOp<'_>> = written
+            .iter()
+            .map(|id| {
+                (
+                    CrdtRowWrite::SetFields,
+                    collection,
+                    id.as_str(),
+                    fields.as_slice(),
+                )
+            })
+            .collect();
+        crdt.check_unique_writes(&checks)?;
+        for key_str in &written {
+            crdt.set_fields(collection, key_str, &fields)?;
         }
+        let affected = written.len() as u64;
         drop(crdt);
         reindex_documents(self, collection, written.iter().map(String::as_str))?;
         Ok(QueryResult {
@@ -177,8 +207,7 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             if !crdt.exists(collection, &key_str) {
                 continue;
             }
-            crdt.delete(collection, &key_str)
-                .map_err(|e| LiteError::Query(format!("delete: {e}")))?;
+            crdt.delete(collection, &key_str)?;
             affected += 1;
             removed.push(key_str);
         }
@@ -199,6 +228,13 @@ fn sql_value_to_loro(v: &SqlValue) -> loro::LoroValue {
         SqlValue::String(s) => loro::LoroValue::String(s.clone().into()),
         SqlValue::Bool(b) => loro::LoroValue::Bool(*b),
         SqlValue::Null => loro::LoroValue::Null,
+        SqlValue::Array(items) => loro::LoroValue::List(
+            items
+                .iter()
+                .map(sql_value_to_loro)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
         _ => loro::LoroValue::Null,
     }
 }

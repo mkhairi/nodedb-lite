@@ -119,8 +119,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .collect();
 
         if !batch_refs.is_empty() {
-            crdt.batch_upsert(&batch_refs)
-                .map_err(NodeDbError::storage)?;
+            crdt.batch_upsert(&batch_refs).map_err(NodeDbError::from)?;
         }
 
         // Deletes are applied individually but within the same lock hold;

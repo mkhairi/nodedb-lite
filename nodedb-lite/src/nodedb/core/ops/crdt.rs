@@ -147,7 +147,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .map(|(k, v)| (k.as_str(), value_to_loro(v)))
                 .collect();
             crdt.upsert(collection, document_id, &loro_fields)
-                .map_err(NodeDbError::storage)?
+                .map_err(NodeDbError::from)?
         };
         crdt.drop_pending(mutation_id);
 

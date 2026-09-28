@@ -126,7 +126,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .map(|(&(id, _), f)| (CrdtRowWrite::SetFields, collection, id, f.as_slice()))
                 .collect();
 
-            crdt.batch_write(&ops).map_err(NodeDbError::storage)?;
+            crdt.batch_write(&ops).map_err(NodeDbError::from)?;
         }
 
         self.update_memory_stats();

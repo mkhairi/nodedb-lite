@@ -73,7 +73,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // write rate — unbounded file growth on an otherwise idle store, and an
         // export duty cycle that starved readers once the document outgrew the
         // flush interval.
-        let (persisted, written_deltas) = {
+        let (persisted, written_deltas, index_flush) = {
             let crdt = self.crdt.lock_or_recover();
             let plan = crdt.plan_persistence().map_err(NodeDbError::storage)?;
             let mut persisted = Vec::with_capacity(plan.len());
@@ -163,6 +163,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 });
             }
 
+            // Index entries in the same batch and lock hold as the rows.
+            let index_flush = self.query_engine.indexes.stage_flush(&mut ops);
+
             // Write the last-flushed mutation_id for partial flush safety.
             ops.push(WriteOp::Put {
                 ns: Namespace::Meta,
@@ -170,7 +173,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 value: max_mid.to_le_bytes().to_vec(),
             });
 
-            (persisted, written_deltas)
+            (persisted, written_deltas, index_flush)
         };
 
         // ── Persist per-collection CSR indices ──
@@ -363,6 +366,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             crdt.mark_persisted(persisted);
             crdt.mark_pending_deltas_persisted(written_deltas);
         }
+        self.query_engine.indexes.mark_flushed(index_flush);
 
         // ── Write HNSW vector segments to pagedb (native PagedbStorage only) ──
         #[cfg(not(target_arch = "wasm32"))]

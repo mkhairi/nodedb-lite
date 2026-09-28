@@ -36,9 +36,7 @@ pub fn insert_columnar<S: StorageEngine>(
 ) -> Result<(QueryResult, Vec<Vec<nodedb_types::Value>>), LiteError> {
     let schema = columnar
         .schema(collection)
-        .ok_or_else(|| LiteError::BadRequest {
-            detail: format!("columnar collection '{collection}' does not exist"),
-        })?;
+        .ok_or_else(|| LiteError::collection_not_found("columnar", collection))?;
 
     let mut affected: u64 = 0;
     let mut written: Vec<Vec<nodedb_types::Value>> = Vec::with_capacity(rows.len());
@@ -71,9 +69,7 @@ fn columnar_schema<S: StorageEngine>(
     let schema = engine
         .columnar
         .schema(collection)
-        .ok_or_else(|| LiteError::BadRequest {
-            detail: format!("columnar collection '{collection}' does not exist"),
-        })?;
+        .ok_or_else(|| LiteError::collection_not_found("columnar", collection))?;
     let pk_idx = schema
         .columns
         .iter()

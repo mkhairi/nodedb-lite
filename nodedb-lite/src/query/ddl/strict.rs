@@ -37,7 +37,12 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         &self,
         name: &str,
     ) -> Result<QueryResult, LiteError> {
-        self.strict.drop_collection(name).await?;
+        // The rows and the indexes over them go in one storage batch.
+        let strict = &self.strict;
+        self.indexes
+            .drop_collection_with(&*self.storage, name, || strict.drop_ops(name))
+            .await?;
+        self.strict.forget_collection(name)?;
 
         Ok(QueryResult {
             columns: vec!["result".into()],

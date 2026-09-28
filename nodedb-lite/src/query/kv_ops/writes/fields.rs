@@ -65,12 +65,16 @@ pub async fn kv_field_set<S: StorageEngine>(
     )?;
     let encoded = encode_value(old_deadline, &new_user_bytes);
     engine
-        .storage
-        .put(Namespace::Kv, &rkey, &encoded)
-        .await
-        .map_err(|e| LiteError::Storage {
-            detail: e.to_string(),
-        })?;
+        .kv_local
+        .commit(
+            &*engine.storage,
+            vec![WriteOp::Put {
+                ns: Namespace::Kv,
+                key: rkey,
+                value: encoded,
+            }],
+        )
+        .await?;
 
     Ok(QueryResult {
         columns: vec![],
@@ -159,13 +163,7 @@ pub async fn kv_transfer<S: StorageEngine>(
             value: encode_value(dst_deadline, &dst_bytes),
         },
     ];
-    engine
-        .storage
-        .batch_write(&ops)
-        .await
-        .map_err(|e| LiteError::Storage {
-            detail: e.to_string(),
-        })?;
+    engine.kv_local.commit(&*engine.storage, ops).await?;
 
     Ok(QueryResult {
         columns: vec![],
@@ -222,13 +220,7 @@ pub async fn kv_transfer_item<S: StorageEngine>(
             value: encode_value(0, &item_bytes),
         },
     ];
-    engine
-        .storage
-        .batch_write(&ops)
-        .await
-        .map_err(|e| LiteError::Storage {
-            detail: e.to_string(),
-        })?;
+    engine.kv_local.commit(&*engine.storage, ops).await?;
 
     Ok(QueryResult {
         columns: vec![],

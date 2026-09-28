@@ -34,15 +34,10 @@ pub async fn insert_select<S: StorageEngine>(
     source_limit: usize,
 ) -> Result<QueryResult, LiteError> {
     let documents: Vec<(String, Vec<u8>)> = if is_strict(engine, source_collection) {
-        let schema =
-            engine
-                .strict
-                .schema(source_collection)
-                .ok_or_else(|| LiteError::BadRequest {
-                    detail: format!(
-                        "strict source collection '{source_collection}' does not exist"
-                    ),
-                })?;
+        let schema = engine
+            .strict
+            .schema(source_collection)
+            .ok_or_else(|| LiteError::collection_not_found("strict", source_collection))?;
         let pk_idx = schema
             .columns
             .iter()
@@ -127,9 +122,7 @@ pub async fn materialize_scan<S: StorageEngine>(
         let schema = engine
             .strict
             .schema(collection)
-            .ok_or_else(|| LiteError::BadRequest {
-                detail: format!("strict collection '{collection}' does not exist"),
-            })?;
+            .ok_or_else(|| LiteError::collection_not_found("strict", collection))?;
         let pk_idx = schema
             .columns
             .iter()
@@ -430,9 +423,7 @@ async fn collect_ids<S: StorageEngine>(
         let schema = engine
             .strict
             .schema(collection)
-            .ok_or_else(|| LiteError::BadRequest {
-                detail: format!("strict collection '{collection}' does not exist"),
-            })?;
+            .ok_or_else(|| LiteError::collection_not_found("strict", collection))?;
         let pk_idx = schema
             .columns
             .iter()
@@ -461,9 +452,7 @@ async fn fetch_document_value<S: StorageEngine>(
         let schema = engine
             .strict
             .schema(collection)
-            .ok_or_else(|| LiteError::BadRequest {
-                detail: format!("strict collection '{collection}' does not exist"),
-            })?;
+            .ok_or_else(|| LiteError::collection_not_found("strict", collection))?;
         let pk = Value::String(doc_id.to_string());
         match engine.strict.get(collection, &pk).await? {
             Some(row) => {

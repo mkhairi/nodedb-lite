@@ -112,10 +112,47 @@ impl<S: StorageEngine> NodeDbLite<S> {
     ) -> NodeDbResult<()> {
         self.kv_check_pressure()?;
         let _order = self.kv_local.write_order.lock().await;
+        if self.kv_local.is_indexed(collection) {
+            return self
+                .kv_put_indexed(collection, key, value, deadline_ms)
+                .await;
+        }
         self.kv_record_put(collection, key.as_bytes(), value, deadline_ms)
             .await?;
         self.kv_buffer_put(collection, key, value, deadline_ms)
             .await
+    }
+
+    /// Put into a collection with a key-value index: refused before it is
+    /// recorded for sync when a unique index forbids it, then committed
+    /// directly after the buffered writes ahead of it, with its entries.
+    /// Call with the write-order lock held.
+    async fn kv_put_indexed(
+        &self,
+        collection: &str,
+        key: &str,
+        value: &[u8],
+        deadline_ms: u64,
+    ) -> NodeDbResult<()> {
+        let rkey = kv_key(collection, key.as_bytes());
+        let op = WriteOp::Put {
+            ns: Namespace::Kv,
+            key: rkey.clone(),
+            value: encode_value(deadline_ms, value),
+        };
+        self.kv_local
+            .check(&*self.storage, std::slice::from_ref(&op))
+            .await
+            .map_err(NodeDbError::from)?;
+        self.kv_record_put(collection, key.as_bytes(), value, deadline_ms)
+            .await?;
+        self.kv_flush_inner().await?;
+        self.kv_local
+            .commit(&*self.storage, vec![op])
+            .await
+            .map_err(NodeDbError::from)?;
+        self.kv_local.cache.lock_or_recover().pop(&rkey);
+        Ok(())
     }
 
     /// Refuse a KV write while the memory governor is at Emergency pressure.

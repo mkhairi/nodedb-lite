@@ -109,6 +109,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .map_err(NodeDbError::from)?;
         }
 
+        // A batch may write bitemporal collections: hold off any index build
+        // reading history until every item's history version is written.
+        let _index_build = self.hold_bitemporal_build(true).await;
+
         // Pre-compute doc IDs and field vecs before taking the lock.
         let mut resolved: Vec<ResolvedBatchItem<'_>> = Vec::with_capacity(items.len());
 
@@ -136,6 +140,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
             resolved.push((doc_id, doc_fields, vec_fields));
         }
 
+        // A written document is live again, even one deleted in history.
+        for (item, (doc_id, _, _)) in items.iter().zip(&resolved) {
+            self.query_engine
+                .indexes
+                .revive(item.doc_collection, doc_id);
+        }
+
         // Build the ops slice for batch_write — one CRDT lock hold, one
         // exported delta per row. Documents replace their row; vector
         // metadata merges into its row.
@@ -160,7 +171,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 }
             }
 
-            crdt.batch_write(&ops).map_err(NodeDbError::storage)?;
+            crdt.batch_write(&ops).map_err(NodeDbError::from)?;
         }
 
         // Post-lock work: bitemporal history + FTS + HNSW (matches single-item ordering).

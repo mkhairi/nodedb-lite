@@ -29,9 +29,7 @@ pub(super) fn strict_schema<S: StorageEngine>(
     engine
         .strict
         .schema(collection)
-        .ok_or_else(|| LiteError::BadRequest {
-            detail: format!("strict collection '{collection}' does not exist"),
-        })
+        .ok_or_else(|| LiteError::collection_not_found("strict", collection))
 }
 
 /// Decode msgpack document bytes into `(field_name, Value)` pairs.

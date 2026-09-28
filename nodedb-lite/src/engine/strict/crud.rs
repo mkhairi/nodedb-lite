@@ -11,7 +11,7 @@ use crate::error::LiteError;
 use crate::runtime::now_millis_i64;
 use crate::storage::engine::{StorageEngine, WriteOp};
 
-use super::engine::{StrictEngine, strict_err_to_lite};
+use super::engine::{CollectionState, StrictEngine, strict_err_to_lite};
 use super::history::{history_key, history_value};
 
 impl<S: StorageEngine> StrictEngine<S> {
@@ -25,36 +25,57 @@ impl<S: StorageEngine> StrictEngine<S> {
     /// For bitemporal collections, also writes an initial history entry so that
     /// the row's birth time is recorded in `Namespace::StrictHistory`.
     pub async fn insert(&self, collection: &str, values: &[Value]) -> Result<(), LiteError> {
+        self.insert_rows(collection, std::slice::from_ref(&values.to_vec()))
+            .await
+    }
+
+    /// Insert rows as [`Self::insert`] does, all or none: a primary key that
+    /// exists or repeats within `rows`, or a unique index the rows would
+    /// break, refuses every row.
+    pub async fn insert_rows(
+        &self,
+        collection: &str,
+        rows: &[Vec<Value>],
+    ) -> Result<(), LiteError> {
         let state = self.get_state(collection)?;
-
-        // Encode the row.
-        let tuple = state.encoder.encode(values).map_err(strict_err_to_lite)?;
-
-        // Build storage key from PK values.
-        let key = state.storage_key(collection, values);
-
-        // Check for duplicate PK.
-        if self.storage.get(Namespace::Strict, &key).await?.is_some() {
-            return Err(LiteError::BadRequest {
-                detail: format!("duplicate primary key in collection '{collection}'"),
+        let mut ops = Vec::with_capacity(rows.len());
+        let mut keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for values in rows {
+            let tuple = state.encoder.encode(values).map_err(strict_err_to_lite)?;
+            let key = state.storage_key(collection, values);
+            if !keys.insert(key.clone())
+                || self.storage.get(Namespace::Strict, &key).await?.is_some()
+            {
+                return Err(LiteError::BadRequest {
+                    detail: format!("duplicate primary key in collection '{collection}'"),
+                });
+            }
+            ops.push(WriteOp::Put {
+                ns: Namespace::Strict,
+                key,
+                value: tuple,
             });
         }
+        self.commit(collection, ops.clone()).await?;
 
-        self.storage.put(Namespace::Strict, &key, &tuple).await?;
-
-        // For bitemporal collections, write the birth history entry.
+        // For bitemporal collections, write each row's birth history entry.
         // The current row's system_from_ms is stored at slot 0 of the tuple;
         // we read it back from `values[0]` (the `__system_from_ms` column).
         if state.schema.bitemporal {
-            let system_from_ms = extract_system_from_values(values);
-            // u64::MAX encodes "no system_to yet" (row is still current).
-            let hist_key = history_key(collection, system_from_ms, &key[collection.len() + 1..]);
-            let hist_value = history_value(&tuple, i64::MAX);
-            self.storage
-                .put(Namespace::StrictHistory, &hist_key, &hist_value)
-                .await?;
+            for (values, op) in rows.iter().zip(&ops) {
+                let WriteOp::Put { key, value, .. } = op else {
+                    continue;
+                };
+                let system_from_ms = extract_system_from_values(values);
+                // u64::MAX encodes "no system_to yet" (row is still current).
+                let hist_key =
+                    history_key(collection, system_from_ms, &key[collection.len() + 1..]);
+                let hist_value = history_value(value, i64::MAX);
+                self.storage
+                    .put(Namespace::StrictHistory, &hist_key, &hist_value)
+                    .await?;
+            }
         }
-
         Ok(())
     }
 
@@ -77,7 +98,7 @@ impl<S: StorageEngine> StrictEngine<S> {
             });
         }
 
-        self.storage.batch_write(&ops).await
+        self.commit(collection, ops).await
     }
 
     /// Update a row by PK. Reads the existing tuple, patches the specified
@@ -91,100 +112,103 @@ impl<S: StorageEngine> StrictEngine<S> {
         pk: &Value,
         updates: &HashMap<String, Value>,
     ) -> Result<bool, LiteError> {
+        let changed = self
+            .update_many(collection, &[(pk.clone(), updates.clone())])
+            .await?;
+        Ok(changed == 1)
+    }
+
+    /// Update rows by PK, each `(pk, updates)` as [`Self::update`] does, in
+    /// one storage batch: a unique index the statement would break refuses
+    /// every row. Rows that do not exist are skipped. Returns the number of
+    /// rows updated.
+    pub async fn update_many(
+        &self,
+        collection: &str,
+        changes: &[(Value, HashMap<String, Value>)],
+    ) -> Result<u64, LiteError> {
         let state = self.get_state(collection)?;
-        let key = state.storage_key_from_pk(collection, pk);
-
-        // Read existing tuple.
-        let existing = match self.storage.get(Namespace::Strict, &key).await? {
-            Some(bytes) => bytes,
-            None => return Ok(false),
-        };
-
-        // Extract all current values.
-        let mut values = state
-            .decoder
-            .extract_all(&existing)
-            .map_err(strict_err_to_lite)?;
-
-        // Apply updates.
-        for (col_name, new_value) in updates {
-            let col_idx =
-                state
-                    .schema
-                    .column_index(col_name)
-                    .ok_or_else(|| LiteError::BadRequest {
-                        detail: format!("unknown column '{col_name}' in collection '{collection}'"),
-                    })?;
-
-            // Validate the new value against the column type.
-            if !matches!(new_value, Value::Null)
-                && !state.schema.columns[col_idx].column_type.accepts(new_value)
-            {
-                return Err(LiteError::BadRequest {
-                    detail: format!(
-                        "column '{}': type mismatch",
-                        state.schema.columns[col_idx].name
-                    ),
+        let mut ops = Vec::new();
+        // (key suffix, old tuple) of each superseded version, and
+        // (final key, new tuple) of each new one, for bitemporal history.
+        let mut superseded: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut born: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut updated = 0u64;
+        for (pk, updates) in changes {
+            let key = state.storage_key_from_pk(collection, pk);
+            let Some(existing) = self.storage.get(Namespace::Strict, &key).await? else {
+                continue;
+            };
+            let mut values = decode_tuple(&state, &existing)?;
+            for (col_name, new_value) in updates {
+                let col_idx =
+                    state
+                        .schema
+                        .column_index(col_name)
+                        .ok_or_else(|| LiteError::BadRequest {
+                            detail: format!(
+                                "unknown column '{col_name}' in collection '{collection}'"
+                            ),
+                        })?;
+                // Validate the new value against the column type.
+                if !matches!(new_value, Value::Null)
+                    && !state.schema.columns[col_idx].column_type.accepts(new_value)
+                {
+                    return Err(LiteError::BadRequest {
+                        detail: format!(
+                            "column '{}': type mismatch",
+                            state.schema.columns[col_idx].name
+                        ),
+                    });
+                }
+                values[col_idx] = new_value.clone();
+            }
+            let new_tuple = state.encoder.encode(&values).map_err(strict_err_to_lite)?;
+            // An update that changes the PK moves the row to its new key.
+            let new_key = state.storage_key(collection, &values);
+            if state.schema.bitemporal {
+                superseded.push((key[collection.len() + 1..].to_vec(), existing));
+                born.push((new_key.clone(), new_tuple.clone()));
+            }
+            if new_key != key {
+                ops.push(WriteOp::Delete {
+                    ns: Namespace::Strict,
+                    key,
                 });
             }
-
-            values[col_idx] = new_value.clone();
+            ops.push(WriteOp::Put {
+                ns: Namespace::Strict,
+                key: new_key,
+                value: new_tuple,
+            });
+            updated += 1;
         }
 
-        // Re-encode and write.
-        let new_tuple = state.encoder.encode(&values).map_err(strict_err_to_lite)?;
-
-        // For bitemporal collections, record the old version's supersession before
-        // overwriting. The system_to of the old version is now().
-        if state.schema.bitemporal {
+        // For bitemporal collections, record each old version's supersession
+        // before overwriting. The system_to of the old version is now().
+        for (suffix, old_tuple) in &superseded {
             let system_to_ms = now_millis_i64();
-            self.record_history_supersession(
-                collection,
-                &key[collection.len() + 1..],
-                &existing,
-                system_to_ms,
-            )
-            .await?;
-        }
-
-        // If PK columns were updated, we need to delete the old key and insert the new one.
-        let new_key = state.storage_key(collection, &values);
-        if new_key != key {
-            self.storage
-                .batch_write(&[
-                    WriteOp::Delete {
-                        ns: Namespace::Strict,
-                        key,
-                    },
-                    WriteOp::Put {
-                        ns: Namespace::Strict,
-                        key: new_key,
-                        value: new_tuple.clone(),
-                    },
-                ])
-                .await?;
-        } else {
-            self.storage
-                .put(Namespace::Strict, &key, &new_tuple)
+            self.record_history_supersession(collection, suffix, old_tuple, system_to_ms)
                 .await?;
         }
 
-        // For bitemporal collections, write the new version's birth history entry.
-        if state.schema.bitemporal {
+        self.commit(collection, ops).await?;
+
+        // For bitemporal collections, write each new version's birth entry.
+        for (final_key, new_tuple) in &born {
             let new_system_from_ms = now_millis_i64();
-            let final_key = state.storage_key(collection, &values);
             let hist_key = history_key(
                 collection,
                 new_system_from_ms,
                 &final_key[collection.len() + 1..],
             );
-            let hist_value = history_value(&new_tuple, i64::MAX);
+            let hist_value = history_value(new_tuple, i64::MAX);
             self.storage
                 .put(Namespace::StrictHistory, &hist_key, &hist_value)
                 .await?;
         }
 
-        Ok(true)
+        Ok(updated)
     }
 
     /// Update a row by replacing with complete new values (for CRDT adapter).
@@ -205,9 +229,15 @@ impl<S: StorageEngine> StrictEngine<S> {
             .encoder
             .encode(new_values)
             .map_err(strict_err_to_lite)?;
-        self.storage
-            .put(Namespace::Strict, &key, &new_tuple)
-            .await?;
+        self.commit(
+            collection,
+            vec![WriteOp::Put {
+                ns: Namespace::Strict,
+                key,
+                value: new_tuple,
+            }],
+        )
+        .await?;
         Ok(true)
     }
 
@@ -234,7 +264,14 @@ impl<S: StorageEngine> StrictEngine<S> {
                     )
                     .await?;
                 }
-                self.storage.delete(Namespace::Strict, &key).await?;
+                self.commit(
+                    collection,
+                    vec![WriteOp::Delete {
+                        ns: Namespace::Strict,
+                        key,
+                    }],
+                )
+                .await?;
             }
         }
         Ok(true)
@@ -248,44 +285,7 @@ impl<S: StorageEngine> StrictEngine<S> {
         let key = state.storage_key_from_pk(collection, pk);
 
         match self.storage.get(Namespace::Strict, &key).await? {
-            Some(bytes) => {
-                // Check tuple schema version for multi-version reads.
-                let tuple_version = state
-                    .decoder
-                    .schema_version(&bytes)
-                    .map_err(strict_err_to_lite)?;
-                let current_version = state.schema.version;
-
-                if tuple_version < current_version {
-                    // Old tuple — it was encoded with fewer columns. Build a
-                    // temporary decoder from the old schema to read it, then
-                    // pad with Null for columns added after that version.
-                    let old_col_count = state
-                        .version_column_counts
-                        .get(&(tuple_version as u16))
-                        .copied()
-                        .unwrap_or(state.schema.columns.len());
-
-                    let old_schema = nodedb_types::columnar::StrictSchema {
-                        columns: state.schema.columns[..old_col_count].to_vec(),
-                        version: tuple_version,
-                        dropped_columns: Vec::new(),
-                        bitemporal: state.schema.bitemporal,
-                    };
-                    let old_decoder = nodedb_strict::TupleDecoder::new(&old_schema);
-                    let mut values = old_decoder
-                        .extract_all(&bytes)
-                        .map_err(strict_err_to_lite)?;
-                    values.resize(state.schema.columns.len(), Value::Null);
-                    Ok(Some(values))
-                } else {
-                    let values = state
-                        .decoder
-                        .extract_all(&bytes)
-                        .map_err(strict_err_to_lite)?;
-                    Ok(Some(values))
-                }
-            }
+            Some(bytes) => decode_tuple(&state, &bytes).map(Some),
             None => Ok(None),
         }
     }
@@ -400,4 +400,32 @@ fn extract_system_from_values(values: &[Value]) -> i64 {
         Some(Value::Integer(ms)) => *ms,
         _ => 0,
     }
+}
+
+/// Decode a stored tuple to values in current schema order. A tuple written
+/// under an older schema version is read with that version's columns and
+/// padded with NULL for the columns added since.
+pub(super) fn decode_tuple(state: &CollectionState, bytes: &[u8]) -> Result<Vec<Value>, LiteError> {
+    let tuple_version = state
+        .decoder
+        .schema_version(bytes)
+        .map_err(strict_err_to_lite)?;
+    if tuple_version >= state.schema.version {
+        return state.decoder.extract_all(bytes).map_err(strict_err_to_lite);
+    }
+    let old_col_count = state
+        .version_column_counts
+        .get(&(tuple_version as u16))
+        .copied()
+        .unwrap_or(state.schema.columns.len());
+    let old_schema = nodedb_types::columnar::StrictSchema {
+        columns: state.schema.columns[..old_col_count].to_vec(),
+        version: tuple_version,
+        dropped_columns: Vec::new(),
+        bitemporal: state.schema.bitemporal,
+    };
+    let old_decoder = nodedb_strict::TupleDecoder::new(&old_schema);
+    let mut values = old_decoder.extract_all(bytes).map_err(strict_err_to_lite)?;
+    values.resize(state.schema.columns.len(), Value::Null);
+    Ok(values)
 }

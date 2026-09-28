@@ -14,7 +14,7 @@ use nodedb_types::value::Value;
 
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
-use crate::storage::engine::StorageEngine;
+use crate::storage::engine::{StorageEngine, WriteOp};
 
 use super::super::reads::{decode_value, encode_value, is_expired, kv_key};
 
@@ -52,12 +52,16 @@ async fn write_body<S: StorageEngine>(
     body: &[u8],
 ) -> Result<(), LiteError> {
     engine
-        .storage
-        .put(Namespace::Kv, rkey, &encode_value(deadline, body))
+        .kv_local
+        .commit(
+            &*engine.storage,
+            vec![WriteOp::Put {
+                ns: Namespace::Kv,
+                key: rkey.to_vec(),
+                value: encode_value(deadline, body),
+            }],
+        )
         .await
-        .map_err(|e| LiteError::Storage {
-            detail: e.to_string(),
-        })
 }
 
 /// The `LiteError` for an atomic that computed no value. The variants carry

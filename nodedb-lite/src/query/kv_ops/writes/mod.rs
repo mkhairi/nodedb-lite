@@ -2,14 +2,17 @@
 //! Write operations for the KV engine physical visitor.
 
 mod basic;
+mod bulk;
 mod fields;
 mod numeric;
 mod row_merge;
+#[cfg(test)]
+mod tests;
+mod ttl;
 
-pub use basic::{
-    kv_batch_put, kv_delete, kv_expire, kv_insert, kv_insert_if_absent,
-    kv_insert_on_conflict_update, kv_persist, kv_put, kv_truncate,
-};
+pub use basic::{kv_insert, kv_insert_if_absent, kv_insert_on_conflict_update, kv_put};
+pub use bulk::{kv_batch_put, kv_delete, kv_truncate};
 pub use fields::{kv_field_set, kv_transfer, kv_transfer_item};
 pub(crate) use numeric::atomic_error;
 pub use numeric::{kv_cas, kv_get_set, kv_incr, kv_incr_float};
+pub use ttl::{kv_expire, kv_persist};

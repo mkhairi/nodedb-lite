@@ -54,9 +54,7 @@ pub async fn scan<S: StorageEngine>(
     let schema = engine
         .columnar
         .schema(collection)
-        .ok_or(LiteError::BadRequest {
-            detail: format!("columnar collection '{collection}' does not exist"),
-        })?;
+        .ok_or_else(|| LiteError::collection_not_found("columnar", collection))?;
 
     let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
@@ -233,9 +231,7 @@ pub async fn materialize_scan<S: StorageEngine>(
     let schema = engine
         .columnar
         .schema(collection)
-        .ok_or(LiteError::BadRequest {
-            detail: format!("columnar collection '{collection}' does not exist"),
-        })?;
+        .ok_or_else(|| LiteError::collection_not_found("columnar", collection))?;
 
     let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
     let _is_bitemporal = engine.columnar.is_bitemporal(collection);

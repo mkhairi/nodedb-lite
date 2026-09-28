@@ -127,17 +127,6 @@ fn encode_result_msgpack(result: &QueryResult) -> Result<Vec<u8>, LiteError> {
     })
 }
 
-/// Convert `SqlValue` to its string representation for index lookups.
-fn sql_value_to_index_str(v: &SqlValue) -> String {
-    match v {
-        SqlValue::String(s) => s.clone(),
-        SqlValue::Int(i) => i.to_string(),
-        SqlValue::Float(f) => f.to_string(),
-        SqlValue::Bool(b) => b.to_string(),
-        _ => String::new(),
-    }
-}
-
 // ── Aggregate ────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -258,43 +247,30 @@ pub(super) fn lower_document_index_lookup<'a, S: StorageEngine + 'a>(
     offset: usize,
     distinct: bool,
     window_functions: &[WindowSpec],
-    case_insensitive: bool,
+    _case_insensitive: bool,
     _temporal: &TemporalScope,
 ) -> Result<LiteFut<'a>, LiteError> {
-    // Lite holds a bare collection name; DatabaseId::DEFAULT keeps it unqualified.
-    let col = nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, collection);
-    let path = field.to_string();
-    let mut val_str = sql_value_to_index_str(value);
-    if case_insensitive {
-        val_str = val_str.to_lowercase();
-    }
-
-    // Encode remaining filters.
-    let filter_bytes = encode_filters(filters)?;
-
+    let collection = collection.to_string();
+    let field = field.to_string();
+    // The planner already lowercased the value for a case-insensitive index.
+    let probe = sql_value_to_value(value)?;
     let filters = filters.to_vec();
     let sort_keys = sort_keys.to_vec();
     let window_functions = window_functions.to_vec();
     let projection = projection.to_vec();
 
     // The fetch returns every indexed match in full: residual filters,
-    // ORDER BY, projection, OFFSET and LIMIT all run in post-processing,
-    // so the op carries no window of its own.
-    let op = DocumentOp::IndexedFetch {
-        collection: col,
-        path,
-        value: val_str,
-        filters: filter_bytes,
-        projection: Vec::new(),
-        limit: usize::MAX,
-        offset: 0,
-    };
-
-    let mut phys = LiteDataPlaneVisitor { engine };
-    let fut = phys.document(&op)?;
-
+    // ORDER BY, projection, OFFSET and LIMIT all run in post-processing.
     Ok(Box::pin(async move {
-        let raw = fut.await?;
+        let raw = crate::query::document_ops::index_reads::indexed_fetch(
+            engine,
+            &collection,
+            &field,
+            &probe,
+            usize::MAX,
+            0,
+        )
+        .await?;
         apply_scan_post_processing(
             raw,
             ScanPostArgs {

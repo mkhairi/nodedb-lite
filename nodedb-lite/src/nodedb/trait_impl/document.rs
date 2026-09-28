@@ -81,6 +81,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
             doc.id.clone()
         };
 
+        let bitemporal = is_bitemporal(&*self.storage, collection)
+            .await
+            .map_err(NodeDbError::storage)?;
+        let _index_build = self.hold_bitemporal_build(bitemporal).await;
+        self.query_engine.indexes.revive(collection, &doc_id);
+
         // Always write to the CRDT store (current-state + sync).
         {
             let mut crdt = self.crdt.lock_or_recover();
@@ -91,7 +97,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .collect();
             let mutation_id = crdt
                 .upsert(collection, &doc_id, &fields)
-                .map_err(NodeDbError::storage)?;
+                .map_err(NodeDbError::from)?;
             // Keep local-only documents out of the outbound CRDT delta stream.
             if !self.should_sync_doc(collection, &doc.fields) {
                 crdt.drop_pending(mutation_id);
@@ -99,10 +105,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         // For bitemporal collections, also record the versioned history entry.
-        if is_bitemporal(&*self.storage, collection)
-            .await
-            .map_err(NodeDbError::storage)?
-        {
+        if bitemporal {
             let now_ms = monotonic_millis_i64();
             let body = document_to_msgpack(&doc);
             versioned_put(
@@ -172,6 +175,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         let sync_doc = self.should_sync_doc(doc_collection, &doc.fields);
 
+        let bitemporal = is_bitemporal(&*self.storage, doc_collection)
+            .await
+            .map_err(NodeDbError::storage)?;
+        let _index_build = self.hold_bitemporal_build(bitemporal).await;
+        self.query_engine.indexes.revive(doc_collection, &doc_id);
+
         // One CRDT lock — one batch_write — one delta per row.
         {
             let mut crdt = self.crdt.lock_or_recover();
@@ -190,7 +199,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                     vec_fields.as_slice(),
                 ));
             }
-            let mutation_ids = crdt.batch_write(&ops).map_err(NodeDbError::storage)?;
+            let mutation_ids = crdt.batch_write(&ops).map_err(NodeDbError::from)?;
             // Keep local-only documents out of the outbound CRDT delta stream.
             if !sync_doc {
                 for mutation_id in mutation_ids {
@@ -200,10 +209,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         // For bitemporal collections, record versioned history (outside the CRDT lock).
-        if is_bitemporal(&*self.storage, doc_collection)
-            .await
-            .map_err(NodeDbError::storage)?
-        {
+        if bitemporal {
             let now_ms = monotonic_millis_i64();
             let body = document_to_msgpack(&doc);
             versioned_put(
@@ -297,6 +303,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .await
             .map_err(NodeDbError::storage)?
         {
+            let _index_build = self.hold_bitemporal_build(true).await;
             let now_ms = monotonic_millis_i64();
             // Monotonic system-time key; wall-clock valid_from so the deletion is
             // visible to "valid as-of now" queries immediately (see versioned_put).
@@ -309,6 +316,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
             )
             .await
             .map_err(NodeDbError::storage)?;
+            // The CRDT copy stays for sync, so the secondary indexes drop the
+            // row here rather than following the CRDT store.
+            self.query_engine.indexes.tombstone(collection, [id]);
             // FTS removal still applies — the document is logically gone now.
             self.remove_document_text(collection, id)?;
             self.remove_document_sparse(collection, id);
@@ -386,6 +396,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
         } else {
             doc.id.clone()
         };
+        let _index_build = self.hold_bitemporal_build(true).await;
+        self.query_engine.indexes.revive(collection, &doc_id);
 
         // Write to CRDT store for current-state access + sync.
         {
@@ -396,7 +408,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .map(|(k, v)| (k.as_str(), value_to_loro(v)))
                 .collect();
             crdt.upsert(collection, &doc_id, &fields)
-                .map_err(NodeDbError::storage)?;
+                .map_err(NodeDbError::from)?;
         }
 
         let now_ms = monotonic_millis_i64();
@@ -421,6 +433,22 @@ impl<S: StorageEngine> NodeDbLite<S> {
         self.index_document_sparse(collection, &doc_id, &doc.fields);
 
         Ok(())
+    }
+}
+
+impl<S: StorageEngine> NodeDbLite<S> {
+    /// For a bitemporal write, hold off any index build reading the
+    /// collection's history until the write — CRDT row and history version —
+    /// is complete. `None` for any other write.
+    pub(super) async fn hold_bitemporal_build(
+        &self,
+        bitemporal: bool,
+    ) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+        if bitemporal {
+            Some(self.query_engine.indexes.bitemporal_build.read().await)
+        } else {
+            None
+        }
     }
 }
 

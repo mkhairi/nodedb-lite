@@ -40,6 +40,7 @@ pub mod engine;
 pub mod error;
 pub mod event;
 pub mod identity;
+pub mod index;
 pub mod nodedb;
 pub mod query;
 pub mod runtime;

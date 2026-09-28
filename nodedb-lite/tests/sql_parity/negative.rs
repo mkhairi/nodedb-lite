@@ -182,6 +182,10 @@ async fn alter_strict_collection_is_rejected() {
 #[tokio::test]
 async fn drop_index_succeeds() {
     let db = open_lite().await;
+    seed_collection(&db, "users", "u1").await;
+    db.execute_sql("CREATE INDEX idx_name ON users (name)", &[])
+        .await
+        .expect("CREATE INDEX must succeed");
     db.execute_sql("DROP INDEX idx_name ON users", &[])
         .await
         .expect("DROP INDEX must succeed");

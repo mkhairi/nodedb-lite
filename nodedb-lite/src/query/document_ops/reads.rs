@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 
-use nodedb_types::Namespace;
 use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
@@ -107,9 +106,7 @@ pub async fn range_scan<S: StorageEngine>(
         let schema = engine
             .strict
             .schema(collection)
-            .ok_or_else(|| LiteError::BadRequest {
-                detail: format!("strict collection '{collection}' does not exist"),
-            })?;
+            .ok_or_else(|| LiteError::collection_not_found("strict", collection))?;
         let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let pk_idx = schema
             .columns
@@ -177,83 +174,6 @@ pub async fn range_scan<S: StorageEngine>(
     }
 }
 
-/// IndexedFetch: fetch docs via secondary index, apply residual filters, and project.
-pub async fn indexed_fetch<S: StorageEngine>(
-    engine: &LiteQueryEngine<S>,
-    collection: &str,
-    path: &str,
-    value: &str,
-    limit: usize,
-    offset: usize,
-) -> Result<QueryResult, LiteError> {
-    let doc_ids = index_lookup_ids(engine, collection, path, value).await?;
-    if is_strict(engine, collection) {
-        let columns = strict_columns(engine, collection);
-        let mut rows = Vec::new();
-        let mut skipped = 0usize;
-        for id in &doc_ids {
-            let pk = Value::String(id.clone());
-            if let Some(values) = engine.strict.get(collection, &pk).await? {
-                if skipped < offset {
-                    skipped += 1;
-                    continue;
-                }
-                rows.push(values);
-                if rows.len() >= limit {
-                    break;
-                }
-            }
-        }
-        Ok(QueryResult {
-            columns,
-            rows,
-            rows_affected: 0,
-            command: None,
-        })
-    } else {
-        let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-        let mut rows = Vec::new();
-        let mut skipped = 0usize;
-        for id in &doc_ids {
-            if let Some(val) = crdt.read(collection, id) {
-                if skipped < offset {
-                    skipped += 1;
-                    continue;
-                }
-                let bytes = crdt_value_to_msgpack(&val)?;
-                rows.push(vec![Value::String(id.clone()), Value::Bytes(bytes)]);
-                if rows.len() >= limit {
-                    break;
-                }
-            }
-        }
-        drop(crdt);
-        Ok(QueryResult {
-            columns: vec!["id".into(), "data".into()],
-            rows,
-            rows_affected: 0,
-            command: None,
-        })
-    }
-}
-
-/// IndexLookup: return doc IDs for all documents matching field=value.
-pub async fn index_lookup<S: StorageEngine>(
-    engine: &LiteQueryEngine<S>,
-    collection: &str,
-    path: &str,
-    value: &str,
-) -> Result<QueryResult, LiteError> {
-    let ids = index_lookup_ids(engine, collection, path, value).await?;
-    let rows: Vec<Vec<Value>> = ids.into_iter().map(|id| vec![Value::String(id)]).collect();
-    Ok(QueryResult {
-        columns: vec!["document_id".into()],
-        rows,
-        rows_affected: 0,
-        command: None,
-    })
-}
-
 /// EstimateCount: exact document count for the collection.
 pub async fn estimate_count<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
@@ -281,71 +201,6 @@ fn strict_columns<S: StorageEngine>(engine: &LiteQueryEngine<S>, collection: &st
         .schema(collection)
         .map(|s| s.columns.iter().map(|c| c.name.clone()).collect())
         .unwrap_or_default()
-}
-
-/// Sparse-index lookup: return all doc IDs where `path == value`.
-pub(super) async fn index_lookup_ids<S: StorageEngine>(
-    engine: &LiteQueryEngine<S>,
-    collection: &str,
-    path: &str,
-    value: &str,
-) -> Result<Vec<String>, LiteError> {
-    let index_key = format!("{collection}:{path}:{value}");
-    let stored = engine
-        .storage
-        .get(Namespace::Meta, index_key.as_bytes())
-        .await
-        .map_err(|e| LiteError::Storage {
-            detail: e.to_string(),
-        })?;
-    match stored {
-        Some(bytes) => {
-            let ids: Vec<String> =
-                zerompk::from_msgpack(&bytes).map_err(|e| LiteError::Serialization {
-                    detail: format!("decode index entry: {e}"),
-                })?;
-            Ok(ids)
-        }
-        None => Ok(Vec::new()),
-    }
-}
-
-/// Write a doc-ID into the sparse index for `(collection, path, value)`.
-pub(super) async fn index_insert_id<S: StorageEngine>(
-    engine: &LiteQueryEngine<S>,
-    collection: &str,
-    path: &str,
-    value: &str,
-    doc_id: &str,
-) -> Result<(), LiteError> {
-    let index_key = format!("{collection}:{path}:{value}");
-    let mut ids: Vec<String> = if let Some(bytes) = engine
-        .storage
-        .get(Namespace::Meta, index_key.as_bytes())
-        .await
-        .map_err(|e| LiteError::Storage {
-            detail: e.to_string(),
-        })? {
-        zerompk::from_msgpack(&bytes).map_err(|e| LiteError::Serialization {
-            detail: format!("decode index entry: {e}"),
-        })?
-    } else {
-        Vec::new()
-    };
-    if !ids.contains(&doc_id.to_string()) {
-        ids.push(doc_id.to_string());
-        let bytes = zerompk::to_msgpack_vec(&ids).map_err(|e| LiteError::Serialization {
-            detail: format!("encode index entry: {e}"),
-        })?;
-        engine
-            .storage
-            .put(Namespace::Meta, index_key.as_bytes(), &bytes)
-            .await
-            .map_err(|e| LiteError::Storage {
-                detail: e.to_string(),
-            })?;
-    }
-    Ok(())
 }
 
 fn crdt_value_to_msgpack(val: &loro::LoroValue) -> Result<Vec<u8>, LiteError> {
