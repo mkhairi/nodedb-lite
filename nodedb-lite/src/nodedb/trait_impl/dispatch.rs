@@ -164,6 +164,31 @@ impl<S: StorageEngine> NodeDb for NodeDbLite<S> {
             .await
     }
 
+    /// Overrides the trait's default (which loops `graph_insert_edge`) with
+    /// the batched CSR-lock-once, single-CRDT-write path. `edge_type` and
+    /// `properties` are not part of this trait signature, so every edge is
+    /// inserted with no properties, matching what looping `graph_insert_edge`
+    /// with `properties: None` would have written.
+    async fn batch_graph_insert_edges(
+        &self,
+        collection: &str,
+        edges: &[(&str, &str, &str)],
+    ) -> NodeDbResult<()> {
+        let owned: Vec<(NodeId, NodeId, &str, Option<Document>)> = edges
+            .iter()
+            .map(|&(src, dst, label)| {
+                (
+                    NodeId::from_validated(src.to_string()),
+                    NodeId::from_validated(dst.to_string()),
+                    label,
+                    None,
+                )
+            })
+            .collect();
+        self.batch_graph_insert_edges(collection, &owned).await?;
+        Ok(())
+    }
+
     // ─── CRDT List Operations (Movable List) ───────────────────────────
 
     async fn list_insert(

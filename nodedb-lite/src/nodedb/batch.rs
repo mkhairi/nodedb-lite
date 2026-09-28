@@ -1,11 +1,20 @@
 //! Batch operations and memory eviction for NodeDbLite.
 
 use nodedb_types::Namespace;
+use nodedb_types::document::Document;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
+use nodedb_types::id::{EdgeId, NodeId};
 
+use crate::engine::crdt::engine::CrdtBatchOp;
+use crate::engine::graph::edge::{
+    edge_crdt_collection, edge_crdt_fields, edge_history_value, edge_id_for,
+};
+use crate::engine::graph::history;
+use crate::engine::graph::index::CsrIndex;
 use crate::engine::vector::nodes::{bind_node, encode_sidecar};
 use crate::engine::vector::resident::{check_insert_widths, lock_resident_or_create};
 use crate::engine::vector::row::EMBEDDING_DIM_FIELD;
+use crate::runtime::now_millis_i64;
 
 use super::{LockExt, NodeDbLite};
 use crate::storage::engine::StorageEngine;
@@ -126,55 +135,95 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
     /// Batch insert graph edges into a named collection — O(1) CRDT delta
     /// export instead of O(N). Edges are isolated to `collection`.
-    pub fn batch_graph_insert_edges(
+    ///
+    /// Mirrors `graph_insert_edge`'s argument order (`from, to, edge_type,
+    /// properties`) and shares its edge-preparation logic (`EdgeId`
+    /// allocation, CRDT field list): a batch of one edge stores the same
+    /// `EdgeId` key and the same fields a single `graph_insert_edge` call
+    /// would, so `graph_delete_edge` can remove either durably and rebuild
+    /// never resurrects a deleted batch-inserted edge.
+    ///
+    /// Bitemporal history is recorded per edge when `collection` is
+    /// bitemporal, and memory stats are updated once at the end. Returns
+    /// the allocated `EdgeId` for each input edge, in order.
+    pub async fn batch_graph_insert_edges(
         &self,
         collection: &str,
-        edges: &[(&str, &str, &str)],
-    ) -> NodeDbResult<()> {
+        edges: &[(NodeId, NodeId, &str, Option<Document>)],
+    ) -> NodeDbResult<Vec<EdgeId>> {
         if edges.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+
+        if self.governor.worst_engine_pressure() == nodedb_mem::PressureLevel::Emergency {
+            return Err(NodeDbError::storage(
+                crate::error::LiteError::Backpressure {
+                    detail:
+                        "batch graph edge insert rejected: memory governor is at Emergency pressure"
+                            .into(),
+                },
+            ));
+        }
+
+        // Allocate every EdgeId (and validate every label) before mutating
+        // anything: a bad label refuses the whole batch, not just its tail.
+        let edge_ids: Vec<EdgeId> = edges
+            .iter()
+            .map(|(from, to, edge_type, _)| edge_id_for(from, to, edge_type))
+            .collect::<NodeDbResult<Vec<_>>>()?;
 
         {
             let memory = self.memory_for(nodedb_mem::EngineId::Graph);
             let mut csr_map = self.csr.lock_or_recover();
             let csr = csr_map
                 .entry(collection.to_string())
-                .or_insert_with(|| crate::engine::graph::index::CsrIndex::new(memory));
-            for &(src, dst, label) in edges {
-                let _ = csr.add_edge(src, label, dst);
+                .or_insert_with(|| CsrIndex::new(memory));
+            for (from, to, edge_type, _) in edges {
+                let _ = csr.add_edge(from.as_str(), edge_type, to.as_str());
             }
         }
 
+        let edge_coll = edge_crdt_collection(collection);
+        let edge_keys: Vec<String> = edge_ids.iter().map(|id| format!("{id}")).collect();
+        let field_lists: Vec<Vec<(&str, loro::LoroValue)>> = edges
+            .iter()
+            .map(|(from, to, edge_type, properties)| {
+                edge_crdt_fields(from, to, edge_type, properties)
+            })
+            .collect();
+
         {
             let mut crdt = self.crdt.lock_or_recover();
-
-            use crate::engine::crdt::engine::{CrdtBatchOp, CrdtField};
-            let edge_coll = format!("__edges__{collection}");
-
-            let ops: Vec<(String, Vec<CrdtField<'_>>)> = edges
+            let ops: Vec<CrdtBatchOp<'_>> = edge_keys
                 .iter()
-                .map(|&(src, dst, label)| {
-                    let edge_id = format!("{src}--{label}-->{dst}");
-                    let fields: Vec<CrdtField<'_>> = vec![
-                        ("src", loro::LoroValue::String(src.into())),
-                        ("dst", loro::LoroValue::String(dst.into())),
-                        ("label", loro::LoroValue::String(label.into())),
-                    ];
-                    (edge_id, fields)
-                })
+                .zip(field_lists.iter())
+                .map(|(key, fields)| (edge_coll.as_str(), key.as_str(), fields.as_slice()))
                 .collect();
+            crdt.batch_upsert(&ops).map_err(NodeDbError::storage)?;
+        }
 
-            let refs: Vec<CrdtBatchOp<'_>> = ops
-                .iter()
-                .map(|(id, fields)| (edge_coll.as_str(), id.as_str(), fields.as_slice()))
-                .collect();
-
-            crdt.batch_upsert(&refs).map_err(NodeDbError::storage)?;
+        // Record each edge's birth in the bitemporal history table if the
+        // collection has bitemporal tracking enabled.
+        let bitemporal = history::is_bitemporal(self.storage.as_ref(), collection)
+            .await
+            .unwrap_or(false);
+        if bitemporal {
+            let system_from_ms = now_millis_i64();
+            for (i, (from, to, edge_type, properties)) in edges.iter().enumerate() {
+                let props_value = edge_history_value(from, to, edge_type, properties);
+                let _ = history::record_edge_insert(
+                    self.storage.as_ref(),
+                    collection,
+                    &edge_keys[i],
+                    &props_value,
+                    system_from_ms,
+                )
+                .await;
+            }
         }
 
         self.update_memory_stats();
-        Ok(())
+        Ok(edge_ids)
     }
 
     /// Compact all per-collection CSR graph indices (merge buffer into dense arrays).

@@ -334,6 +334,14 @@ impl<S: StorageEngine> NodeDbLite<S> {
             }
         }
 
+        // Rewrite any edges left over from the legacy pre-EdgeId batch-insert
+        // key format to the EdgeId-keyed form, once. Guarded by a Meta
+        // marker; a no-op scan after the first successful run. Failing this
+        // fails the open, the same way the other restore steps above do.
+        db.migrate_legacy_edge_keys()
+            .await
+            .map_err(NodeDbError::storage)?;
+
         // Rebuild CSR graph indices when no checkpoint was written before the
         // previous process exited. Pass 1 reads CRDT edge documents; Pass 2
         // scans the durable Namespace::Graph KV edge store; Pass 3 reads

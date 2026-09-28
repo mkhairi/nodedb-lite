@@ -1,6 +1,7 @@
 // Re-export shared graph engine from nodedb-graph crate.
 // The core CSR implementation lives in the shared crate.
 // Lite-specific persistence (checkpoint via KV store) is handled in nodedb/core.rs.
+pub(crate) mod edge;
 pub mod history;
 
 pub use nodedb_graph::csr as index;

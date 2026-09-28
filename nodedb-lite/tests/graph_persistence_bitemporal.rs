@@ -155,6 +155,62 @@ async fn graph_excludes_tombstoned_edges_after_reopen() {
     }
 }
 
+/// Edges written via `batch_graph_insert_edges` on a bitemporal collection
+/// must record bitemporal history exactly as `graph_insert_edge` does.
+///
+/// Simulates a process exit without `flush()`, as
+/// `graph_pagerank_finds_edges_after_reopen_without_explicit_flush` does for
+/// the single-edge path. The CSR checkpoint and CRDT snapshot may be
+/// missing, so rebuild can only find the batch-inserted edges via
+/// `Namespace::GraphHistory` — that succeeds only if the batch path wrote
+/// history rows.
+#[tokio::test]
+async fn batch_inserted_edges_on_bitemporal_collection_record_history() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    let a = NodeId::from_validated("A".to_string());
+    let b = NodeId::from_validated("B".to_string());
+    let c = NodeId::from_validated("C".to_string());
+
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .unwrap();
+        nodedb_lite::engine::graph::history::set_bitemporal(&storage, "social", true)
+            .await
+            .unwrap();
+
+        let db = NodeDbLite::open(storage).await.unwrap();
+        db.batch_graph_insert_edges(
+            "social",
+            &[
+                (a.clone(), b.clone(), "E", None),
+                (b.clone(), c.clone(), "E", None),
+                (c.clone(), a.clone(), "E", None),
+            ],
+        )
+        .await
+        .unwrap();
+        // Intentionally NO .flush() call here — db drops on scope exit.
+    }
+
+    let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+        .await
+        .unwrap();
+    let db = NodeDbLite::open(storage).await.unwrap();
+
+    let ranks = db.graph_pagerank("social", None, None, None).await.unwrap();
+
+    assert_eq!(
+        ranks.len(),
+        3,
+        "batch-inserted edges on a bitemporal collection must record history so \
+         rebuild-without-flush restores all three edges; expected 3 ranked nodes, got {}",
+        ranks.len()
+    );
+}
+
 /// Non-bitemporal graph collections must continue to restore from CRDT after
 /// reopen.
 ///

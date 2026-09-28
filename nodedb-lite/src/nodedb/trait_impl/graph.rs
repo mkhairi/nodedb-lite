@@ -4,8 +4,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use loro::LoroValue;
-
 use nodedb_types::document::Document;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 use nodedb_types::filter::EdgeFilter;
@@ -16,20 +14,18 @@ use nodedb_types::value::Value;
 
 use nodedb_graph::params::{AlgoParams, GraphAlgorithm};
 
+use crate::engine::graph::edge::{
+    edge_crdt_collection, edge_crdt_fields, edge_history_value, edge_id_for,
+};
 use crate::engine::graph::history;
 use crate::engine::graph::index::{CsrIndex, Direction};
 use crate::engine::graph::traversal::DEFAULT_MAX_VISITED;
 use crate::nodedb::LockExt;
 use crate::nodedb::NodeDbLite;
-use crate::nodedb::convert::{loro_value_to_document, value_to_loro};
+use crate::nodedb::convert::loro_value_to_document;
 use crate::query::graph_ops::algorithms;
 use crate::runtime::now_millis_i64;
 use crate::storage::engine::StorageEngine;
-
-/// Returns the CRDT collection name for edges belonging to a graph collection.
-fn edge_crdt_collection(collection: &str) -> String {
-    format!("__edges__{collection}")
-}
 
 impl<S: StorageEngine> NodeDbLite<S> {
     /// Breadth-first traversal from `start` up to `depth` hops, returning a
@@ -163,26 +159,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
             let _ = csr.add_edge(from.as_str(), edge_type, to.as_str());
         }
 
-        let edge_id = EdgeId::try_first(from.clone(), to.clone(), edge_type).map_err(|e| {
-            NodeDbError::storage(format!("edge_store: invalid edge label '{edge_type}': {e}"))
-        })?;
+        let edge_id = edge_id_for(from, to, edge_type)?;
         let edge_key = format!("{edge_id}");
         let edge_coll = edge_crdt_collection(collection);
 
         {
             let mut crdt = self.crdt.lock_or_recover();
-            let mut fields: Vec<(&str, LoroValue)> = vec![
-                ("src", LoroValue::String(from.as_str().into())),
-                ("dst", LoroValue::String(to.as_str().into())),
-                ("label", LoroValue::String(edge_type.into())),
-            ];
-
-            if let Some(ref props) = properties {
-                for (k, v) in &props.fields {
-                    fields.push((k.as_str(), value_to_loro(v)));
-                }
-            }
-
+            let fields = edge_crdt_fields(from, to, edge_type, &properties);
             crdt.upsert(&edge_coll, &edge_key, &fields)
                 .map_err(NodeDbError::storage)?;
         }
@@ -194,18 +177,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .unwrap_or(false);
         if bitemporal {
             let system_from_ms = now_millis_i64();
-            let props_value = {
-                let mut m = std::collections::HashMap::new();
-                m.insert("src".to_string(), Value::String(from.as_str().to_string()));
-                m.insert("dst".to_string(), Value::String(to.as_str().to_string()));
-                m.insert("label".to_string(), Value::String(edge_type.to_string()));
-                if let Some(ref props) = properties {
-                    for (k, v) in &props.fields {
-                        m.insert(k.clone(), v.clone());
-                    }
-                }
-                Value::Object(m)
-            };
+            let props_value = edge_history_value(from, to, edge_type, &properties);
             let _ = history::record_edge_insert(
                 self.storage.as_ref(),
                 collection,
