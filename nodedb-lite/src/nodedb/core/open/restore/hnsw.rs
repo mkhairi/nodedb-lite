@@ -13,22 +13,55 @@ use crate::engine::vector::IndexIdMap;
 use crate::engine::vector::VectorIdMap;
 use crate::engine::vector::graph::HnswIndex;
 use crate::engine::vector::id_map::PersistedIdEntry;
+use crate::nodedb::flush_gens::{FlushArtifact, FlushGens, ID_MAP_KEY};
 use crate::storage::engine::StorageEngine;
 
 use crate::nodedb::core::types::{META_HNSW_COLLECTIONS, NodeDbLite};
 
+/// Restored HNSW artifacts that match their stored form exactly.
+///
+/// Everything not listed here was rebuilt, or had no valid stored copy, and
+/// must start dirty so the first flush writes it.
+#[derive(Debug, Default)]
+pub(in crate::nodedb::core::open) struct HnswLoadedClean {
+    /// Collections whose checkpoint decoded and was kept as the index.
+    graphs: Vec<String>,
+    /// Collections whose vector segment attached to the restored index.
+    segments: Vec<String>,
+    /// Whether the id-map blob decoded and no rebuilt collection replaced
+    /// any of its entries.
+    id_map: bool,
+}
+
+impl HnswLoadedClean {
+    /// Mark every artifact listed here clean in `gens`.
+    pub(in crate::nodedb::core::open) fn mark_clean(&self, gens: &FlushGens) {
+        for name in &self.graphs {
+            gens.mark_clean(FlushArtifact::HnswGraph, name);
+        }
+        for name in &self.segments {
+            gens.mark_clean(FlushArtifact::VectorSegment, name);
+        }
+        if self.id_map {
+            gens.mark_clean(FlushArtifact::HnswIdMap, ID_MAP_KEY);
+        }
+    }
+}
+
 impl<S: StorageEngine> NodeDbLite<S> {
     /// Restore HNSW indices and the vector id_map from storage.
     ///
-    /// Returns `(indices, id_map)`. The id_map binds each index's nodes to
-    /// document ids and is loaded from the blob written by `flush`.
-    /// When no id_map blob exists (first open or an earlier-layout database), the returned
-    /// map is empty and vector search will fall back to HNSW integer IDs until the
-    /// next flush.
+    /// Returns `(indices, id_map, loaded_clean)`. The id_map binds each
+    /// index's nodes to document ids and is loaded from the blob written by
+    /// `flush`. When no id_map blob exists (first open or an earlier-layout
+    /// database), the returned map is empty and vector search will fall back
+    /// to HNSW integer IDs until the next flush. `loaded_clean` names the
+    /// artifacts restored from a valid stored form.
     pub(in crate::nodedb::core::open) async fn restore_hnsw_indices(
         storage: &Arc<S>,
-    ) -> NodeDbResult<(HashMap<String, HnswIndex>, VectorIdMap)> {
+    ) -> NodeDbResult<(HashMap<String, HnswIndex>, VectorIdMap, HnswLoadedClean)> {
         let mut hnsw_indices = HashMap::new();
+        let mut loaded_clean = HnswLoadedClean::default();
         // Collections whose index was rebuilt from durable vectors: their
         // internal ids are freshly assigned, so the persisted `hnsw_id_map`
         // entries for them are stale and must be replaced, not merged.
@@ -75,7 +108,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             }
         }
         if names.is_empty() {
-            return Ok((hnsw_indices, VectorIdMap::new()));
+            return Ok((hnsw_indices, VectorIdMap::new(), loaded_clean));
         }
 
         // On native targets, check if vector segment operations are available.
@@ -86,7 +119,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         // The bindings come first: a segment is attached only when its slots
         // carry the documents these bindings put at each node.
-        let (persisted_ids, displaced) = load_persisted_id_map(storage.as_ref()).await;
+        let (persisted_ids, displaced, id_map_decoded) =
+            load_persisted_id_map(storage.as_ref()).await;
 
         for name in &names {
             let key = format!("hnsw:{name}");
@@ -135,6 +169,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                                                     collection = %name,
                                                     "HNSW restored with pagedb vector segment backing"
                                                 );
+                                                loaded_clean.segments.push(name.clone());
                                                 true
                                             }
                                             Err(e) => {
@@ -169,6 +204,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                             let attached = true;
 
                             if attached {
+                                loaded_clean.graphs.push(name.clone());
                                 hnsw_indices.insert(name.clone(), index);
                             } else {
                                 #[cfg(not(target_arch = "wasm32"))]
@@ -223,6 +259,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // several keeps the latest; the older nodes are tombstoned so search
         // cannot reach them. A rebuilt index has fresh node ids and replaces
         // its persisted bindings below, so it is skipped.
+        //
+        // A tombstone here makes the graph differ from its checkpoint, and a
+        // dropped binding makes the id-map differ from its blob, so neither
+        // starts clean.
+        let id_map_matches_blob = id_map_decoded && displaced.is_empty();
         for (index_key, node) in displaced {
             #[cfg(not(target_arch = "wasm32"))]
             if rebuilt_id_maps.iter().any(|(name, _)| *name == index_key) {
@@ -230,6 +271,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             }
             if let Some(index) = hnsw_indices.get_mut(&index_key) {
                 index.delete(node);
+                loaded_clean.graphs.retain(|name| *name != index_key);
             }
         }
         let id_map = persisted_ids;
@@ -238,6 +280,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // ids were reassigned during the rebuild, so keeping the persisted ones
         // would map search hits to the wrong documents.
         #[cfg(not(target_arch = "wasm32"))]
+        let rebuilt_any = !rebuilt_id_maps.is_empty();
+        #[cfg(target_arch = "wasm32")]
+        let rebuilt_any = false;
+        #[cfg(not(target_arch = "wasm32"))]
         let id_map = {
             let mut id_map = id_map;
             for (name, rebuilt) in rebuilt_id_maps {
@@ -245,8 +291,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
             }
             id_map
         };
+        loaded_clean.id_map = id_map_matches_blob && !rebuilt_any;
 
-        Ok((hnsw_indices, id_map))
+        Ok((hnsw_indices, id_map, loaded_clean))
     }
 }
 
@@ -290,17 +337,19 @@ async fn rebuild_into<S: StorageEngine>(
     }
 }
 
-/// The persisted id map written by `flush`, and the nodes it displaced
-/// (see [`VectorIdMap::from_entries`]). Empty when the blob is absent or
-/// unreadable; vector search then falls back to HNSW integer ids until the
-/// next flush.
-async fn load_persisted_id_map<S: StorageEngine>(storage: &S) -> (VectorIdMap, Vec<(String, u32)>) {
+/// The persisted id map written by `flush`, the nodes it displaced (see
+/// [`VectorIdMap::from_entries`]), and whether the blob decoded. Empty when
+/// the blob is absent or unreadable; vector search then falls back to HNSW
+/// integer ids until the next flush.
+async fn load_persisted_id_map<S: StorageEngine>(
+    storage: &S,
+) -> (VectorIdMap, Vec<(String, u32)>, bool) {
     let Some(envelope) = storage
         .get(Namespace::Vector, b"hnsw_id_map")
         .await
         .unwrap_or(None)
     else {
-        return (VectorIdMap::new(), Vec::new());
+        return (VectorIdMap::new(), Vec::new(), false);
     };
     let Some(bytes) = crate::storage::checksum::unwrap(&envelope) else {
         tracing::error!(
@@ -308,17 +357,20 @@ async fn load_persisted_id_map<S: StorageEngine>(storage: &S) -> (VectorIdMap, V
              Vector search will fall back to HNSW integer IDs until next flush."
         );
         let _ = storage.delete(Namespace::Vector, b"hnsw_id_map").await;
-        return (VectorIdMap::new(), Vec::new());
+        return (VectorIdMap::new(), Vec::new(), false);
     };
     match zerompk::from_msgpack::<Vec<PersistedIdEntry>>(&bytes) {
-        Ok(entries) => VectorIdMap::from_entries(entries),
+        Ok(entries) => {
+            let (id_map, displaced) = VectorIdMap::from_entries(entries);
+            (id_map, displaced, true)
+        }
         Err(e) => {
             tracing::error!(
                 error = %e,
                 "vector_id_map deserialization failed — \
                  vector search will fall back to HNSW integer IDs until next flush"
             );
-            (VectorIdMap::new(), Vec::new())
+            (VectorIdMap::new(), Vec::new(), false)
         }
     }
 }

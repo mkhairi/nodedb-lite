@@ -72,10 +72,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 })
                 .collect();
             if !ops.is_empty() {
-                self.storage
-                    .batch_write(&ops)
-                    .await
-                    .map_err(NodeDbError::storage)?;
+                let written = self.storage.batch_write(&ops).await;
+                self.vector_state.mark_vector_rows_changed(collection);
+                written.map_err(NodeDbError::storage)?;
             }
         }
 

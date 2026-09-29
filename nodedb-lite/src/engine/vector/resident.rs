@@ -16,8 +16,7 @@
 //! The eviction mark (`VectorState::evicted`) catches that: an index absent
 //! from memory and still marked is loaded again before the lock is returned.
 
-use std::collections::HashMap;
-use std::sync::{Arc, MutexGuard};
+use std::sync::Arc;
 
 use nodedb_types::hnsw::HnswParams;
 use nodedb_types::vector_dtype::VectorStorageDtype;
@@ -26,11 +25,13 @@ use crate::engine::vector::HnswIndex;
 use crate::engine::vector::VectorState;
 use crate::engine::vector::search::lazy_load::ensure_index_loaded;
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::TrackedMapGuard;
 use crate::nodedb::lock_ext::LockExt;
 use crate::storage::engine::StorageEngine;
 
-/// The locked index map.
-pub(crate) type IndexMap<'a> = MutexGuard<'a, HashMap<String, HnswIndex>>;
+/// The locked index map. Its mutable access marks the touched index dirty
+/// for the next flush.
+pub(crate) type IndexMap<'a> = TrackedMapGuard<'a, HnswIndex>;
 
 /// Lock the index map with `index_key`'s index resident when memory or
 /// storage holds one. Fails when reading the stored index fails.
@@ -112,12 +113,12 @@ pub(crate) async fn check_insert_widths<S: StorageEngine>(
 /// Get or create the index for `index_key`. An existing index ignores `dim`
 /// and `dtype`: both are fixed when the index is created.
 fn get_or_create<'a>(
-    indices: &'a mut HashMap<String, HnswIndex>,
+    indices: &'a mut IndexMap<'_>,
     index_key: &str,
     dim: usize,
     dtype: VectorStorageDtype,
 ) -> &'a mut HnswIndex {
-    indices.entry(index_key.to_string()).or_insert_with(|| {
+    indices.get_or_insert_with(index_key, || {
         HnswIndex::new(
             dim,
             HnswParams {
@@ -144,7 +145,12 @@ mod tests {
 
     #[test]
     fn get_or_create_uses_the_dtype_only_at_creation() {
-        let mut indices: HashMap<String, HnswIndex> = HashMap::new();
+        let tracked = crate::nodedb::flush_gens::TrackedMap::new(
+            std::collections::HashMap::new(),
+            Arc::new(crate::nodedb::flush_gens::FlushGens::default()),
+            crate::nodedb::flush_gens::FlushArtifact::HnswGraph,
+        );
+        let mut indices = tracked.lock_or_recover();
         get_or_create(&mut indices, "col", 4, VectorStorageDtype::BF16);
         assert_eq!(
             indices.get("col").map(|i| i.params().dtype),

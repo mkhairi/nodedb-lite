@@ -127,10 +127,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // write no segment at all.
         if !embedding.is_empty() {
             let op = crate::engine::vector::durable::put_op(collection, id, embedding);
-            self.storage
-                .batch_write(std::slice::from_ref(&op))
-                .await
-                .map_err(NodeDbError::storage)?;
+            let written = self.storage.batch_write(std::slice::from_ref(&op)).await;
+            self.vector_state.mark_vector_rows_changed(collection);
+            written.map_err(NodeDbError::storage)?;
         }
 
         // Replaces the node `id` held before, so the id stays one node.
@@ -312,10 +311,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // each named-vector sub-index rebuilds from its own rows.
         if !embedding.is_empty() {
             let op = crate::engine::vector::durable::put_op(&index_key, id, embedding);
-            self.storage
-                .batch_write(std::slice::from_ref(&op))
-                .await
-                .map_err(NodeDbError::storage)?;
+            let written = self.storage.batch_write(std::slice::from_ref(&op)).await;
+            self.vector_state.mark_vector_rows_changed(&index_key);
+            written.map_err(NodeDbError::storage)?;
         }
 
         // Replaces the node `id` held before, so the id stays one node.

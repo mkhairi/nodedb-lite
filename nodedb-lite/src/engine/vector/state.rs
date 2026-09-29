@@ -16,13 +16,19 @@ use nodedb_vector::rerank::CodecSidecar;
 
 use crate::engine::vector::HnswIndex;
 use crate::engine::vector::id_map::VectorIdMap;
+use crate::nodedb::flush_gens::{FlushArtifact, FlushGens, ID_MAP_KEY, TrackedCell, TrackedMap};
 use crate::storage::engine::StorageEngine;
 
 pub struct VectorState<S: StorageEngine> {
-    pub(crate) hnsw_indices: Mutex<HashMap<String, HnswIndex>>,
+    /// Per-collection HNSW indices. Every mutable access marks the touched
+    /// collection's [`FlushArtifact::HnswGraph`] dirty.
+    pub(crate) hnsw_indices: TrackedMap<HnswIndex>,
     /// Per-index node ↔ document id bindings. Lock order: `hnsw_indices`
-    /// first, then this.
-    pub(crate) vector_id_map: Mutex<VectorIdMap>,
+    /// first, then this. Every mutable access marks
+    /// [`FlushArtifact::HnswIdMap`] dirty.
+    pub(crate) vector_id_map: TrackedCell<VectorIdMap>,
+    /// Flush dirty tracking shared with the owning `NodeDbLite`.
+    pub(crate) flush_gens: Arc<FlushGens>,
     pub(crate) search_ef: usize,
     pub(crate) storage: Arc<S>,
     /// index_key → trained codec sidecar (populated by S2.a.11).
@@ -68,13 +74,27 @@ pub struct RestoredVectorState<S: StorageEngine> {
     pub indices: HashMap<String, HnswIndex>,
     pub id_map: VectorIdMap,
     pub memory: ScopedMemory,
+    /// Flush dirty tracking owned by the database. The restore path has
+    /// already marked clean every artifact it loaded from a valid stored form.
+    pub(crate) flush_gens: Arc<FlushGens>,
 }
 
 impl<S: StorageEngine> VectorState<S> {
     pub fn new(storage: Arc<S>, search_ef: usize, memory: ScopedMemory) -> Self {
+        let flush_gens = Arc::new(FlushGens::default());
         Self {
-            hnsw_indices: Mutex::new(HashMap::new()),
-            vector_id_map: Mutex::new(VectorIdMap::new()),
+            hnsw_indices: TrackedMap::new(
+                HashMap::new(),
+                Arc::clone(&flush_gens),
+                FlushArtifact::HnswGraph,
+            ),
+            vector_id_map: TrackedCell::new(
+                VectorIdMap::new(),
+                Arc::clone(&flush_gens),
+                FlushArtifact::HnswIdMap,
+                ID_MAP_KEY,
+            ),
+            flush_gens,
             search_ef,
             storage,
             codec_sidecars: Arc::new(Mutex::new(HashMap::new())),
@@ -87,8 +107,18 @@ impl<S: StorageEngine> VectorState<S> {
 
     pub fn from_restored(restored: RestoredVectorState<S>) -> Self {
         Self {
-            hnsw_indices: Mutex::new(restored.indices),
-            vector_id_map: Mutex::new(restored.id_map),
+            hnsw_indices: TrackedMap::new(
+                restored.indices,
+                Arc::clone(&restored.flush_gens),
+                FlushArtifact::HnswGraph,
+            ),
+            vector_id_map: TrackedCell::new(
+                restored.id_map,
+                Arc::clone(&restored.flush_gens),
+                FlushArtifact::HnswIdMap,
+                ID_MAP_KEY,
+            ),
+            flush_gens: restored.flush_gens,
             search_ef: restored.search_ef,
             storage: restored.storage,
             codec_sidecars: Arc::new(Mutex::new(HashMap::new())),
@@ -97,6 +127,17 @@ impl<S: StorageEngine> VectorState<S> {
             evicted: Mutex::new(HashSet::new()),
             memory: restored.memory,
         }
+    }
+
+    /// Record that durable vector rows under `index_key` were written or
+    /// removed, so the vector segments built from them are dirty.
+    ///
+    /// Call it AFTER the storage write returns, whatever its result. Marking
+    /// first would let a flush capture the new generation, read the rows
+    /// before the write lands, and record a segment without that row as
+    /// current.
+    pub(crate) fn mark_vector_rows_changed(&self, index_key: &str) {
+        self.flush_gens.bump_vector_rows(index_key);
     }
 }
 
