@@ -1,7 +1,9 @@
 //! Checkpoint serialization and restoration for [`SpatialIndexManager`].
 //!
-//! Persists the full in-memory spatial state to `Namespace::Spatial` so that a
-//! cold open can load the index without rebuilding from CRDT documents.
+//! Persists the in-memory spatial state to `Namespace::Spatial` so that a
+//! cold open can load the index without rebuilding from CRDT documents. A
+//! flush writes only the R-trees, doc-maps, and catalog entries that changed
+//! since this handle last wrote them.
 //!
 //! ## Key layout under `Namespace::Spatial`
 //!
@@ -19,91 +21,228 @@
 
 use std::collections::HashMap;
 
+use nodedb_spatial::rtree::RTree;
 use nodedb_types::Namespace;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
+use crate::nodedb::flush_gens::{ArtifactFlush, FlushArtifact, FlushGens, spatial_rtree_key};
 use crate::storage::engine::{StorageEngine, WriteOp};
 
-/// Flush the full spatial state to storage.
+/// Catalog key: the sorted `(collection, field)` list.
+const COLLECTIONS_KEY: &[u8] = b"spatial:_collections";
+
+/// Next entry id key.
+const NEXT_ID_KEY: &[u8] = b"spatial:_next_id";
+
+/// One R-tree checkpoint a flush writes after the catalog batch.
+pub(crate) struct SpatialTreeFlush {
+    /// Mark flushed once this tree's own write succeeds.
+    pub(crate) planned: ArtifactFlush,
+    pub(crate) collection: String,
+    pub(crate) field: String,
+    /// The R-tree checkpoint, not yet CRC32C-wrapped.
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// The spatial writes one flush plans.
+pub(crate) struct SpatialFlush {
+    /// Puts for the dirty doc-maps and the changed catalog entries, written
+    /// as one batch.
+    pub(crate) ops: Vec<WriteOp>,
+    /// One plan per dirty collection doc-map put in `ops`.
+    pub(crate) docmaps: Vec<ArtifactFlush>,
+    /// Catalog entries put in `ops`, recorded as written once `ops` commits.
+    pub(crate) meta: Vec<(&'static [u8], Vec<u8>)>,
+    /// Dirty R-trees, each written after `ops`.
+    pub(crate) trees: Vec<SpatialTreeFlush>,
+}
+
+/// Serialize the spatial state a flush must write.
 ///
-/// Persists each R-tree checkpoint (CRC32C-wrapped) plus the `doc_id → entry_id`
-/// mapping so that cold opens can restore exact index state.
-pub(crate) async fn flush_spatial<S>(
-    storage: &S,
-    checkpoints: &[(String, String, Vec<u8>)],
+/// A doc-map or R-tree is written only when it is dirty or `full` is set.
+/// Each generation is captured by `FlushGens::plan`, so call this under the
+/// manager lock the state is read under. `spatial:_collections` and
+/// `spatial:_next_id` are written only when they differ from the value this
+/// handle last wrote, or `full` is set.
+///
+/// Every registered tree is listed in the catalog, sorted, so the encoded
+/// list compares equal across ticks while the set is unchanged. A tree whose
+/// checkpoint fails to serialize is logged and stays dirty.
+pub(crate) fn serialize_spatial(
+    indices: &HashMap<(String, String), RTree>,
     doc_to_entry: &HashMap<(String, String), u64>,
     next_id: u64,
-) -> NodeDbResult<()>
-where
-    S: StorageEngine,
-{
+    full: bool,
+    gens: &FlushGens,
+) -> NodeDbResult<SpatialFlush> {
     let mut ops: Vec<WriteOp> = Vec::new();
+    let mut docmaps: Vec<ArtifactFlush> = Vec::new();
+    let mut meta: Vec<(&'static [u8], Vec<u8>)> = Vec::new();
+    let mut trees: Vec<SpatialTreeFlush> = Vec::new();
 
     // ── Collection list ───────────────────────────────────────────────────────
-    let index_keys: Vec<(String, String)> = checkpoints
-        .iter()
-        .map(|(c, f, _)| (c.clone(), f.clone()))
-        .collect();
+    let mut index_keys: Vec<(String, String)> = indices.keys().cloned().collect();
+    index_keys.sort();
     let keys_bytes = zerompk::to_msgpack_vec(&index_keys)
         .map_err(|e| NodeDbError::serialization("msgpack", e))?;
-    ops.push(WriteOp::Put {
-        ns: Namespace::Spatial,
-        key: b"spatial:_collections".to_vec(),
-        value: keys_bytes,
-    });
+    if full || gens.meta_changed(COLLECTIONS_KEY, &keys_bytes) {
+        ops.push(WriteOp::Put {
+            ns: Namespace::Spatial,
+            key: COLLECTIONS_KEY.to_vec(),
+            value: keys_bytes.clone(),
+        });
+        meta.push((COLLECTIONS_KEY, keys_bytes));
+    }
 
     // ── Next entry ID ─────────────────────────────────────────────────────────
     let next_id_bytes =
         zerompk::to_msgpack_vec(&next_id).map_err(|e| NodeDbError::serialization("msgpack", e))?;
-    ops.push(WriteOp::Put {
-        ns: Namespace::Spatial,
-        key: b"spatial:_next_id".to_vec(),
-        value: next_id_bytes,
-    });
+    if full || gens.meta_changed(NEXT_ID_KEY, &next_id_bytes) {
+        ops.push(WriteOp::Put {
+            ns: Namespace::Spatial,
+            key: NEXT_ID_KEY.to_vec(),
+            value: next_id_bytes.clone(),
+        });
+        meta.push((NEXT_ID_KEY, next_id_bytes));
+    }
 
-    // ── Per-index doc-map (always on B+ tree) ─────────────────────────────────
-    for (collection, field, _rtree_bytes) in checkpoints {
-        let docmap_key = format!("spatial:{collection}:{field}:docmap");
-        let pairs: Vec<(String, u64)> = doc_to_entry
+    // ── Per-collection doc-map (always on B+ tree) ────────────────────────────
+    // The doc-map is filtered by collection only, so every field of a
+    // collection stores the same bytes. It is tracked and written per
+    // collection.
+    let mut collections: Vec<&str> = index_keys.iter().map(|(c, _)| c.as_str()).collect();
+    collections.dedup();
+    for collection in collections {
+        let Some(planned) = gens.plan(FlushArtifact::SpatialDocMap, collection, full) else {
+            continue;
+        };
+        let mut pairs: Vec<(String, u64)> = doc_to_entry
             .iter()
             .filter(|((coll, _doc_id), _)| coll == collection)
             .map(|((_coll, doc_id), &entry_id)| (doc_id.clone(), entry_id))
             .collect();
+        pairs.sort();
         let docmap_bytes = zerompk::to_msgpack_vec(&pairs)
             .map_err(|e| NodeDbError::serialization("msgpack", e))?;
-        ops.push(WriteOp::Put {
-            ns: Namespace::Spatial,
-            key: docmap_key.into_bytes(),
-            value: docmap_bytes,
-        });
+        for (_, field) in index_keys.iter().filter(|(c, _)| c == collection) {
+            ops.push(WriteOp::Put {
+                ns: Namespace::Spatial,
+                key: format!("spatial:{collection}:{field}:docmap").into_bytes(),
+                value: docmap_bytes.clone(),
+            });
+        }
+        docmaps.push(planned);
     }
 
+    // ── Per-index R-tree bytes ────────────────────────────────────────────────
+    for (collection, field) in &index_keys {
+        let Some(tree) = indices.get(&(collection.clone(), field.clone())) else {
+            continue;
+        };
+        let key = spatial_rtree_key(collection, field);
+        let Some(planned) = gens.plan(FlushArtifact::SpatialRtree, &key, full) else {
+            continue;
+        };
+        match tree.checkpoint_to_bytes(None) {
+            Ok(bytes) => trees.push(SpatialTreeFlush {
+                planned,
+                collection: collection.clone(),
+                field: field.clone(),
+                bytes,
+            }),
+            Err(e) => {
+                // Not planned as written, so it stays dirty and the next
+                // flush tries again.
+                tracing::error!(
+                    collection = %collection,
+                    field = %field,
+                    error = %e,
+                    "spatial index checkpoint failed"
+                );
+            }
+        }
+    }
+
+    Ok(SpatialFlush {
+        ops,
+        docmaps,
+        meta,
+        trees,
+    })
+}
+
+/// Write the spatial state `serialize_spatial` planned.
+///
+/// The doc-maps and catalog entries go in one batch, skipped when empty, and
+/// are marked written once it commits. A failed batch returns the error with
+/// nothing marked. Each R-tree is then written on its own and marked flushed
+/// only after its write succeeds. A failed segment write is logged and the
+/// tree stays dirty, so the next flush retries it.
+pub(crate) async fn write_serialized_spatial<S>(
+    storage: &S,
+    flush: SpatialFlush,
+    gens: &FlushGens,
+) -> NodeDbResult<()>
+where
+    S: StorageEngine,
+{
+    let SpatialFlush {
+        ops,
+        docmaps,
+        meta,
+        trees,
+    } = flush;
+
     // ── Commit catalog + docmap to B+ tree ────────────────────────────────────
-    storage
-        .batch_write(&ops)
-        .await
-        .map_err(NodeDbError::storage)?;
+    if !ops.is_empty() {
+        storage
+            .batch_write(&ops)
+            .await
+            .map_err(NodeDbError::storage)?;
+    }
+    for planned in &docmaps {
+        gens.mark_flushed(planned);
+        gens.record_write(planned);
+    }
+    for (key, value) in meta {
+        gens.mark_meta_written(key, value);
+    }
 
     // ── Per-index R-tree bytes: segment when available, KV fallback ───────────
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(seg) = storage.as_spatial_segment_ext() {
-        for (collection, field, rtree_bytes) in checkpoints {
-            let wrapped = crate::storage::checksum::wrap(rtree_bytes);
-            seg.write_spatial_segment(collection, field, &wrapped)
+        for tree in &trees {
+            let wrapped = crate::storage::checksum::wrap(&tree.bytes);
+            match seg
+                .write_spatial_segment(&tree.collection, &tree.field, &wrapped)
                 .await
-                .map_err(NodeDbError::storage)?;
+            {
+                Ok(()) => {
+                    gens.mark_flushed(&tree.planned);
+                    gens.record_write(&tree.planned);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        collection = %tree.collection,
+                        field = %tree.field,
+                        error = %e,
+                        "spatial R-tree segment write failed; \
+                         the tree stays dirty and the next flush retries it"
+                    );
+                }
+            }
         }
         return Ok(());
     }
 
     // Legacy KV path (WASM fallback).
-    let mut rtree_ops: Vec<WriteOp> = Vec::with_capacity(checkpoints.len());
-    for (collection, field, rtree_bytes) in checkpoints {
-        let rtree_key = format!("spatial:{collection}:{field}:rtree");
+    let mut rtree_ops: Vec<WriteOp> = Vec::with_capacity(trees.len());
+    for tree in &trees {
+        let rtree_key = format!("spatial:{}:{}:rtree", tree.collection, tree.field);
         rtree_ops.push(WriteOp::Put {
             ns: Namespace::Spatial,
             key: rtree_key.into_bytes(),
-            value: crate::storage::checksum::wrap(rtree_bytes),
+            value: crate::storage::checksum::wrap(&tree.bytes),
         });
     }
     if !rtree_ops.is_empty() {
@@ -111,6 +250,10 @@ where
             .batch_write(&rtree_ops)
             .await
             .map_err(NodeDbError::storage)?;
+    }
+    for tree in &trees {
+        gens.mark_flushed(&tree.planned);
+        gens.record_write(&tree.planned);
     }
 
     Ok(())
