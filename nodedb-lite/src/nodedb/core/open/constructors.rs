@@ -122,7 +122,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
         let csr = Self::restore_csr_indices(&storage, &graph_memory).await?;
 
         // ── Restore HNSW indices and id_map ──
-        let (hnsw_map, hnsw_id_map) = Self::restore_hnsw_indices(&storage).await?;
+        let (hnsw_map, hnsw_id_map, hnsw_loaded_clean) =
+            Self::restore_hnsw_indices(&storage).await?;
+        // Artifacts restored from a valid stored form start clean; everything
+        // else starts dirty, so the first flush writes what open rebuilt.
+        let flush_gens = Arc::new(crate::nodedb::flush_gens::FlushGens::default());
+        hnsw_loaded_clean.mark_clean(&flush_gens);
 
         // ── Restore spatial indices ──
         let spatial_memory = nodedb_mem::ScopedMemory::new(
@@ -193,6 +198,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             indices: hnsw_map,
             id_map: hnsw_id_map,
             memory: vector_memory,
+            flush_gens: Arc::clone(&flush_gens),
         }));
         let fts_state = Arc::new(FtsState::from_restored(fts_manager));
         let sparse_state = Arc::new(SparseVectorState::from_restored(sparse_manager));
@@ -298,6 +304,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             identity: Mutex::new(lite_identity),
             identity_change: tokio::sync::Mutex::new(()),
             flush_lock: tokio::sync::Mutex::new(()),
+            flush_gens,
             kv_local,
             sync_gate: std::sync::RwLock::new(None),
             tasks: crate::tasks::TaskRegistry::default(),

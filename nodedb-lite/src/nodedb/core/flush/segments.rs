@@ -3,22 +3,40 @@
 //! Persist vector payloads and graph adjacency segments.
 
 use super::indexes::IndexJobs;
-use crate::{engine::vector::segment::segment_payload, storage::engine::StorageEngine};
+use crate::{
+    engine::vector::segment::segment_payload, nodedb::flush_gens::FlushGens,
+    storage::engine::StorageEngine,
+};
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
+/// Write the planned vector segments and the CSR segments.
+///
+/// A vector segment is marked flushed only after its write succeeds. Every
+/// error returns before that, so the segment stays dirty and the next flush
+/// retries it.
 pub(super) async fn write_segments<S: StorageEngine>(
     storage: &S,
     jobs: IndexJobs,
+    flush_gens: &FlushGens,
 ) -> NodeDbResult<()> {
     if let Some(ext) = storage.as_vector_segment_ext() {
-        for (name, sources) in jobs.vectors {
-            if let Some((dim, vectors, surrogates)) = segment_payload(storage, &name, sources)
+        for (planned, sources) in jobs.vectors {
+            let name = planned.key();
+            match segment_payload(storage, name, sources)
                 .await
                 .map_err(NodeDbError::from)?
             {
-                ext.write_vector_segment(&name, dim, &vectors, &surrogates)
-                    .await
-                    .map_err(NodeDbError::from)?;
+                Some((dim, vectors, surrogates)) => {
+                    ext.write_vector_segment(name, dim, &vectors, &surrogates)
+                        .await
+                        .map_err(NodeDbError::from)?;
+                    flush_gens.mark_flushed(&planned);
+                    flush_gens.record_write(&planned);
+                }
+                // No durable vectors: nothing to publish, and that outcome is
+                // final for this generation. A later durable row makes the
+                // segment dirty again.
+                None => flush_gens.mark_flushed(&planned),
             }
         }
     }

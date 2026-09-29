@@ -76,13 +76,14 @@ where
         // a collection writes no segment for it at all.
         if !embedding.is_empty() {
             let op = crate::engine::vector::durable::put_op(&index_key, &doc_id, &embedding);
-            vector_state
+            let written = vector_state
                 .storage
                 .batch_write(std::slice::from_ref(&op))
-                .await
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("Insert: durable vector write failed: {e}"),
-                })?;
+                .await;
+            vector_state.mark_vector_rows_changed(&index_key);
+            written.map_err(|e| LiteError::Storage {
+                detail: format!("Insert: durable vector write failed: {e}"),
+            })?;
         }
         // Replaces the node `doc_id` held before, so the id stays one node.
         let internal_id = upsert_node(&vector_state, &index_key, &doc_id, &embedding).await?;
@@ -372,6 +373,7 @@ where
             crate::engine::vector::durable::remove(&*vector_state.storage, &index_key, &doc_id)
                 .await?;
         }
+        vector_state.mark_vector_rows_changed(&index_key);
 
         tracing::info!(index_key, existed, "vector index dropped");
         Ok(nodedb_types::result::QueryResult {

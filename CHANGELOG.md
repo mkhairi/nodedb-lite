@@ -16,7 +16,24 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 >
 > Public API and exported FFI symbol signatures stay unfrozen until that tag.
 
+### Added
+
+- `NodeDbLite::flush_full()` writes every dirty-tracked flush artifact
+  whether or not it changed. `flush()` stays the dirty-aware pass.
+- `NodeDbLite::flush_artifact_write_count(artifact, collection)` and
+  `flush_artifact_is_dirty(artifact, collection)` report per-artifact flush
+  writes and pending state for `FlushArtifact::{HnswGraph, HnswIdMap,
+  VectorSegment}`.
+
 ### Fixed
+
+- `flush()` no longer rewrites unchanged HNSW artifacts on every tick. Each
+  collection's graph checkpoint, the vector id-map, and each vector segment
+  carry a mutation generation and are written only when dirty. The
+  `meta:hnsw_collections` and `meta:last_flushed_mid` entries are written only
+  when their value changes. An idle store with vector data now makes no HNSW
+  or meta writes per tick; before, it rewrote the full vector segment each
+  time. CSR, FTS, sparse, and spatial flush paths are unchanged.
 
 - Shutdown no longer aborts an in-flight auto-flush or auto-compaction after
   5 s; it waits for the pass to finish, so a stop during a long flush cannot
