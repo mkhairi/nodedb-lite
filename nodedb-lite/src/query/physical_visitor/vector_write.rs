@@ -375,6 +375,21 @@ where
         }
         vector_state.mark_vector_rows_changed(&index_key);
 
+        // Stored vector segment. An index created again under this key and
+        // given the same ids in the same order would pass the attach check and
+        // serve the dropped vectors.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ext) = vector_state.storage.as_vector_segment_ext()
+            && let Err(e) = ext.delete_vector_segment(&index_key).await
+        {
+            tracing::warn!(
+                index_key,
+                error = %e,
+                "DropIndex: removing the vector segment failed; a recreated index \
+                 with the same ids can attach its stale vectors"
+            );
+        }
+
         tracing::info!(index_key, existed, "vector index dropped");
         Ok(nodedb_types::result::QueryResult {
             columns: Vec::new(),
