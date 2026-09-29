@@ -35,8 +35,9 @@ pub enum FlushArtifact {
     HnswGraph,
     /// The store-wide `hnsw_id_map` blob. Tracked under [`ID_MAP_KEY`].
     HnswIdMap,
-    /// A collection's pagedb vector segment. It is built from the durable
-    /// vector rows, so it is dirty whenever those rows change.
+    /// A collection's pagedb vector segment. It is built from the HNSW index
+    /// in node order. It is dirty whenever the collection's durable vector
+    /// rows change, and `flush` also rewrites it whenever the graph is dirty.
     VectorSegment,
 }
 
@@ -110,13 +111,15 @@ impl FlushGens {
 
     /// Record a mutation of the durable vector rows under `index_key`.
     ///
-    /// A segment is built from a prefix scan of `v:<collection>:`, and that
-    /// prefix also covers every bucket whose key extends the collection's with
-    /// `:<field>`. A row written under `a:b` therefore changes the segment of
-    /// `a` as well, so every `:`-delimited ancestor of `index_key` is bumped.
-    /// A document id may itself contain `:`, so a row under `a` can land in
-    /// the prefix of a tracked bucket `a:<field>`: every tracked descendant
-    /// is bumped too.
+    /// The segment is built from the HNSW index, not from these rows, but a
+    /// row change is the signal that its collection's segment is stale. The
+    /// durable rows of a collection live under the prefix `v:<collection>:`,
+    /// and that prefix also covers every bucket whose key extends the
+    /// collection's with `:<field>`. A row written under `a:b` therefore
+    /// counts as a change to `a` as well, so every `:`-delimited ancestor of
+    /// `index_key` is bumped. A document id may itself contain `:`, so a row
+    /// under `a` can land in the prefix of a tracked bucket `a:<field>`:
+    /// every tracked descendant is bumped too.
     pub(crate) fn bump_vector_rows(&self, index_key: &str) {
         let mut gens = self.generations.lock_or_recover();
         let descendant_prefix = format!("{index_key}:");

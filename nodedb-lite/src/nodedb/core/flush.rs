@@ -415,8 +415,47 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // Written only when dirty. The generation is captured under the same
         // lock the entries are read under, so a bind made after this point
         // leaves the id-map dirty for the next flush.
+        #[cfg(not(target_arch = "wasm32"))]
+        let seg_ext = self.storage.as_vector_segment_ext();
+        // Collections whose vector segment this flush can write: a segment is
+        // rewritten when its rows or its graph changed. Their slot bindings
+        // are read below under the id-map lock, in the same critical section
+        // that serializes the id-map, so each segment's stamps name exactly the
+        // bindings the stored id-map holds. The index lock is not held there:
+        // the id-map lock is never taken inside the index lock in a new order.
+        #[cfg(not(target_arch = "wasm32"))]
+        let segment_candidates: std::collections::HashSet<String> = if seg_ext.is_some() {
+            let indices = self.vector_state.hnsw_indices.lock_or_recover();
+            indices
+                .keys()
+                .filter(|name| {
+                    full || self.flush_gens.is_dirty(FlushArtifact::HnswGraph, name)
+                        || self.flush_gens.is_dirty(FlushArtifact::VectorSegment, name)
+                })
+                .cloned()
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut segment_bindings: std::collections::HashMap<
+            String,
+            crate::engine::vector::durable::SlotBindings,
+        > = std::collections::HashMap::new();
         let id_map_flush = {
             let id_map = self.vector_state.vector_id_map.lock_or_recover();
+            #[cfg(not(target_arch = "wasm32"))]
+            if !segment_candidates.is_empty() {
+                segment_bindings =
+                    crate::engine::vector::durable::slot_bindings(id_map.iter(), |index_key| {
+                        segment_candidates.contains(index_key)
+                    });
+                // A candidate with no binding at all still gets an entry: its
+                // segment is written with every slot stamped `TOMB`.
+                for name in &segment_candidates {
+                    segment_bindings.entry(name.clone()).or_default();
+                }
+            }
             match self
                 .flush_gens
                 .plan(FlushArtifact::HnswIdMap, ID_MAP_KEY, full)
@@ -458,12 +497,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
         //   - vector data → pagedb segment (written after batch_write)
         // Otherwise (WASM or legacy backends):
         //   - full checkpoint blob → B+ tree (checkpoint_to_bytes)
-        #[cfg(not(target_arch = "wasm32"))]
-        let seg_ext = self.storage.as_vector_segment_ext();
+        //
         // Each collection's graph blob and vector segment is written only when
-        // dirty. Both generations are captured here, under the index lock: a
-        // graph mutation after this point, or a durable vector row written
-        // after it, leaves the artifact dirty for the next flush.
+        // dirty. Both generations are captured here, under the index lock, and
+        // both payloads are built under the same lock: a graph mutation after
+        // this point, or a durable vector row written after it, leaves the
+        // artifact dirty for the next flush.
         #[cfg_attr(
             target_arch = "wasm32",
             allow(unused_variables, clippy::type_complexity)
@@ -494,7 +533,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
             let mut graph_flushes: Vec<ArtifactFlush> = Vec::new();
             // Mutated only via the native segment-ext path, compiled out on wasm32.
             #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-            let mut segment_flushes: Vec<ArtifactFlush> = Vec::new();
+            // Each entry is (plan, (dim, vectors, stamps)).
+            let mut segment_flushes: Vec<(
+                ArtifactFlush,
+                (usize, Vec<Vec<f32>>, Vec<u64>),
+            )> = Vec::new();
             for (name, index) in indices.iter() {
                 let key = format!("hnsw:{name}");
                 let graph_plan = self.flush_gens.plan(FlushArtifact::HnswGraph, name, full);
@@ -502,6 +545,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     if seg_ext.is_some() {
+                        let graph_dirty = graph_plan.is_some();
                         if let Some(planned) = graph_plan {
                             // Graph-only blob (vector bytes are empty placeholders).
                             let graph_bytes = index.graph_checkpoint_to_bytes().map_err(|e| {
@@ -514,16 +558,48 @@ impl<S: StorageEngine> NodeDbLite<S> {
                             });
                             graph_flushes.push(planned);
                         }
-                        // The segment payload is sourced from the DURABLE vectors
-                        // after this lock is released, NOT from `index` — see
-                        // `engine::vector::durable::segment_payload`. Reading it
-                        // from the index would serialize empty vectors whenever
-                        // the index was restored from a graph-only checkpoint.
-                        if let Some(planned) =
-                            self.flush_gens
-                                .plan(FlushArtifact::VectorSegment, name, full)
+                        // The segment is built from `index` in node order, here
+                        // under the lock the graph blob is serialized under, so
+                        // its vectors and stamps describe exactly that graph.
+                        // See `engine::vector::durable::segment_payload_from_index`.
+                        // A dirty graph rewrites the segment too: a graph whose
+                        // nodes changed no longer matches the stored segment.
+                        // A collection that became dirty after its bindings
+                        // were read has none here and stays dirty.
+                        if let Some(planned) = self.flush_gens.plan(
+                            FlushArtifact::VectorSegment,
+                            name,
+                            full || graph_dirty,
+                        ) && let Some(bindings) = segment_bindings.get(name)
                         {
-                            segment_flushes.push(planned);
+                            if let Some(slot) =
+                                crate::engine::vector::durable::unbound_live_slot(index, bindings)
+                            {
+                                // An insert is between its index write and its
+                                // bind. The segment stays dirty and the next
+                                // flush stamps it with the bind in place.
+                                tracing::debug!(
+                                    collection = %name,
+                                    slot,
+                                    "vector segment deferred: a live node is not bound yet"
+                                );
+                            } else {
+                                match crate::engine::vector::durable::segment_payload_from_index(
+                                    index, bindings,
+                                ) {
+                                    Ok(payload) => segment_flushes.push((planned, payload)),
+                                    Err(e) => {
+                                        // Not planned as written, so it stays
+                                        // dirty and the stored segment is kept.
+                                        tracing::error!(
+                                            collection = %name,
+                                            error = %e,
+                                            "building the vector segment failed; \
+                                             leaving the existing segment in place"
+                                        );
+                                    }
+                                }
+                            }
                         }
                     } else if let Some(planned) = graph_plan {
                         // Non-pagedb native backend: full checkpoint blob path.
@@ -606,43 +682,16 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         // ── Write HNSW vector segments to pagedb (native PagedbStorage only) ──
         //
-        // Only collections whose durable rows changed since their segment was
-        // last written are planned. A segment is marked flushed only after its
-        // write succeeds; every error branch below leaves it dirty, so the
-        // next flush retries it.
+        // Only collections whose durable rows or graph changed since their
+        // segment was last written are planned, with the payload built when
+        // they were planned. A segment is marked flushed only after its write
+        // succeeds; the error branch below leaves it dirty, so the next flush
+        // retries it.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ext) = seg_ext {
-            for planned in &segment_flushes {
+            for (planned, (dim, vectors, stamps)) in &segment_flushes {
                 let name = planned.key();
-                let payload =
-                    match crate::engine::vector::durable::segment_payload(&*self.storage, name)
-                        .await
-                    {
-                        Ok(Some(p)) => p,
-                        // No durable vectors: nothing to publish. Leaving the
-                        // existing segment untouched is deliberate — replacing it
-                        // with an empty one is exactly the corruption this fixes.
-                        // That outcome is final for this generation, so it is
-                        // recorded; a later durable row makes it dirty again.
-                        Ok(None) => {
-                            self.flush_gens.mark_flushed(planned);
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                collection = %name,
-                                error = %e,
-                                "reading durable vectors for the segment write failed; \
-                                 leaving the existing segment in place"
-                            );
-                            continue;
-                        }
-                    };
-                let (dim, vectors, surrogates) = payload;
-                match ext
-                    .write_vector_segment(name, dim, &vectors, &surrogates)
-                    .await
-                {
+                match ext.write_vector_segment(name, *dim, vectors, stamps).await {
                     Ok(()) => {
                         self.flush_gens.mark_flushed(planned);
                         self.flush_gens.record_write(planned);

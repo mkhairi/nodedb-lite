@@ -27,6 +27,18 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A reopened or lazily reloaded HNSW index no longer attaches the wrong
+  vector to its nodes. The vector segment was built from the durable rows in
+  document-id key order, but the graph numbers nodes in insertion order. When
+  the two orders differed, search returned wrong results with no error. The
+  segment is now built from the index in node order. Each slot carries a
+  stamp of its bound document id, or a tombstone marker for an unbound slot.
+  Open and lazy-load check every stamp against the id-map before they attach
+  the segment, and rebuild from the durable rows on any mismatch. A segment
+  written before this fix has no stamps, so it is rebuilt once and rewritten
+  by the next flush. `TRUNCATE` and `DropIndex` now unlink the stored segment,
+  so a stale one cannot attach after the same ids are inserted again.
+
 - `flush()` no longer rewrites unchanged HNSW artifacts on every tick. Each
   collection's graph checkpoint, the vector id-map, and each vector segment
   carry a mutation generation and are written only when dirty. The

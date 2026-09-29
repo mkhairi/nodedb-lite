@@ -9,6 +9,8 @@ use nodedb_types::Namespace;
 use nodedb_types::error::NodeDbResult;
 
 use crate::engine::vector::VectorState;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::engine::vector::durable;
 use crate::engine::vector::graph::HnswIndex;
 use crate::engine::vector::sidecar;
 use crate::nodedb::lock_ext::LockExt;
@@ -101,24 +103,42 @@ pub(super) async fn ensure_index_loaded<S: StorageEngine>(
             Ok(Some(backing)) => {
                 use std::sync::Arc;
                 // A segment that reads but cannot serve this index's nodes is
-                // refused by `with_backing` — otherwise the graph would look
-                // healthy and every query would score a vectorless node.
-                match index.with_backing(Arc::new(backing)) {
-                    Ok(_) => {
-                        tracing::debug!(
-                            index_key,
-                            "lazy-load: attached pagedb vector segment backing"
-                        );
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            index_key,
-                            error = %e,
-                            "lazy-load: vector segment cannot serve this index \
-                             (empty or short payload); rebuilding from durable vectors"
-                        );
-                        false
+                // refused — otherwise the graph would look healthy and every
+                // query would score a vectorless node, or the wrong vector.
+                // The stamp check refuses slots that are not in this graph's
+                // node order; `with_backing` refuses a short or mis-sized one.
+                let bindings = {
+                    let map = vector_state.vector_id_map.lock_or_recover();
+                    durable::slot_bindings(map.iter(), |k| k == index_key)
+                        .remove(index_key)
+                        .unwrap_or_default()
+                };
+                if let Err(mismatch) = durable::verify_segment_stamps(&index, &bindings, &backing) {
+                    tracing::warn!(
+                        index_key,
+                        reason = %mismatch,
+                        "lazy-load: vector segment does not match this index's node order; \
+                         rebuilding from durable vectors"
+                    );
+                    false
+                } else {
+                    match index.with_backing(Arc::new(backing)) {
+                        Ok(_) => {
+                            tracing::debug!(
+                                index_key,
+                                "lazy-load: attached pagedb vector segment backing"
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                index_key,
+                                error = %e,
+                                "lazy-load: vector segment cannot serve this index \
+                                 (empty or short payload); rebuilding from durable vectors"
+                            );
+                            false
+                        }
                     }
                 }
             }

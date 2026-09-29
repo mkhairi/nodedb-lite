@@ -8,6 +8,8 @@ use std::sync::Arc;
 use nodedb_types::Namespace;
 use nodedb_types::error::NodeDbResult;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::engine::vector::durable;
 use crate::engine::vector::graph::HnswIndex;
 use crate::nodedb::flush_gens::{FlushArtifact, FlushGens, ID_MAP_KEY};
 use crate::storage::engine::StorageEngine;
@@ -105,6 +107,46 @@ impl<S: StorageEngine> NodeDbLite<S> {
             return Ok((hnsw_indices, HashMap::new(), loaded_clean));
         }
 
+        // ── Restore vector_id_map ──
+        // The blob is written by `flush` and contains the full flat map.
+        // Without this, vector_search returns HNSW integer strings after restart.
+        // Read before the indexes: a vector segment is checked against these
+        // slot bindings before it is attached.
+        let id_map: VectorIdMap = match storage
+            .get(Namespace::Vector, b"hnsw_id_map")
+            .await
+            .unwrap_or(None)
+        {
+            Some(envelope) => match crate::storage::checksum::unwrap(&envelope) {
+                Some(bytes) => match zerompk::from_msgpack::<Vec<(String, String, u32)>>(&bytes) {
+                    Ok(entries) => {
+                        loaded_clean.id_map = true;
+                        entries
+                            .into_iter()
+                            .map(|(k, doc_id, iid)| (k, (doc_id, iid)))
+                            .collect()
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "vector_id_map deserialization failed — \
+                             vector search will fall back to HNSW integer IDs until next flush"
+                        );
+                        HashMap::new()
+                    }
+                },
+                None => {
+                    tracing::error!(
+                        "vector_id_map CRC32C mismatch — discarding. \
+                         Vector search will fall back to HNSW integer IDs until next flush."
+                    );
+                    let _ = storage.delete(Namespace::Vector, b"hnsw_id_map").await;
+                    HashMap::new()
+                }
+            },
+            None => HashMap::new(),
+        };
+
         // On native targets, check if vector segment operations are available.
         // When yes, the graph blob has empty vector placeholders; we load the
         // backing from the pagedb segment and attach it to the restored index.
@@ -146,26 +188,45 @@ impl<S: StorageEngine> NodeDbLite<S> {
                                         // A segment that READS but cannot serve the
                                         // index's nodes is the dangerous case: the
                                         // graph looks healthy, so every later query
-                                        // scores a node with no vector. `with_backing`
-                                        // validates and refuses, so this rebuilds too.
-                                        match index.with_backing(Arc::new(backing)) {
-                                            Ok(_) => {
-                                                tracing::debug!(
-                                                    collection = %name,
-                                                    "HNSW restored with pagedb vector segment backing"
-                                                );
-                                                loaded_clean.segments.push(name.clone());
-                                                true
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    collection = %name,
-                                                    error = %e,
-                                                    "vector segment cannot serve this index \
-                                                     (empty or short payload); rebuilding HNSW \
-                                                     from durable vectors"
-                                                );
-                                                false
+                                        // scores a node with no vector. The stamp
+                                        // check refuses a segment whose slots are not
+                                        // in this graph's node order, and
+                                        // `with_backing` refuses one that is too short
+                                        // or the wrong dimension. Both rebuild.
+                                        let bindings =
+                                            durable::slot_bindings(id_map.iter(), |k| k == name)
+                                                .remove(name)
+                                                .unwrap_or_default();
+                                        if let Err(mismatch) = durable::verify_segment_stamps(
+                                            &index, &bindings, &backing,
+                                        ) {
+                                            tracing::warn!(
+                                                collection = %name,
+                                                reason = %mismatch,
+                                                "vector segment does not match this index's \
+                                                 node order; rebuilding HNSW from durable vectors"
+                                            );
+                                            false
+                                        } else {
+                                            match index.with_backing(Arc::new(backing)) {
+                                                Ok(_) => {
+                                                    tracing::debug!(
+                                                        collection = %name,
+                                                        "HNSW restored with pagedb vector segment backing"
+                                                    );
+                                                    loaded_clean.segments.push(name.clone());
+                                                    true
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        collection = %name,
+                                                        error = %e,
+                                                        "vector segment cannot serve this index \
+                                                         (empty or short payload); rebuilding HNSW \
+                                                         from durable vectors"
+                                                    );
+                                                    false
+                                                }
                                             }
                                         }
                                     }
@@ -239,44 +300,6 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 rebuild_into(storage, name, None, &mut hnsw_indices, &mut rebuilt_id_maps).await;
             }
         }
-
-        // ── Restore vector_id_map ──
-        // The blob is written by `flush` and contains the full flat map.
-        // Without this, vector_search returns HNSW integer strings after restart.
-        let id_map = match storage
-            .get(Namespace::Vector, b"hnsw_id_map")
-            .await
-            .unwrap_or(None)
-        {
-            Some(envelope) => match crate::storage::checksum::unwrap(&envelope) {
-                Some(bytes) => match zerompk::from_msgpack::<Vec<(String, String, u32)>>(&bytes) {
-                    Ok(entries) => {
-                        loaded_clean.id_map = true;
-                        entries
-                            .into_iter()
-                            .map(|(k, doc_id, iid)| (k, (doc_id, iid)))
-                            .collect()
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "vector_id_map deserialization failed — \
-                             vector search will fall back to HNSW integer IDs until next flush"
-                        );
-                        HashMap::new()
-                    }
-                },
-                None => {
-                    tracing::error!(
-                        "vector_id_map CRC32C mismatch — discarding. \
-                         Vector search will fall back to HNSW integer IDs until next flush."
-                    );
-                    let _ = storage.delete(Namespace::Vector, b"hnsw_id_map").await;
-                    HashMap::new()
-                }
-            },
-            None => HashMap::new(),
-        };
 
         // Replace stale id-map entries for any rebuilt collection. Its internal
         // ids were reassigned during the rebuild, so keeping the persisted ones

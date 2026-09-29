@@ -351,6 +351,21 @@ where
             )
             .await;
 
+        // Stored vector segment. An index created again under this key and
+        // given the same ids in the same order would match its stamps and
+        // attach the dropped vectors.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ext) = vector_state.storage.as_vector_segment_ext()
+            && let Err(e) = ext.delete_vector_segment(&index_key).await
+        {
+            tracing::warn!(
+                index_key,
+                error = %e,
+                "DropIndex: removing the vector segment failed; a recreated index \
+                 with the same ids can attach its stale vectors"
+            );
+        }
+
         // Durable per-document vectors — see the doc comment above.
         match crate::engine::vector::durable::load_collection(&*vector_state.storage, &index_key)
             .await
