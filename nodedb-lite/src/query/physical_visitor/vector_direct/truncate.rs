@@ -142,6 +142,17 @@ async fn reset_index<S: StorageEngine>(
         .remove_index(index_key);
     vector_state.unloadable.lock_or_recover().remove(index_key);
     crate::engine::vector::sidecar::remove_sidecar(vector_state, index_key).await?;
+    // The stored vector segment holds the old vectors. Re-inserting the same
+    // ids binds them to the same slots again, so it would pass the attach
+    // check (slot count and order against the id-map) and serve the new
+    // graph with the old vectors. It is
+    // unlinked before the bump below, which leaves the graph dirty, and a
+    // dirty graph makes the next flush write the segment as well.
+    #[cfg(not(target_arch = "wasm32"))]
+    let segment_deleted = match vector_state.storage.as_vector_segment_ext() {
+        Some(ext) => ext.delete_vector_segment(index_key).await,
+        None => Ok(()),
+    };
     // The checkpoint describes the old graph; the next flush writes the
     // empty index in its place. The graph is marked dirty again after the
     // delete: a flush that ran between the reset above and this delete has
@@ -153,6 +164,8 @@ async fn reset_index<S: StorageEngine>(
     vector_state
         .flush_gens
         .bump(FlushArtifact::HnswGraph, index_key);
+    #[cfg(not(target_arch = "wasm32"))]
+    segment_deleted?;
     deleted
 }
 
