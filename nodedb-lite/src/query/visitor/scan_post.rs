@@ -3,6 +3,7 @@
 //! Post-processing for scan results: WHERE, ORDER BY, window functions,
 //! projection, DISTINCT, OFFSET, LIMIT.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -60,7 +61,8 @@ pub(crate) fn apply_scan_post_processing(
     apply_window_functions(&mut result, window_specs)?;
 
     // 4. Projection
-    project_scan_result(&mut result, projection, sequences)?;
+    let projection = window_served_projection(projection, window_specs);
+    project_scan_result(&mut result, &projection, sequences)?;
 
     // 5. DISTINCT — over the projected row.
     if distinct {
@@ -78,6 +80,38 @@ pub(crate) fn apply_scan_post_processing(
     }
 
     Ok(result)
+}
+
+/// `projection` with each computed item a window spec serves turned into a
+/// read of that spec's output column.
+///
+/// The planner lists a window call both as a `Computed` projection item and
+/// as a [`WindowSpec`] under the same alias. [`apply_window_functions`] has
+/// already appended the spec's column. The scalar evaluator has no window
+/// functions, so evaluating the item would refuse the statement. Origin's
+/// plan converter serves the same alias from its window spec.
+fn window_served_projection<'a>(
+    projection: &'a [Projection],
+    window_specs: &[WindowSpec],
+) -> Cow<'a, [Projection]> {
+    let served = |p: &Projection| {
+        matches!(p, Projection::Computed { expr: _, alias }
+            if window_specs.iter().any(|spec| spec.alias == *alias))
+    };
+    if !projection.iter().any(served) {
+        return Cow::Borrowed(projection);
+    }
+    Cow::Owned(
+        projection
+            .iter()
+            .map(|p| match p {
+                Projection::Computed { expr: _, alias } if served(p) => {
+                    Projection::Column(alias.clone())
+                }
+                other => other.clone(),
+            })
+            .collect(),
+    )
 }
 
 /// Inputs of [`apply_scan_post_processing`].
