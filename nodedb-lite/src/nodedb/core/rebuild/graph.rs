@@ -65,9 +65,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                     continue;
                 }
 
-                let csr = csr_map
-                    .entry(collection.to_string())
-                    .or_insert_with(|| CsrIndex::new(memory.clone()));
+                let csr = csr_map.get_or_insert_with(collection, || CsrIndex::new(memory.clone()));
 
                 for id in &ids {
                     if let Some(loro_val) = crdt.read(crdt_coll, id) {
@@ -137,9 +135,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 if indexed.contains(&tuple) {
                     continue;
                 }
-                let csr = csr_map
-                    .entry(collection.to_string())
-                    .or_insert_with(|| CsrIndex::new(memory.clone()));
+                let csr = csr_map.get_or_insert_with(collection, || CsrIndex::new(memory.clone()));
                 let _ = csr.add_edge(src, label, dst);
                 indexed.insert(tuple);
             }
@@ -207,9 +203,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             // different format and are already covered by Pass 2.
             let memory = self.memory_for(nodedb_mem::EngineId::Graph);
             let mut csr_map = self.csr.lock_or_recover();
-            let csr = csr_map
-                .entry(collection.to_string())
-                .or_insert_with(|| CsrIndex::new(memory));
+            let csr = csr_map.get_or_insert_with(collection, || CsrIndex::new(memory));
 
             for (edge_key, system_to) in &edge_latest_system_to {
                 if *system_to != SYSTEM_TO_CURRENT {

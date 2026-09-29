@@ -12,7 +12,7 @@
 //! "still current".
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use nodedb_graph::params::{AlgoParams, GraphAlgorithm};
 use nodedb_mem::ScopedMemory;
@@ -23,6 +23,7 @@ use nodedb_types::value::Value;
 
 use crate::engine::graph::index::CsrIndex;
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::{FlushArtifact, FlushGens, TrackedMap};
 use crate::storage::engine::StorageEngine;
 
 use super::algorithms;
@@ -172,7 +173,7 @@ pub struct TemporalNeighborsParams<'a> {
 /// Handle `GraphOp::TemporalNeighbors`.
 pub async fn temporal_neighbors<S: StorageEngine>(
     storage: &Arc<S>,
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     memory: &ScopedMemory,
     params: TemporalNeighborsParams<'_>,
 ) -> Result<QueryResult, LiteError> {
@@ -220,7 +221,7 @@ pub async fn temporal_neighbors<S: StorageEngine>(
 /// Handle `GraphOp::TemporalAlgorithm`.
 pub async fn temporal_algorithm<S: StorageEngine>(
     storage: &Arc<S>,
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     memory: &ScopedMemory,
     algorithm: GraphAlgorithm,
     params: &AlgoParams,
@@ -233,10 +234,15 @@ pub async fn temporal_algorithm<S: StorageEngine>(
 
     let snapshot = build_temporal_snapshot(storage, &params.collection, as_of, memory).await?;
 
-    // Wrap snapshot in a temporary map so run_algo can borrow it.
+    // Wrap snapshot in a temporary map so run_algo can borrow it. The map is
+    // never flushed, so its generations are private to it.
     let mut tmp_map = HashMap::new();
     tmp_map.insert(params.collection.clone(), snapshot);
-    let tmp_arc = Arc::new(Mutex::new(tmp_map));
+    let tmp_arc = Arc::new(TrackedMap::new(
+        tmp_map,
+        Arc::new(FlushGens::default()),
+        FlushArtifact::CsrGraph,
+    ));
     algorithms::run_algo(&tmp_arc, algorithm, params)
 }
 

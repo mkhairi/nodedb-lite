@@ -8,7 +8,6 @@
 //! - Two-source (vector + graph expansion): `bm25_query` is `None`.
 //! - Degenerate (pure vector top-k): `expansion_depth == 0` and no BM25.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nodedb_graph::traversal::DEFAULT_MAX_VISITED;
@@ -26,6 +25,7 @@ use crate::engine::vector::search::{
     AnnTuning, SearchFilter, VectorSearchRequest, run_vector_search,
 };
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::TrackedMap;
 use crate::storage::engine::StorageEngine;
 
 /// Parameters of a `GraphOp::RagFusion` query.
@@ -55,7 +55,7 @@ pub async fn rag_fusion<S: StorageEngine>(
     vector_state: &Arc<VectorState<S>>,
     crdt: &Arc<Mutex<CrdtEngine>>,
     fts_state: &Arc<FtsState>,
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     collection: &str,
     spec: RagFusionSpec<'_>,
 ) -> Result<QueryResult, LiteError> {
@@ -339,7 +339,7 @@ mod tests {
             fts_state,
             sparse_state: Arc::new(crate::engine::sparse_vector::SparseVectorState::new()),
             spatial,
-            csr: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            csr: crate::query::engine::test_csr_map(std::collections::HashMap::new()),
             governor,
             kv_local: crate::query::engine::test_kv_local(),
         })
