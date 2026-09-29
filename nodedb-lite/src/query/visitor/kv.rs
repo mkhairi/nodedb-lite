@@ -162,6 +162,8 @@ pub(super) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
                 surrogate: Surrogate::ZERO,
                 returning: None,
                 rls_filters: Vec::new(),
+                // A local SQL write, not a sync push.
+                provenance: None,
             },
         };
         ops.push(op);

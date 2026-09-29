@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Mutating `KvOp` arms: put/insert/delete/increment/CAS/transfer.
 
-use nodedb_physical::physical_plan::{ReturningSpec, UpdateValue};
+use nodedb_physical::physical_plan::{KvCounterShape, ReturningSpec, UpdateValue};
 use nodedb_types::{QualifiedCollection, RlsWriteCheck};
 
 use crate::error::LiteError;
@@ -213,8 +213,10 @@ pub(super) fn incr<'a, S: StorageEngine + 'a>(
     delta: i64,
     ttl_ms: u64,
     rls_write_check: &RlsWriteCheck,
+    shape: &KvCounterShape,
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
     deny_policy("KvOp::Incr", None, &[], rls_write_check)?;
+    refuse_typed_shape("KvOp::Incr", collection, shape)?;
     let col = collection.clone();
     let k = key.to_vec();
     Ok(Box::pin(async move {
@@ -226,15 +228,46 @@ pub(super) fn incr_float<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     collection: &QualifiedCollection,
     key: &[u8],
-    delta: f64,
+    delta: &str,
     rls_write_check: &RlsWriteCheck,
+    shape: &KvCounterShape,
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
     deny_policy("KvOp::IncrFloat", None, &[], rls_write_check)?;
+    refuse_typed_shape("KvOp::IncrFloat", collection, shape)?;
+    // The plan carries the client's decimal text. Lite stores the counter
+    // as an f64, so it parses the text once here.
+    let delta: f64 = delta.parse().map_err(|_| LiteError::BadRequest {
+        detail: format!("KvOp::IncrFloat: increment {delta:?} is not a decimal number"),
+    })?;
+    if !delta.is_finite() {
+        return Err(LiteError::BadRequest {
+            detail: format!("KvOp::IncrFloat: increment {delta} is not finite"),
+        });
+    }
     let col = collection.clone();
     let k = key.to_vec();
     Ok(Box::pin(async move {
         kv_ops::writes::kv_incr_float(engine, col.as_str(), &k, delta).await
     }))
+}
+
+/// Lite honours [`KvCounterShape::Raw`] with its own bare-number counter
+/// and refuses a typed shape.
+fn refuse_typed_shape(
+    op: &str,
+    collection: &QualifiedCollection,
+    shape: &KvCounterShape,
+) -> Result<(), LiteError> {
+    match shape {
+        KvCounterShape::Raw => Ok(()),
+        KvCounterShape::Typed {
+            column: _,
+            template: _,
+        } => Err(super::unsupported::typed_counter_shape(
+            op,
+            collection.as_str(),
+        )),
+    }
 }
 
 pub(super) fn cas<'a, S: StorageEngine + 'a>(

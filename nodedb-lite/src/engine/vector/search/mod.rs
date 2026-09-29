@@ -23,6 +23,23 @@ use crate::nodedb::convert::loro_value_to_document;
 use crate::nodedb::lock_ext::LockExt;
 use crate::storage::engine::StorageEngine;
 
+/// Map an HNSW search refusal to the Lite error a caller can act on.
+///
+/// Bad caller input (a query of the wrong dimension, an undecodable filter)
+/// is a bad request. Everything else is a fault in the stored index.
+fn vector_search_error(e: nodedb_vector::VectorError) -> LiteError {
+    match e {
+        nodedb_vector::VectorError::DimensionMismatch { .. }
+        | nodedb_vector::VectorError::InvalidFilterBitmap { .. }
+        | nodedb_vector::VectorError::InvalidInput { .. } => LiteError::BadRequest {
+            detail: e.to_string(),
+        },
+        other => LiteError::Storage {
+            detail: format!("vector search: {other}"),
+        },
+    }
+}
+
 /// Run a vector similarity search against the named HNSW index.
 ///
 /// `index_key` is the HNSW bucket key (e.g. `"collection"` or
@@ -180,6 +197,7 @@ where
     } else {
         index.search(query, fetch_k, ef_search)
     };
+    let raw_results = raw_results.map_err(vector_search_error)?;
 
     // ── Shared rerank (FP32 exact distance, Matryoshka-truncation aware) ──────
 

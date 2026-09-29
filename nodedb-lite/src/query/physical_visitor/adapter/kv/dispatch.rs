@@ -67,15 +67,19 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             surrogate: _,
             returning,
             rls_filters,
-        } => writes::put(
-            engine,
-            collection,
-            key,
-            value,
-            *ttl_ms,
-            returning,
-            rls_filters,
-        ),
+            provenance,
+        } => {
+            unsupported::refuse_sync_provenance("KvOp::Put", provenance)?;
+            writes::put(
+                engine,
+                collection,
+                key,
+                value,
+                *ttl_ms,
+                returning,
+                rls_filters,
+            )
+        }
 
         KvOp::Insert {
             collection,
@@ -143,14 +147,18 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             rls_write_check,
             returning,
             rls_filters,
-        } => writes::delete(
-            engine,
-            collection,
-            keys,
-            rls_write_check,
-            returning,
-            rls_filters,
-        ),
+            provenance,
+        } => {
+            unsupported::refuse_sync_provenance("KvOp::Delete", provenance)?;
+            writes::delete(
+                engine,
+                collection,
+                keys,
+                rls_write_check,
+                returning,
+                rls_filters,
+            )
+        }
 
         KvOp::BatchPut {
             collection,
@@ -186,7 +194,16 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             ttl_ms,
             surrogate: _,
             rls_write_check,
-        } => writes::incr(engine, collection, key, *delta, *ttl_ms, rls_write_check),
+            shape,
+        } => writes::incr(
+            engine,
+            collection,
+            key,
+            *delta,
+            *ttl_ms,
+            rls_write_check,
+            shape,
+        ),
 
         KvOp::IncrFloat {
             collection,
@@ -194,7 +211,8 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             delta,
             surrogate: _,
             rls_write_check,
-        } => writes::incr_float(engine, collection, key, *delta, rls_write_check),
+            shape,
+        } => writes::incr_float(engine, collection, key, delta, rls_write_check, shape),
 
         KvOp::Cas {
             collection,
@@ -340,6 +358,19 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             index_name,
             primary_key,
         } => indexes::sorted_index_score(engine, index_name, primary_key),
+
+        // A sorted-index read inside an explicit transaction block, answered
+        // from a tree folded with the transaction's staged writes. Lite has no
+        // per-transaction staging overlay to fold in.
+        KvOp::SortedIndexTxnRead {
+            collection,
+            index_name,
+            pending: _,
+            read: _,
+        } => Err(unsupported::sorted_index_txn_read(
+            collection.as_str(),
+            index_name,
+        )),
 
         // ResolveWrite/ResolvedWrite are the resolve-before-propose wire
         // shape Origin's cross-vshard write path uses to decide a policy

@@ -663,7 +663,9 @@ impl<S: StorageEngine> ColumnarEngine<S> {
             });
         }
 
-        match s.mutation.update(old_pk, new_values) {
+        // Lite never assigns cross-engine surrogates to columnar rows, and its
+        // segments carry no surrogate sidecar, so a flushed row has none to keep.
+        match s.mutation.update(old_pk, new_values, None) {
             Ok(_) => Ok(true),
             Err(nodedb_columnar::ColumnarError::PrimaryKeyNotFound) => Ok(false),
             Err(e) => Err(columnar_err_to_lite(e)),

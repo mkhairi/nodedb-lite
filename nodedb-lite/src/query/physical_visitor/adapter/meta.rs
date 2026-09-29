@@ -275,7 +275,22 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             }))
         }
         // ── Origin-only ops that Lite's plan converter never emits ───────────
-        MetaOp::CreateTenantSnapshot { tenant_id } => {
+        MetaOp::CreateTenantSnapshot {
+            tenant_id,
+            cut_watermark,
+        } => {
+            // A cut watermark is an Origin WAL LSN the receiving Control
+            // Plane settles before the snapshot. Lite has no such LSN space,
+            // so it cannot tell which writes lie below the watermark.
+            if let Some(watermark) = cut_watermark {
+                return Err(LiteError::Unsupported {
+                    detail: format!(
+                        "CreateTenantSnapshot with cut_watermark {watermark} asks for a \
+                         backup's consistent cut at an Origin WAL LSN; \
+                         unsupported on the single-node Lite engine"
+                    ),
+                });
+            }
             let tid = *tenant_id;
             let storage = engine.storage.clone();
             Ok(Box::pin(async move {
@@ -354,6 +369,20 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }),
         MetaOp::RecordCalvinWriteVersions { .. } => Err(LiteError::Unsupported {
             detail: "RecordCalvinWriteVersions maintains the cluster write-version registry; \
+                     unsupported on the single-node Lite engine"
+                .into(),
+        }),
+
+        // A committed transaction's redo record, installed by every replica
+        // from its vShard's data-group Raft log. Lite executes a transaction
+        // directly through `TransactionBatch` and has no redo log to apply.
+        MetaOp::ApplyTransactionRedo {
+            redo: _,
+            collections: _,
+            sum_targets: _,
+            origin: _,
+        } => Err(LiteError::Unsupported {
+            detail: "ApplyTransactionRedo installs a replicated transaction redo record; \
                      unsupported on the single-node Lite engine"
                 .into(),
         }),
