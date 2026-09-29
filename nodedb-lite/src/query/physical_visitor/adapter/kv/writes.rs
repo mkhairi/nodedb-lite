@@ -235,15 +235,13 @@ pub(super) fn incr_float<'a, S: StorageEngine + 'a>(
     deny_policy("KvOp::IncrFloat", None, &[], rls_write_check)?;
     refuse_typed_shape("KvOp::IncrFloat", collection, shape)?;
     // The plan carries the client's decimal text. Lite stores the counter
-    // as an f64, so it parses the text once here.
-    let delta: f64 = delta.parse().map_err(|_| LiteError::BadRequest {
-        detail: format!("KvOp::IncrFloat: increment {delta:?} is not a decimal number"),
+    // as an f64, so it parses the text once here, by Origin's rule: a
+    // delta that is not a decimal number or overflows f64 is refused.
+    let delta = nodedb_physical::kv_atomic::float_text::delta_to_f64(delta).map_err(|e| {
+        LiteError::BadRequest {
+            detail: format!("KvOp::IncrFloat: increment {delta:?}: {e}"),
+        }
     })?;
-    if !delta.is_finite() {
-        return Err(LiteError::BadRequest {
-            detail: format!("KvOp::IncrFloat: increment {delta} is not finite"),
-        });
-    }
     let col = collection.clone();
     let k = key.to_vec();
     Ok(Box::pin(async move {

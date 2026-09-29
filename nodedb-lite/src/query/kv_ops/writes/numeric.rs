@@ -119,7 +119,14 @@ pub async fn kv_incr_float<S: StorageEngine>(
         }
     };
 
+    // A NaN or infinite result is a counter fault (nodedb-physical `KvOp::IncrFloat`).
+    // Storing it would leave a counter no later increment can repair.
     let new_val = current + delta;
+    if !new_val.is_finite() {
+        return Err(LiteError::BadRequest {
+            detail: format!("IncrFloat: {current} + {delta} is not a finite number"),
+        });
+    }
     let new_user_bytes =
         zerompk::to_msgpack_vec(&new_val).map_err(|e| LiteError::Serialization {
             detail: format!("IncrFloat encode: {e}"),
@@ -241,4 +248,37 @@ pub async fn kv_get_set<S: StorageEngine>(
         rows_affected: 1,
         command: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::engine::test_engine;
+
+    #[tokio::test]
+    async fn incr_float_refuses_a_sum_that_overflows_to_infinity() {
+        let engine = test_engine().await;
+        kv_incr_float(&engine, "kvnum", b"big", 1e308)
+            .await
+            .expect("seed near f64::MAX");
+
+        let err = kv_incr_float(&engine, "kvnum", b"big", 1e308)
+            .await
+            .expect_err("1e308 + 1e308 overflows to inf");
+        assert!(
+            matches!(err, LiteError::BadRequest { detail: _ }),
+            "overflow is a bad request, got {err:?}"
+        );
+
+        // The refused write left the stored counter untouched.
+        let raw = engine
+            .storage
+            .get(Namespace::Kv, &kv_key("kvnum", b"big"))
+            .await
+            .expect("storage get")
+            .expect("counter still stored");
+        let (_, user) = decode_value(&raw).expect("decode");
+        let stored: f64 = zerompk::from_msgpack(user).expect("stored f64");
+        assert_eq!(stored, 1e308);
+    }
 }

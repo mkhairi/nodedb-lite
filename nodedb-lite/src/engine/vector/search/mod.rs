@@ -25,17 +25,50 @@ use crate::storage::engine::StorageEngine;
 
 /// Map an HNSW search refusal to the Lite error a caller can act on.
 ///
-/// Bad caller input (a query of the wrong dimension, an undecodable filter)
-/// is a bad request. Everything else is a fault in the stored index.
+/// Bad caller input (a query of the wrong dimension, an undecodable filter,
+/// unusable parameters) is a bad request. Every other variant is a fault in
+/// the stored index and maps to `Storage`, never `Corrupted`: the search did
+/// not read a corrupt page, so the store must not be renamed aside.
+///
+/// Every variant this build knows is named. `VectorError` is
+/// `#[non_exhaustive]`, so stable Rust requires the last wildcard arm and a
+/// new upstream variant cannot be a compile error here. It lands in
+/// `Storage`, the safe side: a caller never retries it as its own mistake.
 fn vector_search_error(e: nodedb_vector::VectorError) -> LiteError {
+    use nodedb_vector::VectorError as E;
     match e {
-        nodedb_vector::VectorError::DimensionMismatch { .. }
-        | nodedb_vector::VectorError::InvalidFilterBitmap { .. }
-        | nodedb_vector::VectorError::InvalidInput { .. } => LiteError::BadRequest {
+        E::DimensionMismatch {
+            expected: _,
+            got: _,
+        }
+        | E::InvalidFilterBitmap { detail: _ }
+        | E::InvalidInput { detail: _ } => LiteError::BadRequest {
             detail: e.to_string(),
         },
-        other => LiteError::Storage {
-            detail: format!("vector search: {other}"),
+        E::BudgetExhausted(_)
+        | E::StoredDimensionMismatch {
+            expected: _,
+            got: _,
+        }
+        | E::VectorUnavailable { id: _ }
+        | E::VectorDecodeFailed { id: _, detail: _ }
+        | E::UnsupportedVersion {
+            found: _,
+            expected: _,
+        }
+        | E::InvalidMagic
+        | E::DeserializationFailed(_)
+        | E::CheckpointEncryptedNoKey
+        | E::CheckpointPlaintextKeyRequired
+        | E::CheckpointEncryptionError { detail: _ }
+        | E::CheckpointSerializationError { detail: _ }
+        | E::CheckpointDeserializationError { detail: _ }
+        | E::SegmentIo(_) => LiteError::Storage {
+            detail: format!("vector search: {e}"),
+        },
+        // `#[non_exhaustive]`: a variant added upstream after this build.
+        unknown => LiteError::Storage {
+            detail: format!("vector search: {unknown}"),
         },
     }
 }
