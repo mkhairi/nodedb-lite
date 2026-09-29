@@ -8,6 +8,7 @@ use nodedb_types::error::{NodeDbError, NodeDbResult};
 
 use crate::engine::crdt::{CrdtEngine, CrdtWriteKind};
 use crate::engine::fts::coordinator::TextMutationPermit;
+use crate::nodedb::flush_gens::FlushArtifact;
 use crate::nodedb::lock_ext::LockExt;
 
 use super::super::types::{META_CRDT_DELTAS, META_LAST_FLUSHED_MID, NodeDbLite};
@@ -39,6 +40,23 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// that costs a mutation id rather than a payload.
     pub fn crdt_spilled_delta_count(&self) -> usize {
         self.crdt.lock_or_recover().spilled_pending_count()
+    }
+
+    /// Number of successful writes of `artifact` for `collection` since this
+    /// handle was opened.
+    ///
+    /// [`FlushArtifact::HnswIdMap`] is one store-wide blob: pass
+    /// [`ID_MAP_KEY`](crate::nodedb::ID_MAP_KEY) (the empty string) as its
+    /// collection. A counter, not a timing, so a caller can assert on it
+    /// directly: an idle store must not advance it.
+    pub fn flush_artifact_write_count(&self, artifact: FlushArtifact, collection: &str) -> u64 {
+        self.flush_gens.write_count(artifact, collection)
+    }
+
+    /// Whether `artifact` for `collection` holds mutations that no flush has
+    /// made durable yet.
+    pub fn flush_artifact_is_dirty(&self, artifact: FlushArtifact, collection: &str) -> bool {
+        self.flush_gens.is_dirty(artifact, collection)
     }
 
     /// Mutation ids of every queue entry currently stored under a `delta:` key.
@@ -131,12 +149,33 @@ impl<S: StorageEngine> NodeDbLite<S> {
     }
 
     /// Persist all in-memory state to storage (call before shutdown).
+    ///
+    /// Dirty-aware: an HNSW graph, the vector id-map, a vector segment, or a
+    /// meta entry that has not changed since this handle last made it durable
+    /// is not written again. [`flush_full`](Self::flush_full) writes all of
+    /// them regardless.
     pub async fn flush(&self) -> NodeDbResult<()> {
         let permit = self.fts_state.admit_exclusive().await;
         self.flush_admitted(&permit).await
     }
 
-    pub(crate) async fn flush_admitted(&self, _permit: &TextMutationPermit) -> NodeDbResult<()> {
+    /// Persist all in-memory state, writing every dirty-tracked artifact
+    /// whether or not it changed, then mark each one flushed.
+    ///
+    /// For callers that do not trust the stored form, e.g. after an external
+    /// tool touched the file. Artifacts outside the dirty tracking behave as in
+    /// [`flush`](Self::flush).
+    pub async fn flush_full(&self) -> NodeDbResult<()> {
+        let permit = self.fts_state.admit_exclusive().await;
+        self.flush_pass(&permit, true).await
+    }
+
+    pub(crate) async fn flush_admitted(&self, permit: &TextMutationPermit) -> NodeDbResult<()> {
+        self.flush_pass(permit, false).await
+    }
+
+    /// One flush pass. `full` ignores the dirty state of tracked artifacts.
+    async fn flush_pass(&self, _permit: &TextMutationPermit, full: bool) -> NodeDbResult<()> {
         // One flush at a time: the CRDT update sequence is allocated under the
         // `crdt` guard but committed after it is released, so concurrent
         // flushes would hand out the same numbers. See `flush_lock`.
@@ -151,6 +190,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         self.kv_flush_inner().await?;
 
         let mut ops = Vec::new();
+        // Meta entries queued in `ops`, recorded as written once the batch
+        // commits. An unchanged meta value is not written again.
+        let mut meta_writes: Vec<(&'static [u8], Vec<u8>)> = Vec::new();
 
         // Delta entries already on disk. Restore prefers these over the bulk
         // blob, so any one that is no longer pending — acknowledged by Origin,
@@ -291,20 +333,43 @@ impl<S: StorageEngine> NodeDbLite<S> {
             let index_flush = self.query_engine.indexes.stage_flush(&mut ops);
 
             // Write the last-flushed mutation_id for partial flush safety.
-            ops.push(WriteOp::Put {
-                ns: Namespace::Meta,
-                key: META_LAST_FLUSHED_MID.to_vec(),
-                value: max_mid.to_le_bytes().to_vec(),
-            });
+            // Skipped when it equals the value this handle last committed:
+            // rewriting it on an idle tick stores identical bytes.
+            let max_mid_bytes = max_mid.to_le_bytes().to_vec();
+            if full
+                || self
+                    .flush_gens
+                    .meta_changed(META_LAST_FLUSHED_MID, &max_mid_bytes)
+            {
+                ops.push(WriteOp::Put {
+                    ns: Namespace::Meta,
+                    key: META_LAST_FLUSHED_MID.to_vec(),
+                    value: max_mid_bytes.clone(),
+                });
+                meta_writes.push((META_LAST_FLUSHED_MID, max_mid_bytes));
+            }
 
             (persisted, written_deltas, index_flush)
         };
 
-        let jobs = self.stage_indexes(&mut ops)?;
+        let mut jobs = self.stage_indexes(&mut ops, full, &mut meta_writes)?;
         self.storage
             .batch_write(&ops)
             .await
             .map_err(NodeDbError::storage)?;
+
+        // The graph blobs, the id-map, and the meta entries in the batch are
+        // durable now. Record the generations captured when they were
+        // serialized, never the current ones: a mutation made since keeps its
+        // artifact dirty. A failed batch returned above, so nothing is marked
+        // and the next flush writes all of it again.
+        for planned in std::mem::take(&mut jobs.batched) {
+            self.flush_gens.mark_flushed(&planned);
+            self.flush_gens.record_write(&planned);
+        }
+        for (key, value) in meta_writes {
+            self.flush_gens.mark_meta_written(key, value);
+        }
 
         // The CRDT writes are durable now, so advance the frontiers and the
         // checkpoint accounting. Doing this only after the write means a failed
@@ -339,7 +404,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         self.query_engine.indexes.mark_flushed(index_flush);
 
         #[cfg(not(target_arch = "wasm32"))]
-        super::segments::write_segments(self.storage.as_ref(), jobs).await?;
+        super::segments::write_segments(self.storage.as_ref(), jobs, &self.flush_gens).await?;
         #[cfg(target_arch = "wasm32")]
         let _ = jobs;
 
