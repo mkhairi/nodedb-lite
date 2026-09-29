@@ -220,6 +220,15 @@ async fn scan_window_function_works() {
         .await
         .expect("window function must succeed");
     assert_eq!(r.rows.len(), 2, "window function must return all rows");
+    // The `rn` column is the window's output, not a NULL from scalar
+    // evaluation of the call.
+    let rn = r.columns.iter().position(|c| c == "rn").expect("rn column");
+    let mut numbers: Vec<Value> = r.rows.iter().map(|row| row[rn].clone()).collect();
+    numbers.sort_by_key(|v| match v {
+        Value::Integer(i) => *i,
+        other => panic!("rn must be an integer, got {other:?}"),
+    });
+    assert_eq!(numbers, vec![Value::Integer(1), Value::Integer(2)]);
 }
 
 #[tokio::test]
