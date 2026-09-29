@@ -265,11 +265,10 @@ mod tests {
         };
         use nodedb_types::Namespace;
         use std::collections::HashMap;
-        use std::sync::Mutex;
 
         let storage = Arc::new(PagedbStorageMem::open_in_memory().await?);
         let memory = crate::query::graph_ops::test_memory();
-        let csr = Arc::new(Mutex::new(HashMap::<String, CsrIndex>::new()));
+        let csr = crate::query::engine::test_csr_map(HashMap::<String, CsrIndex>::new());
         for dst in ["b", "empty"] {
             let mut fields = props(9).fields;
             fields.insert("sql_only".into(), Value::Bool(true));

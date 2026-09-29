@@ -150,9 +150,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
     /// Persist all in-memory state to storage (call before shutdown).
     ///
-    /// Dirty-aware: an HNSW graph, the vector id-map, a vector segment, or a
-    /// meta entry that has not changed since this handle last made it durable
-    /// is not written again. [`flush_full`](Self::flush_full) writes all of
+    /// Dirty-aware: an HNSW graph, the vector id-map, a vector segment, a CSR
+    /// graph checkpoint, or a meta entry that has not changed since this
+    /// handle last made it durable is not written again. [`flush_full`](Self::flush_full) writes all of
     /// them regardless.
     pub async fn flush(&self) -> NodeDbResult<()> {
         let permit = self.fts_state.admit_exclusive().await;

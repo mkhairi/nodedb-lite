@@ -9,7 +9,7 @@ use crate::{
 };
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
-/// Write the planned vector segments and the CSR segments.
+/// Write the planned vector segments and CSR graph segments.
 ///
 /// A vector segment is marked flushed only after its write succeeds. Every
 /// error returns before that, so the segment stays dirty and the next flush
@@ -41,10 +41,12 @@ pub(super) async fn write_segments<S: StorageEngine>(
         }
     }
     if let Some(ext) = storage.as_graph_segment_ext() {
-        for (name, checkpoint) in jobs.csr {
-            ext.write_graph_segment(&name, &checkpoint)
+        for (planned, checkpoint) in jobs.csr {
+            ext.write_graph_segment(planned.key(), &checkpoint)
                 .await
                 .map_err(NodeDbError::from)?;
+            flush_gens.mark_flushed(&planned);
+            flush_gens.record_write(&planned);
         }
     }
     Ok(())

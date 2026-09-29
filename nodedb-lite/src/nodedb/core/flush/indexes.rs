@@ -5,7 +5,7 @@
 use super::super::types::{META_CSR_COLLECTIONS, META_HNSW_COLLECTIONS};
 use crate::{
     nodedb::{
-        LockExt, NodeDbLite,
+        NodeDbLite,
         flush_gens::{ArtifactFlush, FlushArtifact, ID_MAP_KEY},
     },
     storage::engine::{StorageEngine, WriteOp},
@@ -16,8 +16,9 @@ use nodedb_types::{
 };
 
 pub(super) struct IndexJobs {
+    /// CSR graph segments due a write, each with the generation planned for it.
     #[cfg(not(target_arch = "wasm32"))]
-    pub csr: Vec<(String, Vec<u8>)>,
+    pub csr: Vec<(ArtifactFlush, Vec<u8>)>,
     /// Vector segments due a write, each with the generation planned for it.
     #[cfg(not(target_arch = "wasm32"))]
     pub vectors: Vec<(
@@ -51,44 +52,71 @@ impl<S: StorageEngine> NodeDbLite<S> {
         //   - B+ tree receives only the collection-name index (META_CSR_COLLECTIONS)
         // Otherwise (WASM or non-pagedb native backends):
         //   - CSR blob → B+ tree (Namespace::Graph, CRC32C wrapped)
+        //
+        // Each collection's checkpoint is serialized and written only when
+        // dirty. Its generation is captured here, under the CSR lock the bytes
+        // are serialized under, so an edge added after this point leaves the
+        // collection dirty for the next flush.
         #[cfg(not(target_arch = "wasm32"))]
         let graph_seg_ext = self.storage.as_graph_segment_ext();
         #[cfg(not(target_arch = "wasm32"))]
         let csr_segment_data;
         {
             let csr_map = self.csr.lock_or_recover();
-            let names: Vec<String> = csr_map.keys().cloned().collect();
+            // Sorted so the encoded list is a function of the set of names,
+            // not of the map's iteration order, and compares equal across
+            // ticks while the set is unchanged.
+            let mut entries: Vec<_> = csr_map.iter().collect();
+            entries.sort_by_key(|(name, _)| *name);
+            let names: Vec<String> = entries.iter().map(|(name, _)| (*name).clone()).collect();
             let names_bytes = zerompk::to_msgpack_vec(&names)
                 .map_err(|e| NodeDbError::serialization("msgpack", e))?;
-            ops.push(WriteOp::Put {
-                ns: Namespace::Meta,
-                key: META_CSR_COLLECTIONS.to_vec(),
-                value: names_bytes,
-            });
+            if full
+                || self
+                    .flush_gens
+                    .meta_changed(META_CSR_COLLECTIONS, &names_bytes)
+            {
+                ops.push(WriteOp::Put {
+                    ns: Namespace::Meta,
+                    key: META_CSR_COLLECTIONS.to_vec(),
+                    value: names_bytes.clone(),
+                });
+                meta_writes.push((META_CSR_COLLECTIONS, names_bytes));
+            }
 
-            // Mutated only via the native segment-ext path, compiled out on wasm32.
+            // Segments written after the batch, each marked flushed once its
+            // own write succeeds. Mutated only via the native segment-ext
+            // path, compiled out on wasm32.
             #[cfg(not(target_arch = "wasm32"))]
-            let mut segment_data: Vec<(String, Vec<u8>)> = Vec::new();
-            for (name, index) in csr_map.iter() {
+            let mut segment_data: Vec<(ArtifactFlush, Vec<u8>)> = Vec::new();
+            for (name, index) in entries {
+                let Some(planned) = self.flush_gens.plan(FlushArtifact::CsrGraph, name, full)
+                else {
+                    continue;
+                };
                 let checkpoint = index
                     .checkpoint_to_bytes()
                     .map_err(|e| NodeDbError::serialization("csr-checkpoint", e))?;
                 #[cfg(not(target_arch = "wasm32"))]
                 if graph_seg_ext.is_some() {
-                    segment_data.push((name.clone(), checkpoint));
+                    segment_data.push((planned, checkpoint));
                 } else {
                     ops.push(WriteOp::Put {
                         ns: Namespace::Graph,
                         key: format!("csr:{name}").into_bytes(),
                         value: crate::storage::checksum::wrap(&checkpoint),
                     });
+                    batched.push(planned);
                 }
                 #[cfg(target_arch = "wasm32")]
-                ops.push(WriteOp::Put {
-                    ns: Namespace::Graph,
-                    key: format!("csr:{name}").into_bytes(),
-                    value: crate::storage::checksum::wrap(&checkpoint),
-                });
+                {
+                    ops.push(WriteOp::Put {
+                        ns: Namespace::Graph,
+                        key: format!("csr:{name}").into_bytes(),
+                        value: crate::storage::checksum::wrap(&checkpoint),
+                    });
+                    batched.push(planned);
+                }
             }
             #[cfg(not(target_arch = "wasm32"))]
             {

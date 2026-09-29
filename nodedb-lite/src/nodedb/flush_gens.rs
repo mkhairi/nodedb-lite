@@ -38,6 +38,9 @@ pub enum FlushArtifact {
     /// A collection's pagedb vector segment. It is built from the durable
     /// vector rows, so it is dirty whenever those rows change.
     VectorSegment,
+    /// A collection's CSR adjacency checkpoint. A pagedb graph segment when
+    /// the storage has graph segments, a `csr:<collection>` blob otherwise.
+    CsrGraph,
 }
 
 /// Collection key the store-wide [`FlushArtifact::HnswIdMap`] is tracked under.
@@ -73,7 +76,8 @@ pub(crate) struct ArtifactFlush {
 
 impl ArtifactFlush {
     /// The collection this write belongs to.
-    // Read only by the vector segment write, which wasm32 does not have.
+    // Read only by the vector and graph segment writes, which wasm32 does not
+    // have.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn key(&self) -> &str {
         &self.key
@@ -244,8 +248,8 @@ impl FlushGens {
 /// the whole map bumps every key present when the guard drops, which can
 /// over-mark but never under-mark.
 ///
-/// `pub` only because the public `index_row` takes it; the module itself is
-/// crate-private.
+/// `pub` only because public functions (`index_row`, the graph ops) take it;
+/// the module itself is crate-private.
 #[derive(Debug)]
 pub struct TrackedMap<V> {
     inner: Mutex<HashMap<String, V>>,

@@ -28,6 +28,7 @@ use crate::engine::htap::HtapBridge;
 use crate::engine::sparse_vector::SparseVectorState;
 use crate::engine::strict::StrictEngine;
 use crate::engine::vector::{RestoredVectorState, VectorState};
+use crate::nodedb::flush_gens::{FlushArtifact, TrackedMap};
 use crate::nodedb::lock_ext::LockExt;
 use crate::storage::engine::StorageEngine;
 
@@ -206,7 +207,20 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .map_err(NodeDbError::storage)?;
         let array_state = Arc::new(tokio::sync::Mutex::new(array_engine));
 
-        let csr_arc = Arc::new(Mutex::new(csr));
+        // Every restored collection decoded from its stored segment or blob,
+        // so it starts clean. A collection `rebuild_graph_indices` adds below
+        // goes through the guard and starts dirty.
+        let csr_arc = Arc::new(TrackedMap::new(
+            std::collections::HashMap::new(),
+            Arc::clone(&flush_gens),
+            FlushArtifact::CsrGraph,
+        ));
+        {
+            let mut restored = csr_arc.lock_or_recover();
+            for (name, index) in csr {
+                restored.insert_clean(name, index);
+            }
+        }
         let query_engine =
             crate::query::LiteQueryEngine::new(crate::query::LiteQueryEngineParams {
                 crdt: Arc::clone(&crdt),
