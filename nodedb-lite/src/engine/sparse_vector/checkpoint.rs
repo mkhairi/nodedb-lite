@@ -2,8 +2,9 @@
 
 //! Checkpoint serialization and restoration for [`SparseVectorManager`].
 //!
-//! Persists every sparse inverted index so a cold open loads them directly —
-//! no rebuild pass over source documents is required.
+//! Persists the sparse inverted indexes so a cold open loads them directly —
+//! no rebuild pass over source documents is required. A flush writes only the
+//! indexes that changed since this handle last wrote them.
 //!
 //! ## Key layout under `Namespace::Vector`
 //!
@@ -23,11 +24,12 @@
 //!
 //! [`SparseVectorManager`]: super::manager::SparseVectorManager
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nodedb_types::Namespace;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
+use crate::nodedb::flush_gens::{ArtifactFlush, FlushArtifact, FlushGens};
 use crate::storage::engine::{StorageEngine, WriteOp};
 
 use super::index::SparseInvertedIndex;
@@ -43,7 +45,33 @@ fn documents_key(index_key: &str) -> String {
     format!("sparse:{index_key}:docs")
 }
 
-/// Serialize sparse index state into write ops.
+/// The sparse writes one flush plans.
+pub(crate) struct SparseFlush {
+    /// Puts for the dirty indexes and, when it changed, the index list.
+    pub(crate) ops: Vec<WriteOp>,
+    /// One plan per index put in `ops`. Mark each flushed once `ops` commits.
+    pub(crate) planned: Vec<ArtifactFlush>,
+    /// The index list put in `ops`, if any. Record it as written once `ops`
+    /// commits.
+    pub(crate) meta: Option<(&'static [u8], Vec<u8>)>,
+}
+
+/// Sparse index state restored from storage.
+pub(crate) struct RestoredSparse {
+    /// Every listed index. An index whose blob is absent or undecodable is
+    /// present and empty.
+    pub(crate) indices: HashMap<String, SparseInvertedIndex>,
+    /// Index keys whose document blob decoded. Only these match their stored
+    /// form.
+    pub(crate) decoded: HashSet<String>,
+}
+
+/// Serialize the sparse indexes a flush must write.
+///
+/// An index is written only when it is dirty or `full` is set. Its
+/// generation is captured by `FlushGens::plan`, so call this under the
+/// manager lock the indexes are read under. The index list is written only
+/// when it differs from the value this handle last wrote, or `full` is set.
 ///
 /// Pure and synchronous, so it is safe to call while holding the manager's
 /// mutex guard; the caller performs the I/O after releasing the lock.
@@ -53,20 +81,36 @@ fn documents_key(index_key: &str) -> String {
 /// previous checkpoint's contents.
 pub(crate) fn serialize_sparse(
     indices: &HashMap<String, SparseInvertedIndex>,
-) -> NodeDbResult<Vec<WriteOp>> {
-    let mut ops: Vec<WriteOp> = Vec::with_capacity(indices.len() + 1);
+    full: bool,
+    gens: &FlushGens,
+) -> NodeDbResult<SparseFlush> {
+    let mut ops: Vec<WriteOp> = Vec::new();
+    let mut planned: Vec<ArtifactFlush> = Vec::new();
+    let mut meta = None;
 
+    // Sorted so the encoded list is a function of the set of keys, not of
+    // the map's iteration order, and compares equal across ticks while the
+    // set is unchanged.
     let mut index_keys: Vec<String> = indices.keys().cloned().collect();
     index_keys.sort();
     let keys_bytes = zerompk::to_msgpack_vec(&index_keys)
         .map_err(|e| NodeDbError::serialization("msgpack", e))?;
-    ops.push(WriteOp::Put {
-        ns: Namespace::Vector,
-        key: INDEX_LIST_KEY.to_vec(),
-        value: keys_bytes,
-    });
+    if full || gens.meta_changed(INDEX_LIST_KEY, &keys_bytes) {
+        ops.push(WriteOp::Put {
+            ns: Namespace::Vector,
+            key: INDEX_LIST_KEY.to_vec(),
+            value: keys_bytes.clone(),
+        });
+        meta = Some((INDEX_LIST_KEY, keys_bytes));
+    }
 
-    for (index_key, index) in indices {
+    for index_key in &index_keys {
+        let Some(index) = indices.get(index_key) else {
+            continue;
+        };
+        let Some(plan) = gens.plan(FlushArtifact::SparseIndex, index_key, full) else {
+            continue;
+        };
         let documents: Vec<SerDocument> = index.documents();
         let bytes = zerompk::to_msgpack_vec(&documents)
             .map_err(|e| NodeDbError::serialization("msgpack", e))?;
@@ -75,9 +119,10 @@ pub(crate) fn serialize_sparse(
             key: documents_key(index_key).into_bytes(),
             value: bytes,
         });
+        planned.push(plan);
     }
 
-    Ok(ops)
+    Ok(SparseFlush { ops, planned, meta })
 }
 
 /// Write pre-serialized sparse index state to storage.
@@ -101,10 +146,9 @@ where
 /// distinguishes from a checkpoint that legitimately holds no documents — only
 /// the former warrants a rebuild from source documents. A corrupt blob for one
 /// index is logged and that index restored empty rather than failing the whole
-/// open; the remaining indexes stay usable.
-pub(crate) async fn restore_sparse<S>(
-    storage: &S,
-) -> NodeDbResult<Option<HashMap<String, SparseInvertedIndex>>>
+/// open; the remaining indexes stay usable. Only an index whose blob decoded
+/// is reported in [`RestoredSparse::decoded`].
+pub(crate) async fn restore_sparse<S>(storage: &S) -> NodeDbResult<Option<RestoredSparse>>
 where
     S: StorageEngine,
 {
@@ -118,6 +162,7 @@ where
 
     let mut indices: HashMap<String, SparseInvertedIndex> =
         HashMap::with_capacity(index_keys.len());
+    let mut decoded: HashSet<String> = HashSet::with_capacity(index_keys.len());
 
     for index_key in &index_keys {
         let key = documents_key(index_key);
@@ -131,6 +176,7 @@ where
                     index_key.clone(),
                     SparseInvertedIndex::from_documents(documents),
                 );
+                decoded.insert(index_key.clone());
             }
             Err(e) => {
                 tracing::warn!(
@@ -144,7 +190,7 @@ where
     }
 
     tracing::debug!(index_count = indices.len(), "sparse checkpoint restored");
-    Ok(Some(indices))
+    Ok(Some(RestoredSparse { indices, decoded }))
 }
 
 #[cfg(test)]
@@ -171,14 +217,17 @@ mod tests {
         let mut indices = HashMap::new();
         indices.insert("docs:emb".to_string(), index);
 
-        let ops = serialize_sparse(&indices).expect("serialize");
-        write_serialized_sparse(&storage, ops).await.expect("write");
+        let flush = serialize_sparse(&indices, true, &FlushGens::default()).expect("serialize");
+        write_serialized_sparse(&storage, flush.ops)
+            .await
+            .expect("write");
 
         let restored = restore_sparse(&storage)
             .await
             .expect("restore")
             .expect("checkpoint present");
-        let restored_index = restored.get("docs:emb").expect("index restored");
+        assert!(restored.decoded.contains("docs:emb"));
+        let restored_index = restored.indices.get("docs:emb").expect("index restored");
         assert_eq!(restored_index.doc_count(), 2);
 
         let hits = restored_index.search(&sv(&[(9, 1.0)]), 10);
