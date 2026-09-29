@@ -67,9 +67,19 @@ impl SparseInvertedIndex {
     /// Upsert semantics: any postings previously recorded for `doc_id` are
     /// removed before the new ones are appended, so re-indexing a document
     /// never duplicates its postings.
-    pub fn insert(&mut self, doc_id: &str, vector: &SparseVector) {
+    ///
+    /// Returns `true` when the index changed. Re-inserting the vector a
+    /// document already holds changes nothing and returns `false`.
+    pub fn insert(&mut self, doc_id: &str, vector: &SparseVector) -> bool {
         let internal_id = match self.doc_id_forward.get(doc_id).copied() {
             Some(existing) => {
+                if self
+                    .doc_entries
+                    .get(&existing)
+                    .is_some_and(|entries| entries.as_slice() == vector.entries())
+                {
+                    return false;
+                }
                 self.detach_postings(existing);
                 existing
             }
@@ -90,6 +100,7 @@ impl SparseInvertedIndex {
                 .push((internal_id, weight));
         }
         self.doc_entries.insert(internal_id, entries);
+        true
     }
 
     /// Remove a document entirely. Returns `true` when it was present.

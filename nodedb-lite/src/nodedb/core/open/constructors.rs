@@ -108,9 +108,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // ── Restore FTS indices ──
         let fts_manager = Self::restore_fts_indices(&storage, &governor).await?;
 
+        // Artifacts restored from a valid stored form start clean; everything
+        // else starts dirty, so the first flush writes what open rebuilt.
+        // Created before the sparse and spatial restores, whose managers
+        // record their mutations in it.
+        let flush_gens = Arc::new(crate::nodedb::flush_gens::FlushGens::default());
+
         // ── Restore sparse-vector inverted indices ──
         let (sparse_manager, sparse_checkpoint_present) =
-            Self::restore_sparse_indices(&storage).await;
+            Self::restore_sparse_indices(&storage, &flush_gens).await;
 
         // ── Restore per-collection CSR indices ──
         let graph_memory = nodedb_mem::ScopedMemory::new(
@@ -124,9 +130,6 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // ── Restore HNSW indices and id_map ──
         let (hnsw_map, hnsw_id_map, hnsw_loaded_clean) =
             Self::restore_hnsw_indices(&storage).await?;
-        // Artifacts restored from a valid stored form start clean; everything
-        // else starts dirty, so the first flush writes what open rebuilt.
-        let flush_gens = Arc::new(crate::nodedb::flush_gens::FlushGens::default());
         hnsw_loaded_clean.mark_clean(&flush_gens);
 
         // ── Restore spatial indices ──
@@ -137,7 +140,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             nodedb_mem::EngineId::Spatial,
         );
         let spatial = Arc::new(Mutex::new(
-            Self::restore_spatial_indices(&storage, &spatial_memory).await,
+            Self::restore_spatial_indices(&storage, &spatial_memory, &flush_gens).await,
         ));
 
         // ── Restore strict document engine ──

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Flush writes a derived HNSW or CSR artifact only when it changed.
+//! Flush writes a derived HNSW, CSR, sparse, or spatial artifact only when it
+//! changed.
 //!
 //! `flush()` runs on a timer. Rewriting every collection's graph checkpoint,
-//! the vector id-map, every vector segment, and every CSR adjacency checkpoint
-//! on each tick costs their full size whether or not anything changed: an
-//! idle store with a large vector collection rewrote hundreds of megabytes
-//! per tick.
+//! the vector id-map, every vector segment, every CSR adjacency checkpoint,
+//! every sparse index, and every spatial R-tree and doc-map on each tick costs
+//! their full size whether or not anything changed: an idle store with a
+//! large vector collection rewrote hundreds of megabytes per tick.
 //!
 //! These assert on per-artifact write counters and on the keys a probing
 //! storage wrapper saw, not on elapsed time, so they fail for the reason they
@@ -19,7 +20,7 @@ use std::time::Duration;
 use nodedb_client::NodeDb;
 use nodedb_lite::engine::vector::pagedb_backing::PagedbBacking;
 use nodedb_lite::error::LiteError;
-use nodedb_lite::nodedb::{FlushArtifact, ID_MAP_KEY};
+use nodedb_lite::nodedb::{FlushArtifact, ID_MAP_KEY, spatial_rtree_key};
 use nodedb_lite::storage::array_segment_ext::ArraySegmentExt;
 use nodedb_lite::storage::columnar_segment_ext::ColumnarSegmentExt;
 use nodedb_lite::storage::engine::{CompactionOutcome, KvPair};
@@ -30,8 +31,11 @@ use nodedb_lite::storage::vector_segment_ext::VectorSegmentExt;
 use nodedb_lite::{
     Encryption, LiteConfig, NodeDbLite, PagedbStorageDefault, StorageEngine, WriteOp,
 };
-use nodedb_types::Namespace;
+use nodedb_types::document::Document;
+use nodedb_types::geometry::Geometry;
 use nodedb_types::id::NodeId;
+use nodedb_types::value::Value;
+use nodedb_types::{BoundingBox, Namespace};
 use tokio::sync::Notify;
 
 const DIM: usize = 8;
@@ -191,6 +195,9 @@ impl Gate {
     }
 }
 
+/// The `(namespace, key)` of each op in one committed batch.
+type BatchKeys = Vec<(Namespace, Vec<u8>)>;
+
 /// Test controls shared between a [`ProbeStorage`] and the test body.
 #[derive(Default)]
 struct Probe {
@@ -208,6 +215,16 @@ struct Probe {
     fail_graph_segment_writes: AtomicBool,
     /// Parks a CSR graph segment write for a collection, before it is applied.
     graph_segment_gate: Gate,
+    /// `(namespace, key)` of every delete a committed batch carried.
+    deletes: Mutex<Vec<(Namespace, Vec<u8>)>>,
+    /// Every committed non-empty batch, as the `(namespace, key)` of each op.
+    batches: Mutex<Vec<BatchKeys>>,
+    /// `<collection>/<field>` of every successful spatial segment write.
+    spatial_segment_writes: Mutex<Vec<String>>,
+    /// Makes every spatial segment write fail while set.
+    fail_spatial_segment_writes: AtomicBool,
+    /// Parks a spatial segment write for a collection, before it is applied.
+    spatial_segment_gate: Gate,
 }
 
 impl Probe {
@@ -217,6 +234,21 @@ impl Probe {
 
     fn take_graph_segment_writes(&self) -> Vec<String> {
         std::mem::take(&mut *self.graph_segment_writes.lock().unwrap())
+    }
+
+    fn take_deletes(&self) -> Vec<(Namespace, Vec<u8>)> {
+        std::mem::take(&mut *self.deletes.lock().unwrap())
+    }
+
+    fn take_batches(&self) -> Vec<BatchKeys> {
+        std::mem::take(&mut *self.batches.lock().unwrap())
+    }
+
+    /// Successful spatial segment writes, sorted.
+    fn take_spatial_segment_writes(&self) -> Vec<String> {
+        let mut writes = std::mem::take(&mut *self.spatial_segment_writes.lock().unwrap());
+        writes.sort();
+        writes
     }
 }
 
@@ -270,6 +302,14 @@ impl ProbeStorage {
                 detail: "probe: inner storage has no graph segment support".into(),
             })
     }
+
+    fn spatial_segments(&self) -> Result<&dyn SpatialSegmentExt, LiteError> {
+        self.inner
+            .as_spatial_segment_ext()
+            .ok_or_else(|| LiteError::Storage {
+                detail: "probe: inner storage has no spatial segment support".into(),
+            })
+    }
 }
 
 #[async_trait::async_trait]
@@ -312,10 +352,21 @@ impl StorageEngine for ProbeStorage {
             self.probe.graph_batch_gate.pass(collection).await;
         }
         self.inner.batch_write(ops).await?;
+        let mut batch: Vec<(Namespace, Vec<u8>)> = Vec::with_capacity(ops.len());
         for op in ops {
-            if let WriteOp::Put { ns, key, value: _ } = op {
-                self.record(*ns, key);
+            match op {
+                WriteOp::Put { ns, key, value: _ } => {
+                    self.record(*ns, key);
+                    batch.push((*ns, key.clone()));
+                }
+                WriteOp::Delete { ns, key } => {
+                    self.probe.deletes.lock().unwrap().push((*ns, key.clone()));
+                    batch.push((*ns, key.clone()));
+                }
             }
+        }
+        if !batch.is_empty() {
+            self.probe.batches.lock().unwrap().push(batch);
         }
         Ok(())
     }
@@ -368,7 +419,7 @@ impl StorageEngine for ProbeStorage {
     }
 
     fn as_spatial_segment_ext(&self) -> Option<&dyn SpatialSegmentExt> {
-        self.inner.as_spatial_segment_ext()
+        Some(self)
     }
 }
 
@@ -433,6 +484,54 @@ impl GraphSegmentExt for ProbeStorage {
     async fn delete_graph_segment(&self, collection: &str) -> Result<(), LiteError> {
         self.graph_segments()?
             .delete_graph_segment(collection)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl SpatialSegmentExt for ProbeStorage {
+    async fn write_spatial_segment(
+        &self,
+        collection: &str,
+        field: &str,
+        bytes: &[u8],
+    ) -> Result<(), LiteError> {
+        self.probe.spatial_segment_gate.pass(collection).await;
+        if self
+            .probe
+            .fail_spatial_segment_writes
+            .load(Ordering::SeqCst)
+        {
+            return Err(LiteError::Storage {
+                detail: format!(
+                    "probe: injected spatial segment write failure for {collection}/{field}"
+                ),
+            });
+        }
+        self.spatial_segments()?
+            .write_spatial_segment(collection, field, bytes)
+            .await?;
+        self.probe
+            .spatial_segment_writes
+            .lock()
+            .unwrap()
+            .push(format!("{collection}/{field}"));
+        Ok(())
+    }
+
+    async fn open_spatial_segment(
+        &self,
+        collection: &str,
+        field: &str,
+    ) -> Result<Option<Box<[u8]>>, LiteError> {
+        self.spatial_segments()?
+            .open_spatial_segment(collection, field)
+            .await
+    }
+
+    async fn delete_spatial_segment(&self, collection: &str, field: &str) -> Result<(), LiteError> {
+        self.spatial_segments()?
+            .delete_spatial_segment(collection, field)
             .await
     }
 }
@@ -1065,4 +1164,604 @@ async fn flush_full_writes_every_csr_collection_and_the_meta() {
         "flush_full must put the CSR collection list; saw {puts:?}"
     );
     assert!(!csr_dirty(&db, GRAPH_A) && !csr_dirty(&db, GRAPH_B));
+}
+
+// ---------------------------------------------------------------------------
+// Sparse vectors
+// ---------------------------------------------------------------------------
+
+const SPARSE: &str = "sparse_docs";
+const DOCS: &str = "docs";
+
+/// The key a sparse index is tracked under: `<collection>:<field>`.
+fn sparse_key(collection: &str, field: &str) -> String {
+    format!("{collection}:{field}")
+}
+
+fn sparse_writes<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str, field: &str) -> u64 {
+    db.flush_artifact_write_count(FlushArtifact::SparseIndex, &sparse_key(collection, field))
+}
+
+fn sparse_dirty<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str, field: &str) -> bool {
+    db.flush_artifact_is_dirty(FlushArtifact::SparseIndex, &sparse_key(collection, field))
+}
+
+fn sparse_insert<S: StorageEngine>(db: &NodeDbLite<S>, field: &str, doc_id: &str, dim: u32) {
+    db.sparse_insert(SPARSE, field, doc_id, &[(dim, 1.0)])
+        .expect("sparse_insert");
+}
+
+/// A document whose `emb` field holds a sparse-vector literal.
+async fn put_sparse_document<S: StorageEngine>(db: &NodeDbLite<S>, doc_id: &str) {
+    let mut doc = Document::new(doc_id);
+    doc.set("emb", Value::String("{1: 0.5}".into()));
+    db.document_put(DOCS, doc).await.expect("document_put");
+}
+
+/// Puts a flush makes for a sparse index or the sparse index list.
+fn sparse_puts(puts: &[(Namespace, Vec<u8>)]) -> Vec<String> {
+    let mut out: Vec<String> = puts
+        .iter()
+        .filter(|(ns, key)| *ns == Namespace::Vector && key.starts_with(b"sparse:"))
+        .map(|(ns, key)| format!("{ns:?}/{}", String::from_utf8_lossy(key)))
+        .collect();
+    out.sort();
+    out
+}
+
+/// A second flush with no sparse mutation in between writes no sparse key.
+#[tokio::test]
+async fn second_flush_without_mutation_writes_no_sparse_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("sparse_idle.pagedb")).await;
+    sparse_insert(&db, "a", "d1", 1);
+
+    db.flush().await.expect("first flush");
+    assert_eq!(
+        sparse_writes(&db, SPARSE, "a"),
+        1,
+        "the first flush writes it"
+    );
+    assert!(!sparse_dirty(&db, SPARSE, "a"));
+    probe.take_puts();
+
+    db.flush().await.expect("idle flush");
+
+    assert_eq!(
+        sparse_puts(&probe.take_puts()),
+        Vec::<String>::new(),
+        "an idle flush must not put a sparse index or an unchanged index list"
+    );
+    assert_eq!(sparse_writes(&db, SPARSE, "a"), 1);
+}
+
+/// An insert into one sparse field makes the next flush rewrite that field's
+/// index only. The index list is unchanged, so it is not rewritten either.
+#[tokio::test]
+async fn sparse_insert_rewrites_only_its_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("sparse_insert.pagedb")).await;
+    sparse_insert(&db, "a", "d1", 1);
+    sparse_insert(&db, "b", "d1", 2);
+    db.flush().await.expect("seed flush");
+    let (a_before, b_before) = (
+        sparse_writes(&db, SPARSE, "a"),
+        sparse_writes(&db, SPARSE, "b"),
+    );
+    probe.take_puts();
+
+    sparse_insert(&db, "a", "d2", 3);
+    assert!(sparse_dirty(&db, SPARSE, "a"));
+    assert!(!sparse_dirty(&db, SPARSE, "b"));
+    db.flush().await.expect("flush after insert");
+
+    assert_eq!(
+        sparse_puts(&probe.take_puts()),
+        vec![format!("Vector/sparse:{SPARSE}:a:docs")],
+        "only the touched index is put"
+    );
+    assert_eq!(sparse_writes(&db, SPARSE, "a"), a_before + 1);
+    assert_eq!(sparse_writes(&db, SPARSE, "b"), b_before);
+}
+
+/// Every document write reconciles the collection's sparse indexes, removing
+/// the document from each field it does not carry. A write whose document is
+/// in none of them changes nothing, so no index turns dirty.
+#[tokio::test]
+async fn non_sparse_document_write_does_not_dirty_sparse() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("sparse_precision.pagedb")).await;
+    put_sparse_document(&db, "d1").await;
+    db.flush().await.expect("seed flush");
+    assert!(!sparse_dirty(&db, DOCS, "emb"));
+    let before = sparse_writes(&db, DOCS, "emb");
+    probe.take_puts();
+
+    let mut plain = Document::new("d2");
+    plain.set("title", Value::String("plain text".into()));
+    db.document_put(DOCS, plain).await.expect("document_put");
+
+    assert!(
+        !sparse_dirty(&db, DOCS, "emb"),
+        "a document with no sparse field must not dirty the collection's sparse index"
+    );
+    db.flush().await.expect("flush after the plain write");
+    assert_eq!(sparse_puts(&probe.take_puts()), Vec::<String>::new());
+    assert_eq!(sparse_writes(&db, DOCS, "emb"), before);
+}
+
+/// A sparse index restored from its stored blob starts clean, so the first
+/// flush after a reopen does not rewrite it.
+#[tokio::test]
+async fn sparse_restored_from_its_checkpoint_starts_clean() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("sparse_reopen.pagedb");
+    {
+        let db = open_manual_flush(&path).await;
+        put_sparse_document(&db, "d1").await;
+        db.flush().await.expect("flush");
+        db.shutdown().await;
+    }
+
+    let (db, probe) = open_probed(&path).await;
+    assert!(
+        !sparse_dirty(&db, DOCS, "emb"),
+        "an index whose blob decoded starts clean"
+    );
+    let hits = db
+        .sparse_search(DOCS, "emb", &[(1, 1.0)], 10)
+        .expect("sparse_search");
+    assert_eq!(hits.len(), 1, "the restored index still answers");
+
+    db.flush().await.expect("first flush after reopen");
+    assert_eq!(sparse_writes(&db, DOCS, "emb"), 0);
+    let puts = sparse_puts(&probe.take_puts());
+    assert!(
+        !puts.iter().any(|p| p.ends_with(":docs")),
+        "the first flush after a reopen must not rewrite a restored index; saw {puts:?}"
+    );
+}
+
+/// `flush_full()` writes every sparse index and the index list even when
+/// all are clean.
+#[tokio::test]
+async fn flush_full_writes_every_sparse_index_and_the_list() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("sparse_full.pagedb")).await;
+    sparse_insert(&db, "a", "d1", 1);
+    sparse_insert(&db, "b", "d1", 2);
+    db.flush().await.expect("flush");
+    db.flush().await.expect("idle flush");
+    assert!(!sparse_dirty(&db, SPARSE, "a") && !sparse_dirty(&db, SPARSE, "b"));
+    let before = (
+        sparse_writes(&db, SPARSE, "a"),
+        sparse_writes(&db, SPARSE, "b"),
+    );
+    probe.take_puts();
+
+    db.flush_full().await.expect("flush_full");
+
+    assert_eq!(
+        (
+            sparse_writes(&db, SPARSE, "a"),
+            sparse_writes(&db, SPARSE, "b")
+        ),
+        (before.0 + 1, before.1 + 1)
+    );
+    assert_eq!(
+        sparse_puts(&probe.take_puts()),
+        vec![
+            "Vector/sparse:_indices".to_string(),
+            format!("Vector/sparse:{SPARSE}:a:docs"),
+            format!("Vector/sparse:{SPARSE}:b:docs"),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Spatial
+// ---------------------------------------------------------------------------
+
+const PLACES: &str = "places";
+const OTHER: &str = "other";
+const LOC: &str = "loc";
+const GEO: &str = "geo";
+
+fn point(i: usize) -> Geometry {
+    Geometry::point(i as f64 * 0.01, i as f64 * 0.01)
+}
+
+fn rtree_writes<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str, field: &str) -> u64 {
+    db.flush_artifact_write_count(
+        FlushArtifact::SpatialRtree,
+        &spatial_rtree_key(collection, field),
+    )
+}
+
+fn rtree_dirty<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str, field: &str) -> bool {
+    db.flush_artifact_is_dirty(
+        FlushArtifact::SpatialRtree,
+        &spatial_rtree_key(collection, field),
+    )
+}
+
+fn docmap_writes<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str) -> u64 {
+    db.flush_artifact_write_count(FlushArtifact::SpatialDocMap, collection)
+}
+
+fn docmap_dirty<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str) -> bool {
+    db.flush_artifact_is_dirty(FlushArtifact::SpatialDocMap, collection)
+}
+
+/// Puts a flush makes under `Namespace::Spatial`, sorted.
+fn spatial_puts(puts: &[(Namespace, Vec<u8>)]) -> Vec<String> {
+    let mut out: Vec<String> = puts
+        .iter()
+        .filter(|(ns, _)| *ns == Namespace::Spatial)
+        .map(|(ns, key)| format!("{ns:?}/{}", String::from_utf8_lossy(key)))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Committed non-empty batches carrying any `Namespace::Spatial` op.
+fn spatial_batches(batches: &[BatchKeys]) -> usize {
+    batches
+        .iter()
+        .filter(|batch| batch.iter().any(|(ns, _)| *ns == Namespace::Spatial))
+        .count()
+}
+
+/// A second flush with no spatial mutation in between writes no spatial key,
+/// runs no spatial batch, and writes no R-tree segment.
+#[tokio::test]
+async fn second_flush_without_mutation_writes_no_spatial_put_or_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("spatial_idle.pagedb")).await;
+    db.spatial_insert(PLACES, LOC, "p1", &point(1));
+
+    db.flush().await.expect("first flush");
+    assert_eq!(
+        (rtree_writes(&db, PLACES, LOC), docmap_writes(&db, PLACES)),
+        (1, 1),
+        "the first flush writes the tree and its doc-map"
+    );
+    assert!(!rtree_dirty(&db, PLACES, LOC) && !docmap_dirty(&db, PLACES));
+    probe.take_puts();
+    probe.take_batches();
+    probe.take_spatial_segment_writes();
+
+    db.flush().await.expect("idle flush");
+
+    assert_eq!(spatial_puts(&probe.take_puts()), Vec::<String>::new());
+    assert_eq!(
+        spatial_batches(&probe.take_batches()),
+        0,
+        "an idle flush must not run a spatial batch"
+    );
+    assert_eq!(probe.take_spatial_segment_writes(), Vec::<String>::new());
+    assert_eq!(
+        (rtree_writes(&db, PLACES, LOC), docmap_writes(&db, PLACES)),
+        (1, 1)
+    );
+}
+
+/// An insert makes the next flush write that tree's segment, its
+/// collection's doc-map, and `spatial:_next_id`, and nothing for another
+/// collection. The set of trees is unchanged, so the catalog is not written.
+#[tokio::test]
+async fn spatial_insert_writes_its_tree_its_doc_map_and_next_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("spatial_insert.pagedb")).await;
+    db.spatial_insert(PLACES, LOC, "p1", &point(1));
+    db.spatial_insert(OTHER, LOC, "o1", &point(2));
+    db.flush().await.expect("seed flush");
+    probe.take_puts();
+    probe.take_spatial_segment_writes();
+
+    db.spatial_insert(PLACES, LOC, "p2", &point(3));
+    assert!(rtree_dirty(&db, PLACES, LOC) && docmap_dirty(&db, PLACES));
+    assert!(!rtree_dirty(&db, OTHER, LOC) && !docmap_dirty(&db, OTHER));
+    db.flush().await.expect("flush after insert");
+
+    assert_eq!(
+        probe.take_spatial_segment_writes(),
+        vec![format!("{PLACES}/{LOC}")]
+    );
+    assert_eq!(
+        spatial_puts(&probe.take_puts()),
+        vec![
+            "Spatial/spatial:_next_id".to_string(),
+            format!("Spatial/spatial:{PLACES}:{LOC}:docmap"),
+        ]
+    );
+    assert_eq!(
+        (rtree_writes(&db, OTHER, LOC), docmap_writes(&db, OTHER)),
+        (1, 1),
+        "the untouched collection is not rewritten"
+    );
+}
+
+/// `TRUNCATE` empties every tree of the collection, so every one of its
+/// fields and its doc-map turn dirty. Another collection stays clean.
+#[tokio::test]
+async fn truncate_dirties_every_spatial_field_of_the_collection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("spatial_truncate.pagedb")).await;
+    // `TRUNCATE` addresses a document collection, so give it one row.
+    let mut row = Document::new("row1");
+    row.set("n", Value::Integer(1));
+    db.document_put(PLACES, row).await.expect("document_put");
+    db.spatial_insert(PLACES, LOC, "p1", &point(1));
+    db.spatial_insert(PLACES, GEO, "g1", &point(2));
+    db.spatial_insert(OTHER, LOC, "o1", &point(3));
+    db.flush().await.expect("seed flush");
+    probe.take_spatial_segment_writes();
+
+    db.execute_sql(&format!("TRUNCATE {PLACES}"), &[])
+        .await
+        .expect("TRUNCATE");
+
+    assert!(rtree_dirty(&db, PLACES, LOC), "every field is emptied");
+    assert!(rtree_dirty(&db, PLACES, GEO), "every field is emptied");
+    assert!(docmap_dirty(&db, PLACES));
+    assert!(!rtree_dirty(&db, OTHER, LOC) && !docmap_dirty(&db, OTHER));
+
+    db.flush().await.expect("flush after truncate");
+    assert_eq!(
+        probe.take_spatial_segment_writes(),
+        vec![format!("{PLACES}/{GEO}"), format!("{PLACES}/{LOC}")]
+    );
+    assert!(!rtree_dirty(&db, PLACES, LOC) && !rtree_dirty(&db, PLACES, GEO));
+    assert!(!docmap_dirty(&db, PLACES));
+}
+
+/// An insert that lands while the tree's segment write is in flight keeps
+/// the tree and its doc-map dirty, and the next flush writes the tree again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_during_the_spatial_segment_write_leaves_the_tree_dirty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("spatial_race.pagedb")).await;
+    db.spatial_insert(PLACES, LOC, "p1", &point(1));
+
+    probe.spatial_segment_gate.arm(PLACES);
+    let flushing = tokio::spawn({
+        let db = Arc::clone(&db);
+        async move { db.flush().await }
+    });
+    probe.spatial_segment_gate.wait_entered().await;
+    // The flush has captured the tree's generation and serialized it, and
+    // its doc-map batch has committed. This entry is in neither.
+    db.spatial_insert(PLACES, LOC, "p2", &point(2));
+    probe.spatial_segment_gate.release();
+    flushing.await.expect("join").expect("racing flush");
+
+    assert_eq!(
+        rtree_writes(&db, PLACES, LOC),
+        1,
+        "the in-flight segment write itself succeeded"
+    );
+    assert!(
+        rtree_dirty(&db, PLACES, LOC),
+        "an insert after the capture must keep the tree dirty"
+    );
+    assert!(
+        docmap_dirty(&db, PLACES),
+        "an insert after the doc-map batch must keep the doc-map dirty"
+    );
+
+    db.flush().await.expect("follow-up flush");
+    assert_eq!(rtree_writes(&db, PLACES, LOC), 2);
+    assert!(!rtree_dirty(&db, PLACES, LOC) && !docmap_dirty(&db, PLACES));
+}
+
+/// A spatial segment write that fails leaves the tree dirty, and the next
+/// flush retries it.
+#[tokio::test]
+async fn failed_spatial_segment_write_is_retried_by_the_next_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("spatial_fail.pagedb")).await;
+    db.spatial_insert(PLACES, LOC, "p1", &point(1));
+
+    probe
+        .fail_spatial_segment_writes
+        .store(true, Ordering::SeqCst);
+    db.flush()
+        .await
+        .expect("a spatial segment write error is logged, not returned");
+    assert_eq!(
+        rtree_writes(&db, PLACES, LOC),
+        0,
+        "the segment did not land"
+    );
+    assert!(
+        rtree_dirty(&db, PLACES, LOC),
+        "a failed segment write must not be recorded as flushed"
+    );
+    assert_eq!(docmap_writes(&db, PLACES), 1, "the doc-map batch landed");
+    assert!(!docmap_dirty(&db, PLACES));
+
+    probe
+        .fail_spatial_segment_writes
+        .store(false, Ordering::SeqCst);
+    db.flush().await.expect("retry flush");
+    assert_eq!(
+        rtree_writes(&db, PLACES, LOC),
+        1,
+        "the retry writes the tree"
+    );
+    assert_eq!(
+        probe.take_spatial_segment_writes(),
+        vec![format!("{PLACES}/{LOC}")]
+    );
+    assert_eq!(
+        docmap_writes(&db, PLACES),
+        1,
+        "the clean doc-map is not rewritten"
+    );
+    assert!(!rtree_dirty(&db, PLACES, LOC));
+}
+
+/// Trees and doc-maps restored from their stored forms start clean, so the
+/// first flush after a reopen rewrites neither.
+#[tokio::test]
+async fn spatial_restored_from_its_checkpoint_starts_clean() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("spatial_reopen.pagedb");
+    {
+        let db = open_manual_flush(&path).await;
+        db.spatial_insert(PLACES, LOC, "p1", &point(1));
+        db.spatial_insert(OTHER, LOC, "o1", &point(2));
+        db.flush().await.expect("flush");
+        db.shutdown().await;
+    }
+
+    let (db, probe) = open_probed(&path).await;
+    for collection in [PLACES, OTHER] {
+        assert!(
+            !rtree_dirty(&db, collection, LOC) && !docmap_dirty(&db, collection),
+            "{collection} restored from its checkpoint starts clean"
+        );
+    }
+    let world = BoundingBox::new(-180.0, -90.0, 180.0, 90.0);
+    assert_eq!(db.spatial_search_bbox(PLACES, LOC, &world).len(), 1);
+
+    db.flush().await.expect("first flush after reopen");
+    assert_eq!(probe.take_spatial_segment_writes(), Vec::<String>::new());
+    let puts = spatial_puts(&probe.take_puts());
+    assert!(
+        !puts.iter().any(|p| p.ends_with(":docmap")),
+        "the first flush after a reopen must not rewrite a restored doc-map; saw {puts:?}"
+    );
+    for collection in [PLACES, OTHER] {
+        assert_eq!(
+            (
+                rtree_writes(&db, collection, LOC),
+                docmap_writes(&db, collection)
+            ),
+            (0, 0)
+        );
+    }
+}
+
+/// `flush_full()` writes every spatial tree, every doc-map, and both catalog
+/// entries even when all are clean.
+#[tokio::test]
+async fn flush_full_writes_every_spatial_tree_doc_map_and_catalog_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("spatial_full.pagedb")).await;
+    db.spatial_insert(PLACES, LOC, "p1", &point(1));
+    db.spatial_insert(OTHER, LOC, "o1", &point(2));
+    db.flush().await.expect("flush");
+    db.flush().await.expect("idle flush");
+    probe.take_puts();
+    probe.take_spatial_segment_writes();
+
+    db.flush_full().await.expect("flush_full");
+
+    assert_eq!(
+        probe.take_spatial_segment_writes(),
+        vec![format!("{OTHER}/{LOC}"), format!("{PLACES}/{LOC}")]
+    );
+    assert_eq!(
+        spatial_puts(&probe.take_puts()),
+        vec![
+            "Spatial/spatial:_collections".to_string(),
+            "Spatial/spatial:_next_id".to_string(),
+            format!("Spatial/spatial:{OTHER}:{LOC}:docmap"),
+            format!("Spatial/spatial:{PLACES}:{LOC}:docmap"),
+        ]
+    );
+    for collection in [PLACES, OTHER] {
+        assert_eq!(
+            (
+                rtree_writes(&db, collection, LOC),
+                docmap_writes(&db, collection)
+            ),
+            (2, 2)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Every tracked engine together
+// ---------------------------------------------------------------------------
+
+/// Ops outside the FTS engine. FTS is excluded on purpose: its flush is not
+/// dirty-tracked yet and still writes `fts:_collections` and
+/// `fts:_surrogates` on every tick.
+fn non_fts(ops: &[(Namespace, Vec<u8>)]) -> Vec<String> {
+    ops.iter()
+        .filter(|(ns, _)| *ns != Namespace::Fts)
+        .map(|(ns, key)| format!("{ns:?}/{}", String::from_utf8_lossy(key)))
+        .collect()
+}
+
+/// With vectors, edges, sparse vectors, and geometries all flushed, a second
+/// flush writes nothing for any of those engines: no put, no delete, no
+/// batch, and no vector, graph, or spatial segment.
+///
+/// The seed writes no document text, and FTS keys are excluded from every
+/// assertion (see [`non_fts`]).
+#[tokio::test]
+async fn second_flush_writes_nothing_for_vectors_edges_sparse_or_spatial() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("all_idle.pagedb")).await;
+    insert(&db, ALPHA, 0..4).await;
+    add_edge(&db, GRAPH_A, "a", "b").await;
+    sparse_insert(&db, "a", "d1", 1);
+    db.spatial_insert(PLACES, LOC, "p1", &point(1));
+
+    db.flush().await.expect("first flush");
+    let before = (
+        writes(&db, ALPHA),
+        id_map_writes(&db),
+        csr_writes(&db, GRAPH_A),
+        sparse_writes(&db, SPARSE, "a"),
+        rtree_writes(&db, PLACES, LOC),
+        docmap_writes(&db, PLACES),
+    );
+    probe.take_puts();
+    probe.take_deletes();
+    probe.take_batches();
+    probe.take_graph_segment_writes();
+    probe.take_spatial_segment_writes();
+
+    db.flush().await.expect("idle flush");
+
+    assert_eq!(
+        non_fts(&probe.take_puts()),
+        Vec::<String>::new(),
+        "an idle flush must not put anything outside FTS"
+    );
+    assert_eq!(
+        non_fts(&probe.take_deletes()),
+        Vec::<String>::new(),
+        "an idle flush must not delete anything outside FTS"
+    );
+    let batches: Vec<Vec<String>> = probe
+        .take_batches()
+        .iter()
+        .map(|batch| non_fts(batch.as_slice()))
+        .filter(|ops| !ops.is_empty())
+        .collect();
+    assert_eq!(
+        batches,
+        Vec::<Vec<String>>::new(),
+        "an idle flush must not run a batch outside FTS"
+    );
+    assert_eq!(probe.take_graph_segment_writes(), Vec::<String>::new());
+    assert_eq!(probe.take_spatial_segment_writes(), Vec::<String>::new());
+    assert_eq!(
+        (
+            writes(&db, ALPHA),
+            id_map_writes(&db),
+            csr_writes(&db, GRAPH_A),
+            sparse_writes(&db, SPARSE, "a"),
+            rtree_writes(&db, PLACES, LOC),
+            docmap_writes(&db, PLACES),
+        ),
+        before,
+        "no tracked artifact is rewritten"
+    );
 }

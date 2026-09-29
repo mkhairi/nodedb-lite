@@ -23,7 +23,9 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `NodeDbLite::flush_artifact_write_count(artifact, collection)` and
   `flush_artifact_is_dirty(artifact, collection)` report per-artifact flush
   writes and pending state for `FlushArtifact::{HnswGraph, HnswIdMap,
-  VectorSegment, CsrGraph}`.
+  VectorSegment, CsrGraph, SparseIndex, SpatialRtree, SpatialDocMap}`.
+  `spatial_rtree_key(collection, field)` builds the key a `SpatialRtree` is
+  tracked under.
 
 ### Fixed
 
@@ -45,7 +47,7 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `meta:hnsw_collections` and `meta:last_flushed_mid` entries are written only
   when their value changes. An idle store with vector data now makes no HNSW
   or meta writes per tick; before, it rewrote the full vector segment each
-  time. FTS, sparse, and spatial flush paths are unchanged.
+  time. The FTS flush path is unchanged.
 
 - `flush()` no longer rewrites every CSR graph on every tick. Each graph
   collection's adjacency checkpoint carries a mutation generation and is
@@ -54,6 +56,24 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   retries it. `meta:csr_collections` is written in sorted order, and only when
   the set of collections changes. A graph restored from its stored checkpoint
   starts clean. A graph rebuilt from edge documents at open starts dirty.
+
+- `flush()` no longer rewrites every sparse index on every tick. Each index
+  carries a mutation generation and is written only when dirty. An insert
+  that stores the vector a document already holds, and a document write that
+  removes nothing from an index, leave it clean. `sparse:_indices` is written
+  only when the set of indexes changes. An index restored from a blob that
+  decoded starts clean. An absent or undecodable blob starts dirty.
+
+- `flush()` no longer rewrites every spatial R-tree and doc-map on every
+  tick. Each `(collection, field)` R-tree and each collection's doc-map carry
+  a mutation generation and are written only when dirty.
+  `spatial:_collections` is written in sorted order, and only when the set of
+  trees changes. `spatial:_next_id` is written only when it changes. The
+  doc-map and catalog batch is skipped when empty. A failed R-tree segment
+  write is logged and leaves the tree dirty, and the next flush retries it.
+  Before, it aborted the flush and skipped the FTS and sparse writes after
+  it. A tree restored from its checkpoint starts clean. A tree rebuilt at
+  open starts dirty.
 
 - Shutdown no longer aborts an in-flight auto-flush or auto-compaction after
   5 s; it waits for the pass to finish, so a stop during a long flush cannot

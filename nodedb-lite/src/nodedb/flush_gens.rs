@@ -42,10 +42,32 @@ pub enum FlushArtifact {
     /// A collection's CSR adjacency checkpoint. A pagedb graph segment when
     /// the storage has graph segments, a `csr:<collection>` blob otherwise.
     CsrGraph,
+    /// One sparse inverted index, `sparse:<index_key>:docs`. Tracked under
+    /// its `<collection>:<field>` index key.
+    SparseIndex,
+    /// One `(collection, field)` R-tree checkpoint. A pagedb spatial segment
+    /// when the storage has spatial segments, a
+    /// `spatial:<collection>:<field>:rtree` blob otherwise. Tracked under
+    /// [`spatial_rtree_key`].
+    SpatialRtree,
+    /// A collection's spatial doc-map, written as
+    /// `spatial:<collection>:<field>:docmap` once per field of the collection.
+    /// Tracked under the collection. Every copy holds the doc-map of the
+    /// whole collection, so a change to any one field dirties all of them.
+    SpatialDocMap,
 }
 
 /// Collection key the store-wide [`FlushArtifact::HnswIdMap`] is tracked under.
 pub const ID_MAP_KEY: &str = "";
+
+/// Key a [`FlushArtifact::SpatialRtree`] is tracked under.
+///
+/// The collection is length-prefixed. A plain `<collection>:<field>` key is
+/// ambiguous: `a:b` with field `c` and `a` with field `b:c` share it, and the
+/// flush of one tree then marks the other clean.
+pub fn spatial_rtree_key(collection: &str, field: &str) -> String {
+    format!("{}:{collection}{field}", collection.len())
+}
 
 /// One artifact's mutation generation and the generation last made durable.
 #[derive(Debug, Clone, Copy)]

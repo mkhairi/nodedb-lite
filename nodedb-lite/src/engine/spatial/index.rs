@@ -5,19 +5,23 @@
 //! - Geometry extraction from document fields
 //! - Checkpoint/restore via MessagePack + CRC32C (same pattern as HNSW/CSR)
 //! - Spatial query execution (range search, nearest neighbor)
+//!
+//! Every mutation goes through a `&mut self` method here, and each one marks
+//! the R-trees and collection doc-maps it changed dirty for flush. A call
+//! that changes nothing marks nothing.
 
-use std::collections::HashMap;
-
-type CheckpointData = (
-    Vec<(String, String, Vec<u8>)>,
-    HashMap<(String, String), u64>,
-    u64,
-);
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use nodedb_mem::ScopedMemory;
 use nodedb_spatial::rtree::{RTree, RTreeEntry};
 use nodedb_types::BoundingBox;
+use nodedb_types::error::NodeDbResult;
 use nodedb_types::geometry::Geometry;
+
+use crate::nodedb::flush_gens::{FlushArtifact, FlushGens, spatial_rtree_key};
+
+use super::checkpoint::SpatialFlush;
 
 /// Manages per-collection R-tree spatial indexes.
 ///
@@ -37,17 +41,42 @@ pub struct SpatialIndexManager {
     /// Governor handle bound to the spatial engine budget. Cloned into every
     /// R-tree this manager creates.
     memory: ScopedMemory,
+    /// Flush dirty tracking for every R-tree and collection doc-map.
+    gens: Arc<FlushGens>,
 }
 
 impl SpatialIndexManager {
+    /// Create an empty manager with its own, unshared flush tracking.
     pub fn new(memory: ScopedMemory) -> Self {
+        Self::with_gens(memory, Arc::new(FlushGens::default()))
+    }
+
+    /// Create an empty manager that records its mutations in `gens`.
+    ///
+    /// The store passes its own `FlushGens`, so its flush sees which trees
+    /// and doc-maps changed.
+    pub(crate) fn with_gens(memory: ScopedMemory, gens: Arc<FlushGens>) -> Self {
         Self {
             indices: HashMap::new(),
             doc_to_entry: HashMap::new(),
             entry_to_doc: HashMap::new(),
             next_id: 1,
             memory,
+            gens,
         }
+    }
+
+    /// Mark the R-tree of `(collection, field)` dirty.
+    fn mark_tree(&self, collection: &str, field: &str) {
+        self.gens.bump(
+            FlushArtifact::SpatialRtree,
+            &spatial_rtree_key(collection, field),
+        );
+    }
+
+    /// Mark the doc-map of `collection` dirty.
+    fn mark_docmap(&self, collection: &str) {
+        self.gens.bump(FlushArtifact::SpatialDocMap, collection);
     }
 
     /// Resolve an R-tree entry ID to its document ID within a collection.
@@ -90,6 +119,10 @@ impl SpatialIndexManager {
         self.doc_to_entry.insert(doc_key, entry_id);
         self.entry_to_doc
             .insert(entry_id, (collection.to_string(), doc_id.to_string()));
+        // The entry id is new, so the tree and the collection's doc-map both
+        // changed. `next_id` is a catalog entry flush compares by value.
+        self.mark_tree(collection, field);
+        self.mark_docmap(collection);
     }
 
     /// Remove a document's geometry from the index.
@@ -99,8 +132,13 @@ impl SpatialIndexManager {
 
         if let Some(entry_id) = self.doc_to_entry.remove(&doc_key) {
             self.entry_to_doc.remove(&entry_id);
-            if let Some(tree) = self.indices.get_mut(&key) {
-                tree.delete(entry_id);
+            self.mark_docmap(collection);
+            let deleted = self
+                .indices
+                .get_mut(&key)
+                .is_some_and(|tree| tree.delete(entry_id));
+            if deleted {
+                self.mark_tree(collection, field);
             }
         }
     }
@@ -122,13 +160,18 @@ impl SpatialIndexManager {
             let Some(tree) = self.indices.get_mut(&key) else {
                 continue;
             };
+            let had_entries = !tree.is_empty();
             for entry in tree.entries() {
                 if let Some((_, doc_id)) = self.entry_to_doc.get(&entry.id) {
                     removed.push((field.clone(), doc_id.clone()));
                 }
             }
             *tree = RTree::new(self.memory.clone());
+            if had_entries {
+                self.mark_tree(collection, &field);
+            }
         }
+        let before = self.doc_to_entry.len();
         self.doc_to_entry.retain(|(coll, _), entry_id| {
             let owned = coll == collection;
             if owned {
@@ -136,6 +179,9 @@ impl SpatialIndexManager {
             }
             !owned
         });
+        if self.doc_to_entry.len() != before {
+            self.mark_docmap(collection);
+        }
         removed
     }
 
@@ -200,14 +246,19 @@ impl SpatialIndexManager {
         results
     }
 
-    /// Return the data needed by the checkpoint module to persist full state.
+    /// Serialize the trees, doc-maps, and catalog entries the next flush
+    /// must write.
     ///
-    /// Returns `(rtree_checkpoints, doc_to_entry, next_id)`.
-    pub fn checkpoint_data(&self) -> CheckpointData {
-        (
-            self.checkpoint_all(),
-            self.doc_to_entry.clone(),
+    /// Plans each write under this manager's lock, which the caller holds
+    /// through `&self`, so every captured generation describes exactly the
+    /// bytes serialized. `full` writes all of them.
+    pub(crate) fn checkpoint_dirty(&self, full: bool) -> NodeDbResult<SpatialFlush> {
+        super::checkpoint::serialize_spatial(
+            &self.indices,
+            &self.doc_to_entry,
             self.next_id,
+            full,
+            &self.gens,
         )
     }
 
@@ -216,6 +267,9 @@ impl SpatialIndexManager {
     /// Replaces the current in-memory state with the provided R-tree
     /// checkpoints and the exact `doc_id → entry_id` mapping that was
     /// serialised at flush time.
+    ///
+    /// A tree that decodes starts clean. A collection's doc-map starts clean
+    /// when every one of its trees decoded, and dirty otherwise.
     pub fn load_checkpoint(
         &mut self,
         checkpoints: &[(String, String, Vec<u8>)],
@@ -229,13 +283,21 @@ impl SpatialIndexManager {
             .collect();
         self.doc_to_entry = doc_to_entry;
         self.next_id = next_id;
+        let mut collections: HashSet<&str> = HashSet::new();
+        let mut failed: HashSet<&str> = HashSet::new();
         for (collection, field, bytes) in checkpoints {
+            collections.insert(collection);
             match RTree::from_checkpoint(bytes, None, self.memory.clone()) {
                 Ok(tree) => {
                     self.indices
                         .insert((collection.clone(), field.clone()), tree);
+                    self.gens.mark_clean(
+                        FlushArtifact::SpatialRtree,
+                        &spatial_rtree_key(collection, field),
+                    );
                 }
                 Err(e) => {
+                    failed.insert(collection);
                     tracing::warn!(
                         collection = %collection,
                         field = %field,
@@ -243,6 +305,14 @@ impl SpatialIndexManager {
                         "spatial R-tree restore failed; collection will be empty until rebuilt"
                     );
                 }
+            }
+        }
+        for collection in collections {
+            if failed.contains(collection) {
+                self.mark_docmap(collection);
+            } else {
+                self.gens
+                    .mark_clean(FlushArtifact::SpatialDocMap, collection);
             }
         }
     }
@@ -308,6 +378,10 @@ impl SpatialIndexManager {
         let tree = RTree::bulk_load(entries, self.memory.clone());
         self.indices
             .insert((collection.to_string(), field.to_string()), tree);
+        self.mark_tree(collection, field);
+        if !documents.is_empty() {
+            self.mark_docmap(collection);
+        }
     }
 }
 
@@ -381,6 +455,29 @@ mod tests {
 
         mgr.index_document("places", "loc", "doc3", &Geometry::point(10.5, 20.5));
         assert_eq!(mgr.search("places", "loc", &bbox).len(), 1);
+    }
+
+    #[test]
+    fn only_a_real_change_marks_a_tree_or_doc_map_dirty() {
+        let mut mgr = SpatialIndexManager::new(test_memory());
+        mgr.index_document("places", "loc", "doc1", &Geometry::point(10.0, 20.0));
+        let tree = spatial_rtree_key("places", "loc");
+        mgr.gens.mark_clean(FlushArtifact::SpatialRtree, &tree);
+        mgr.gens.mark_clean(FlushArtifact::SpatialDocMap, "places");
+
+        mgr.remove_document("places", "loc", "absent");
+        mgr.truncate_collection("nothing_here");
+        assert!(!mgr.gens.is_dirty(FlushArtifact::SpatialRtree, &tree));
+        assert!(!mgr.gens.is_dirty(FlushArtifact::SpatialDocMap, "places"));
+
+        mgr.remove_document("places", "loc", "doc1");
+        assert!(mgr.gens.is_dirty(FlushArtifact::SpatialRtree, &tree));
+        assert!(mgr.gens.is_dirty(FlushArtifact::SpatialDocMap, "places"));
+    }
+
+    #[test]
+    fn rtree_keys_do_not_collide_across_the_separator() {
+        assert_ne!(spatial_rtree_key("a:b", "c"), spatial_rtree_key("a", "b:c"));
     }
 
     #[test]

@@ -153,8 +153,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// Persist all in-memory state to storage (call before shutdown).
     ///
     /// Dirty-aware: an HNSW graph, the vector id-map, a vector segment, a CSR
-    /// graph checkpoint, or a meta entry that has not changed since this
-    /// handle last made it durable is not written again.
+    /// graph checkpoint, a sparse index, a spatial R-tree or doc-map, or a
+    /// meta or catalog entry that has not changed since this handle last made
+    /// it durable is not written again.
     /// [`flush_full`](Self::flush_full) writes all of them regardless.
     pub async fn flush(&self) -> NodeDbResult<()> {
         self.flush_pass(false).await
@@ -770,13 +771,14 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         // ── Persist spatial indices (separate batch — includes docmap) ────────
-        let (spatial_checkpoints, spatial_doc_to_entry, spatial_next_id) =
-            self.spatial.lock_or_recover().checkpoint_data();
-        crate::engine::spatial::checkpoint::flush_spatial(
+        // Only dirty R-trees and collection doc-maps are serialized, and each
+        // generation is captured under the spatial lock the bytes are read
+        // under. A mutation after this point leaves its artifact dirty.
+        let spatial_flush = self.spatial.lock_or_recover().checkpoint_dirty(full)?;
+        crate::engine::spatial::checkpoint::write_serialized_spatial(
             self.storage.as_ref(),
-            &spatial_checkpoints,
-            &spatial_doc_to_entry,
-            spatial_next_id,
+            spatial_flush,
+            &self.flush_gens,
         )
         .await?;
 
@@ -800,18 +802,30 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         // ── Persist sparse-vector inverted indices ────────────────────────────
         // Same shape as the FTS block: serialize synchronously under the lock,
-        // then perform the storage write after releasing it.
-        let sparse_ops = {
-            let sparse = self.sparse_state.manager.lock_or_recover();
-            crate::engine::sparse_vector::checkpoint::serialize_sparse(sparse.checkpoint_data())
-                .map_err(|e| NodeDbError::storage(format!("sparse serialize: {e}")))?
-        };
+        // then perform the storage write after releasing it. Only dirty
+        // indexes are serialized, and each generation is captured under the
+        // same lock, so an insert after this point leaves its index dirty.
+        let sparse_flush = self
+            .sparse_state
+            .manager
+            .lock_or_recover()
+            .checkpoint_dirty(full)
+            .map_err(|e| NodeDbError::storage(format!("sparse serialize: {e}")))?;
         crate::engine::sparse_vector::checkpoint::write_serialized_sparse(
             self.storage.as_ref(),
-            sparse_ops,
+            sparse_flush.ops,
         )
         .await
         .map_err(|e| NodeDbError::storage(format!("sparse flush: {e}")))?;
+        // The batch committed, or was empty and skipped. Record the captured
+        // generations, never the current ones.
+        for planned in &sparse_flush.planned {
+            self.flush_gens.mark_flushed(planned);
+            self.flush_gens.record_write(planned);
+        }
+        if let Some((key, value)) = sparse_flush.meta {
+            self.flush_gens.mark_meta_written(key, value);
+        }
 
         // ── Spill FTS + spatial staging buffers to durable queues ────────────
         // These queues accumulate sync entries written synchronously by
