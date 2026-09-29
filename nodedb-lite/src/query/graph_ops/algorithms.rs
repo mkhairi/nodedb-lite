@@ -4,7 +4,7 @@
 //! Betweenness, Harmonic, Degree, Louvain, Triangles, Diameter, kCore.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use nodedb_graph::params::{AlgoParams, GraphAlgorithm};
 use nodedb_types::result::QueryResult;
@@ -12,8 +12,9 @@ use nodedb_types::value::Value;
 
 use crate::engine::graph::index::CsrIndex;
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::TrackedMap;
 
-type CsrMap = Arc<Mutex<HashMap<String, CsrIndex>>>;
+type CsrMap = Arc<TrackedMap<CsrIndex>>;
 
 /// Dispatch to the correct algorithm implementation.
 pub fn run_algo(
@@ -672,7 +673,7 @@ mod tests {
     fn make_csr_map(csr: CsrIndex) -> CsrMap {
         let mut map = HashMap::new();
         map.insert("g".to_string(), csr);
-        Arc::new(Mutex::new(map))
+        crate::query::engine::test_csr_map(map)
     }
 
     fn default_params(collection: &str) -> AlgoParams {
