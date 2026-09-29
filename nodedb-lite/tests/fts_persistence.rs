@@ -71,7 +71,10 @@ async fn fts_index_persists_across_restart() {
         pre_restart_results = results.iter().map(|r| (r.id.clone(), r.distance)).collect();
 
         db.flush().await.expect("flush");
-        // db is dropped here, releasing the file lock.
+        // A background task can hold the last strong handle past the drop,
+        // so the reopen below would race the file lock. `shutdown` stops the
+        // tasks and waits for them.
+        db.shutdown().await;
     }
 
     // ── Second open: reopen, search, assert byte-identical results ────────────
