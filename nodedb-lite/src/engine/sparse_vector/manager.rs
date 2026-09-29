@@ -5,12 +5,21 @@
 //! Mirrors the FTS manager's shape: one index per named field, keyed
 //! `"{collection}:{field}"`, maintained incrementally on document write and
 //! delete, and checkpointed to storage on flush so a reopen is free.
+//!
+//! Every mutation goes through a `&mut self` method here, and each one marks
+//! the index it changed dirty for flush. A call that changes nothing marks
+//! nothing, so an idle index is not rewritten.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use nodedb_types::SparseVector;
 use nodedb_types::Value;
+use nodedb_types::error::NodeDbResult;
 
+use crate::nodedb::flush_gens::{FlushArtifact, FlushGens};
+
+use super::checkpoint::SparseFlush;
 use super::index::{SparseHit, SparseInvertedIndex};
 
 /// Index key used when a caller does not name a field.
@@ -20,6 +29,8 @@ const DEFAULT_FIELD: &str = "_sparse";
 pub struct SparseVectorManager {
     /// Key: `"{collection}:{field}"` → inverted index.
     indices: HashMap<String, SparseInvertedIndex>,
+    /// Flush dirty tracking for each index, under its index key.
+    gens: Arc<FlushGens>,
 }
 
 impl Default for SparseVectorManager {
@@ -29,10 +40,19 @@ impl Default for SparseVectorManager {
 }
 
 impl SparseVectorManager {
-    /// Create an empty manager.
+    /// Create an empty manager with its own, unshared flush tracking.
     pub fn new() -> Self {
+        Self::with_gens(Arc::new(FlushGens::default()))
+    }
+
+    /// Create an empty manager that records its mutations in `gens`.
+    ///
+    /// The store passes its own `FlushGens`, so its flush sees which indexes
+    /// changed.
+    pub(crate) fn with_gens(gens: Arc<FlushGens>) -> Self {
         Self {
             indices: HashMap::new(),
+            gens,
         }
     }
 
@@ -67,7 +87,14 @@ impl SparseVectorManager {
         vector: &SparseVector,
     ) {
         let key = Self::index_key(collection, field);
-        self.indices.entry(key).or_default().insert(doc_id, vector);
+        if self
+            .indices
+            .entry(key.clone())
+            .or_default()
+            .insert(doc_id, vector)
+        {
+            self.gens.bump(FlushArtifact::SparseIndex, &key);
+        }
     }
 
     /// Remove `doc_id` from one `(collection, field)` index.
@@ -75,10 +102,14 @@ impl SparseVectorManager {
     /// Returns `true` when the document was present.
     pub fn remove_document(&mut self, collection: &str, field: &str, doc_id: &str) -> bool {
         let key = Self::index_key(collection, field);
-        match self.indices.get_mut(&key) {
+        let removed = match self.indices.get_mut(&key) {
             Some(index) => index.delete(doc_id),
             None => false,
+        };
+        if removed {
+            self.gens.bump(FlushArtifact::SparseIndex, &key);
         }
+        removed
     }
 
     /// Remove `doc_id` from every sparse index belonging to `collection`.
@@ -90,6 +121,7 @@ impl SparseVectorManager {
         let mut removed = 0usize;
         for (key, index) in self.indices.iter_mut() {
             if key.starts_with(&prefix) && index.delete(doc_id) {
+                self.gens.bump(FlushArtifact::SparseIndex, key);
                 removed += 1;
             }
         }
@@ -123,10 +155,15 @@ impl SparseVectorManager {
         }
 
         // Drop the document from any other sparse index of this collection.
+        // Runs on every document write, so only an index that actually held
+        // the document is marked dirty.
         let prefix = format!("{collection}:");
         for (key, index) in self.indices.iter_mut() {
-            if key.starts_with(&prefix) && !indexed_fields.iter().any(|k| k == key) {
-                index.delete(doc_id);
+            if key.starts_with(&prefix)
+                && !indexed_fields.iter().any(|k| k == key)
+                && index.delete(doc_id)
+            {
+                self.gens.bump(FlushArtifact::SparseIndex, key);
             }
         }
     }
@@ -149,13 +186,30 @@ impl SparseVectorManager {
         }
     }
 
-    /// Borrow every index for checkpoint serialization.
-    pub fn checkpoint_data(&self) -> &HashMap<String, SparseInvertedIndex> {
-        &self.indices
+    /// Serialize the indexes the next flush must write.
+    ///
+    /// Plans each write under this manager's lock, which the caller holds
+    /// through `&self`, so every captured generation describes exactly the
+    /// bytes serialized. `full` writes every index and the index list.
+    pub(crate) fn checkpoint_dirty(&self, full: bool) -> NodeDbResult<SparseFlush> {
+        super::checkpoint::serialize_sparse(&self.indices, full, &self.gens)
     }
 
     /// Install indexes restored from a checkpoint, replacing current state.
-    pub fn load_checkpoint(&mut self, indices: HashMap<String, SparseInvertedIndex>) {
+    ///
+    /// An index in `decoded` matches its stored form and starts clean. Any
+    /// other index starts dirty, so the next flush writes it.
+    pub fn load_checkpoint(
+        &mut self,
+        indices: HashMap<String, SparseInvertedIndex>,
+        decoded: &HashSet<String>,
+    ) {
+        for key in self.indices.keys().chain(indices.keys()) {
+            self.gens.bump(FlushArtifact::SparseIndex, key);
+        }
+        for key in indices.keys().filter(|key| decoded.contains(*key)) {
+            self.gens.mark_clean(FlushArtifact::SparseIndex, key);
+        }
         self.indices = indices;
     }
 }
@@ -228,6 +282,27 @@ mod tests {
         mgr.index_document_fields("docs", "d1", &fields);
 
         assert!(mgr.search("docs", "emb", &sv(&[(1, 1.0)]), 10).is_empty());
+    }
+
+    #[test]
+    fn only_a_real_change_marks_an_index_dirty() {
+        let mut mgr = SparseVectorManager::new();
+        mgr.index_document("docs", "emb", "d1", &sv(&[(1, 1.0)]));
+        let key = SparseVectorManager::index_key("docs", "emb");
+        mgr.gens.mark_clean(FlushArtifact::SparseIndex, &key);
+
+        mgr.index_document("docs", "emb", "d1", &sv(&[(1, 1.0)]));
+        let mut fields = HashMap::new();
+        fields.insert("title".to_string(), Value::String("plain".into()));
+        mgr.index_document_fields("docs", "d2", &fields);
+        assert!(!mgr.remove_document("docs", "emb", "d2"));
+        assert!(
+            !mgr.gens.is_dirty(FlushArtifact::SparseIndex, &key),
+            "a call that changes nothing must not mark the index dirty"
+        );
+
+        mgr.index_document("docs", "emb", "d1", &sv(&[(1, 2.0)]));
+        assert!(mgr.gens.is_dirty(FlushArtifact::SparseIndex, &key));
     }
 
     #[test]
