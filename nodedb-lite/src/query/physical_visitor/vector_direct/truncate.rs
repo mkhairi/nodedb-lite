@@ -16,6 +16,7 @@ use nodedb_types::Namespace;
 use crate::engine::vector::{HnswIndex, VectorState};
 use crate::error::LiteError;
 use crate::nodedb::LockExt;
+use crate::nodedb::flush_gens::FlushArtifact;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::truncate::truncated;
 use crate::storage::engine::StorageEngine;
@@ -110,11 +111,17 @@ async fn reset_index<S: StorageEngine>(
     vector_state.unloadable.lock_or_recover().remove(index_key);
     crate::engine::vector::sidecar::remove_sidecar(vector_state, index_key).await?;
     // The checkpoint describes the old graph; the next flush writes the
-    // empty index in its place.
-    vector_state
+    // empty index in its place. The graph is marked dirty again after the
+    // delete: a flush that ran between the reset above and this delete has
+    // recorded the empty graph as durable, and the delete just removed it.
+    let deleted = vector_state
         .storage
         .delete(Namespace::Vector, format!("hnsw:{index_key}").as_bytes())
-        .await
+        .await;
+    vector_state
+        .flush_gens
+        .bump(FlushArtifact::HnswGraph, index_key);
+    deleted
 }
 
 #[cfg(test)]

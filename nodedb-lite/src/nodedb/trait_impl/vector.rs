@@ -97,10 +97,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // write no segment at all.
         if !embedding.is_empty() {
             let op = crate::engine::vector::durable::put_op(collection, id, embedding);
-            self.storage
-                .batch_write(std::slice::from_ref(&op))
-                .await
-                .map_err(NodeDbError::storage)?;
+            let written = self.storage.batch_write(std::slice::from_ref(&op)).await;
+            self.vector_state.mark_vector_rows_changed(collection);
+            written.map_err(NodeDbError::storage)?;
         }
 
         let internal_id = {
@@ -225,8 +224,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // one. Ordering also matters: if the process dies between the two, a
         // surviving durable row would come back, whereas a removed row simply
         // leaves the tombstoned slot to be rebuilt away.
-        if let Err(e) = crate::engine::vector::durable::remove(&*self.storage, collection, id).await
-        {
+        let removed = crate::engine::vector::durable::remove(&*self.storage, collection, id).await;
+        self.vector_state.mark_vector_rows_changed(collection);
+        if let Err(e) = removed {
             tracing::warn!(
                 collection,
                 id,
@@ -331,10 +331,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // each named-vector sub-index rebuilds from its own rows.
         if !embedding.is_empty() {
             let op = crate::engine::vector::durable::put_op(&index_key, id, embedding);
-            self.storage
-                .batch_write(std::slice::from_ref(&op))
-                .await
-                .map_err(NodeDbError::storage)?;
+            let written = self.storage.batch_write(std::slice::from_ref(&op)).await;
+            self.vector_state.mark_vector_rows_changed(&index_key);
+            written.map_err(NodeDbError::storage)?;
         }
 
         let internal_id = {

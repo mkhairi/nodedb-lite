@@ -218,10 +218,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // never be the thing that is missing after a crash.
         if !embedding.is_empty() {
             let op = crate::engine::vector::durable::put_op(vector_collection, id, embedding);
-            self.storage
-                .batch_write(std::slice::from_ref(&op))
-                .await
-                .map_err(NodeDbError::storage)?;
+            let written = self.storage.batch_write(std::slice::from_ref(&op)).await;
+            self.vector_state
+                .mark_vector_rows_changed(vector_collection);
+            written.map_err(NodeDbError::storage)?;
         }
 
         self.index_document_text(doc_collection, &doc_id, &doc.fields)?;

@@ -7,6 +7,7 @@ use nodedb_types::Namespace;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
 use crate::engine::crdt::{CrdtEngine, CrdtWriteKind};
+use crate::nodedb::flush_gens::{ArtifactFlush, FlushArtifact, ID_MAP_KEY};
 use crate::nodedb::lock_ext::LockExt;
 
 use super::types::{
@@ -41,6 +42,23 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// that costs a mutation id rather than a payload.
     pub fn crdt_spilled_delta_count(&self) -> usize {
         self.crdt.lock_or_recover().spilled_pending_count()
+    }
+
+    /// Number of successful writes of `artifact` for `collection` since this
+    /// handle was opened.
+    ///
+    /// [`FlushArtifact::HnswIdMap`] is one store-wide blob: pass
+    /// [`ID_MAP_KEY`] (the empty string) as its collection. A counter, not a
+    /// timing, so a caller can assert on it directly: an idle store must not
+    /// advance it.
+    pub fn flush_artifact_write_count(&self, artifact: FlushArtifact, collection: &str) -> u64 {
+        self.flush_gens.write_count(artifact, collection)
+    }
+
+    /// Whether `artifact` for `collection` holds mutations that no flush has
+    /// made durable yet.
+    pub fn flush_artifact_is_dirty(&self, artifact: FlushArtifact, collection: &str) -> bool {
+        self.flush_gens.is_dirty(artifact, collection)
     }
 
     /// Mutation ids of every queue entry currently stored under a `delta:` key.
@@ -133,7 +151,27 @@ impl<S: StorageEngine> NodeDbLite<S> {
     }
 
     /// Persist all in-memory state to storage (call before shutdown).
+    ///
+    /// Dirty-aware: an HNSW graph, the vector id-map, a vector segment, or a
+    /// meta entry that has not changed since this handle last made it durable
+    /// is not written again. [`flush_full`](Self::flush_full) writes all of
+    /// them regardless.
     pub async fn flush(&self) -> NodeDbResult<()> {
+        self.flush_pass(false).await
+    }
+
+    /// Persist all in-memory state, writing every dirty-tracked artifact
+    /// whether or not it changed, then mark each one flushed.
+    ///
+    /// For callers that do not trust the stored form, e.g. after an external
+    /// tool touched the file. Artifacts outside the dirty tracking behave as in
+    /// [`flush`](Self::flush).
+    pub async fn flush_full(&self) -> NodeDbResult<()> {
+        self.flush_pass(true).await
+    }
+
+    /// One flush pass. `full` ignores the dirty state of tracked artifacts.
+    async fn flush_pass(&self, full: bool) -> NodeDbResult<()> {
         // One flush at a time: the CRDT update sequence is allocated under the
         // `crdt` guard but committed after it is released, so concurrent
         // flushes would hand out the same numbers. See `flush_lock`.
@@ -145,6 +183,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         self.kv_flush_inner().await?;
 
         let mut ops = Vec::new();
+        // Meta entries queued in `ops`, recorded as written once the batch
+        // commits. An unchanged meta value is not written again.
+        let mut meta_writes: Vec<(&[u8], Vec<u8>)> = Vec::new();
 
         // Delta entries already on disk. Restore prefers these over the bulk
         // blob, so any one that is no longer pending — acknowledged by Origin,
@@ -281,11 +322,21 @@ impl<S: StorageEngine> NodeDbLite<S> {
             }
 
             // Write the last-flushed mutation_id for partial flush safety.
-            ops.push(WriteOp::Put {
-                ns: Namespace::Meta,
-                key: META_LAST_FLUSHED_MID.to_vec(),
-                value: max_mid.to_le_bytes().to_vec(),
-            });
+            // Skipped when it equals the value this handle last committed:
+            // rewriting it on an idle tick stores identical bytes.
+            let max_mid_bytes = max_mid.to_le_bytes().to_vec();
+            if full
+                || self
+                    .flush_gens
+                    .meta_changed(META_LAST_FLUSHED_MID, &max_mid_bytes)
+            {
+                ops.push(WriteOp::Put {
+                    ns: Namespace::Meta,
+                    key: META_LAST_FLUSHED_MID.to_vec(),
+                    value: max_mid_bytes.clone(),
+                });
+                meta_writes.push((META_LAST_FLUSHED_MID, max_mid_bytes));
+            }
 
             (persisted, written_deltas)
         };
@@ -360,30 +411,46 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // Vector search with an empty id_map after restart is the bug this fixes.
         // Vectors are flush-only (no per-insert durability path); the id_map
         // follows the same durability contract — flush required.
-        {
+        //
+        // Written only when dirty. The generation is captured under the same
+        // lock the entries are read under, so a bind made after this point
+        // leaves the id-map dirty for the next flush.
+        let id_map_flush = {
             let id_map = self.vector_state.vector_id_map.lock_or_recover();
-            // Serialize as Vec<(composite_key, doc_id, internal_id)> for stable msgpack encoding.
-            let entries: Vec<(&str, &str, u32)> = id_map
-                .iter()
-                .map(|(k, (doc_id, iid))| (k.as_str(), doc_id.as_str(), *iid))
-                .collect();
-            match zerompk::to_msgpack_vec(&entries) {
-                Ok(bytes) => {
-                    ops.push(WriteOp::Put {
-                        ns: Namespace::Vector,
-                        key: b"hnsw_id_map".to_vec(),
-                        value: crate::storage::checksum::wrap(&bytes),
-                    });
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "vector_id_map serialization failed; \
-                         vector search after restart will fall back to HNSW integer IDs"
-                    );
+            match self
+                .flush_gens
+                .plan(FlushArtifact::HnswIdMap, ID_MAP_KEY, full)
+            {
+                None => None,
+                Some(planned) => {
+                    // Serialize as Vec<(composite_key, doc_id, internal_id)> for stable msgpack encoding.
+                    let entries: Vec<(&str, &str, u32)> = id_map
+                        .iter()
+                        .map(|(k, (doc_id, iid))| (k.as_str(), doc_id.as_str(), *iid))
+                        .collect();
+                    match zerompk::to_msgpack_vec(&entries) {
+                        Ok(bytes) => {
+                            ops.push(WriteOp::Put {
+                                ns: Namespace::Vector,
+                                key: b"hnsw_id_map".to_vec(),
+                                value: crate::storage::checksum::wrap(&bytes),
+                            });
+                            Some(planned)
+                        }
+                        Err(e) => {
+                            // Not planned as written, so it stays dirty and the
+                            // next flush tries again.
+                            tracing::error!(
+                                error = %e,
+                                "vector_id_map serialization failed; \
+                                 vector search after restart will fall back to HNSW integer IDs"
+                            );
+                            None
+                        }
+                    }
                 }
             }
-        }
+        };
 
         // ── Persist HNSW indices ──
         // When the pagedb segment extension is available (native PagedbStorage):
@@ -393,47 +460,72 @@ impl<S: StorageEngine> NodeDbLite<S> {
         //   - full checkpoint blob → B+ tree (checkpoint_to_bytes)
         #[cfg(not(target_arch = "wasm32"))]
         let seg_ext = self.storage.as_vector_segment_ext();
+        // Each collection's graph blob and vector segment is written only when
+        // dirty. Both generations are captured here, under the index lock: a
+        // graph mutation after this point, or a durable vector row written
+        // after it, leaves the artifact dirty for the next flush.
         #[cfg_attr(
             target_arch = "wasm32",
             allow(unused_variables, clippy::type_complexity)
         )]
         #[allow(clippy::type_complexity)]
-        let hnsw_segment_names: Vec<String> = {
+        let (graph_flushes, segment_flushes) = {
             let indices = self.vector_state.hnsw_indices.lock_or_recover();
-            let names: Vec<String> = indices.keys().cloned().collect();
+            // Sorted so the encoded list is a function of the set of names,
+            // not of the map's iteration order, and compares equal across
+            // ticks while the set is unchanged.
+            let mut names: Vec<String> = indices.keys().cloned().collect();
+            names.sort();
             let names_bytes = zerompk::to_msgpack_vec(&names)
                 .map_err(|e| NodeDbError::serialization("msgpack", e))?;
-            ops.push(WriteOp::Put {
-                ns: Namespace::Meta,
-                key: META_HNSW_COLLECTIONS.to_vec(),
-                value: names_bytes,
-            });
+            if full
+                || self
+                    .flush_gens
+                    .meta_changed(META_HNSW_COLLECTIONS, &names_bytes)
+            {
+                ops.push(WriteOp::Put {
+                    ns: Namespace::Meta,
+                    key: META_HNSW_COLLECTIONS.to_vec(),
+                    value: names_bytes.clone(),
+                });
+                meta_writes.push((META_HNSW_COLLECTIONS, names_bytes));
+            }
 
+            let mut graph_flushes: Vec<ArtifactFlush> = Vec::new();
             // Mutated only via the native segment-ext path, compiled out on wasm32.
             #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-            let mut segment_names: Vec<String> = Vec::new();
+            let mut segment_flushes: Vec<ArtifactFlush> = Vec::new();
             for (name, index) in indices.iter() {
                 let key = format!("hnsw:{name}");
+                let graph_plan = self.flush_gens.plan(FlushArtifact::HnswGraph, name, full);
 
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     if seg_ext.is_some() {
-                        // Graph-only blob (vector bytes are empty placeholders).
-                        let graph_bytes = index
-                            .graph_checkpoint_to_bytes()
-                            .map_err(|e| NodeDbError::serialization("hnsw-graph-checkpoint", e))?;
-                        ops.push(WriteOp::Put {
-                            ns: Namespace::Vector,
-                            key: key.into_bytes(),
-                            value: crate::storage::checksum::wrap(&graph_bytes),
-                        });
+                        if let Some(planned) = graph_plan {
+                            // Graph-only blob (vector bytes are empty placeholders).
+                            let graph_bytes = index.graph_checkpoint_to_bytes().map_err(|e| {
+                                NodeDbError::serialization("hnsw-graph-checkpoint", e)
+                            })?;
+                            ops.push(WriteOp::Put {
+                                ns: Namespace::Vector,
+                                key: key.into_bytes(),
+                                value: crate::storage::checksum::wrap(&graph_bytes),
+                            });
+                            graph_flushes.push(planned);
+                        }
                         // The segment payload is sourced from the DURABLE vectors
                         // after this lock is released, NOT from `index` — see
                         // `engine::vector::durable::segment_payload`. Reading it
                         // from the index would serialize empty vectors whenever
                         // the index was restored from a graph-only checkpoint.
-                        segment_names.push(name.clone());
-                    } else {
+                        if let Some(planned) =
+                            self.flush_gens
+                                .plan(FlushArtifact::VectorSegment, name, full)
+                        {
+                            segment_flushes.push(planned);
+                        }
+                    } else if let Some(planned) = graph_plan {
                         // Non-pagedb native backend: full checkpoint blob path.
                         let checkpoint = index
                             .checkpoint_to_bytes()
@@ -443,10 +535,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
                             key: key.into_bytes(),
                             value: crate::storage::checksum::wrap(&checkpoint),
                         });
+                        graph_flushes.push(planned);
                     }
                 }
                 #[cfg(target_arch = "wasm32")]
-                {
+                if let Some(planned) = graph_plan {
                     // WASM: full checkpoint blob path (no segment ops).
                     let checkpoint = index
                         .checkpoint_to_bytes()
@@ -456,15 +549,29 @@ impl<S: StorageEngine> NodeDbLite<S> {
                         key: key.into_bytes(),
                         value: crate::storage::checksum::wrap(&checkpoint),
                     });
+                    graph_flushes.push(planned);
                 }
             }
-            segment_names
+            (graph_flushes, segment_flushes)
         };
 
         self.storage
             .batch_write(&ops)
             .await
             .map_err(NodeDbError::storage)?;
+
+        // The graph blobs, the id-map, and the meta entries in the batch are
+        // durable now. Record the generations captured when they were
+        // serialized, never the current ones: a mutation made since keeps its
+        // artifact dirty. A failed batch returned above, so nothing is marked
+        // and the next flush writes all of it again.
+        for planned in graph_flushes.iter().chain(id_map_flush.iter()) {
+            self.flush_gens.mark_flushed(planned);
+            self.flush_gens.record_write(planned);
+        }
+        for (key, value) in meta_writes {
+            self.flush_gens.mark_meta_written(key, value);
+        }
 
         // The CRDT writes are durable now, so advance the frontiers and the
         // checkpoint accounting. Doing this only after the write means a failed
@@ -498,9 +605,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         // ── Write HNSW vector segments to pagedb (native PagedbStorage only) ──
+        //
+        // Only collections whose durable rows changed since their segment was
+        // last written are planned. A segment is marked flushed only after its
+        // write succeeds; every error branch below leaves it dirty, so the
+        // next flush retries it.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ext) = seg_ext {
-            for name in &hnsw_segment_names {
+            for planned in &segment_flushes {
+                let name = planned.key();
                 let payload =
                     match crate::engine::vector::durable::segment_payload(&*self.storage, name)
                         .await
@@ -509,7 +622,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
                         // No durable vectors: nothing to publish. Leaving the
                         // existing segment untouched is deliberate — replacing it
                         // with an empty one is exactly the corruption this fixes.
-                        Ok(None) => continue,
+                        // That outcome is final for this generation, so it is
+                        // recorded; a later durable row makes it dirty again.
+                        Ok(None) => {
+                            self.flush_gens.mark_flushed(planned);
+                            continue;
+                        }
                         Err(e) => {
                             tracing::error!(
                                 collection = %name,
@@ -521,16 +639,23 @@ impl<S: StorageEngine> NodeDbLite<S> {
                         }
                     };
                 let (dim, vectors, surrogates) = payload;
-                if let Err(e) = ext
+                match ext
                     .write_vector_segment(name, dim, &vectors, &surrogates)
                     .await
                 {
-                    tracing::error!(
-                        collection = %name,
-                        error = %e,
-                        "HNSW vector segment write failed; \
-                         graph topology is persisted but vectors may be lost on cold restart"
-                    );
+                    Ok(()) => {
+                        self.flush_gens.mark_flushed(planned);
+                        self.flush_gens.record_write(planned);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            collection = %name,
+                            error = %e,
+                            "HNSW vector segment write failed; \
+                             graph topology is persisted but vectors may be lost on cold restart; \
+                             the segment stays dirty and the next flush retries it"
+                        );
+                    }
                 }
             }
         }

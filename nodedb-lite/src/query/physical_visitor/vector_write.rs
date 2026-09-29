@@ -67,13 +67,14 @@ where
         // a collection writes no segment for it at all.
         if !embedding.is_empty() {
             let op = crate::engine::vector::durable::put_op(&index_key, &doc_id, &embedding);
-            vector_state
+            let written = vector_state
                 .storage
                 .batch_write(std::slice::from_ref(&op))
-                .await
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("Insert: durable vector write failed: {e}"),
-                })?;
+                .await;
+            vector_state.mark_vector_rows_changed(&index_key);
+            written.map_err(|e| LiteError::Storage {
+                detail: format!("Insert: durable vector write failed: {e}"),
+            })?;
         }
         let internal_id = {
             let dtype = {
@@ -381,6 +382,7 @@ where
                 );
             }
         }
+        vector_state.mark_vector_rows_changed(&index_key);
 
         tracing::info!(index_key, existed, "vector index dropped");
         Ok(nodedb_types::result::QueryResult {

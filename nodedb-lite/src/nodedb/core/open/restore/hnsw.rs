@@ -9,6 +9,7 @@ use nodedb_types::Namespace;
 use nodedb_types::error::NodeDbResult;
 
 use crate::engine::vector::graph::HnswIndex;
+use crate::nodedb::flush_gens::{FlushArtifact, FlushGens, ID_MAP_KEY};
 use crate::storage::engine::StorageEngine;
 
 use crate::nodedb::core::types::{META_HNSW_COLLECTIONS, NodeDbLite};
@@ -16,18 +17,54 @@ use crate::nodedb::core::types::{META_HNSW_COLLECTIONS, NodeDbLite};
 /// `"{collection}:{internal_id}"` → (document id, internal id).
 type VectorIdMap = HashMap<String, (String, u32)>;
 
+/// Restored HNSW artifacts that match their stored form exactly.
+///
+/// Everything not listed here was rebuilt, or had no valid stored copy, and
+/// must start dirty so the first flush writes it.
+#[derive(Debug, Default)]
+pub(in crate::nodedb::core::open) struct HnswLoadedClean {
+    /// Collections whose checkpoint decoded and was kept as the index.
+    graphs: Vec<String>,
+    /// Collections whose vector segment attached to the restored index.
+    segments: Vec<String>,
+    /// Whether the id-map blob decoded and no rebuilt collection replaced
+    /// any of its entries.
+    id_map: bool,
+}
+
+impl HnswLoadedClean {
+    /// Mark every artifact listed here clean in `gens`.
+    pub(in crate::nodedb::core::open) fn mark_clean(&self, gens: &FlushGens) {
+        for name in &self.graphs {
+            gens.mark_clean(FlushArtifact::HnswGraph, name);
+        }
+        for name in &self.segments {
+            gens.mark_clean(FlushArtifact::VectorSegment, name);
+        }
+        if self.id_map {
+            gens.mark_clean(FlushArtifact::HnswIdMap, ID_MAP_KEY);
+        }
+    }
+}
+
 impl<S: StorageEngine> NodeDbLite<S> {
     /// Restore HNSW indices and the vector id_map from storage.
     ///
-    /// Returns `(indices, id_map)`. The id_map maps `"{index_key}:{internal_id}"`
-    /// to `(doc_id, internal_id)` and is loaded from the blob written by `flush`.
-    /// When no id_map blob exists (first open or pre-fix databases), the returned
-    /// map is empty and vector search will fall back to HNSW integer IDs until the
-    /// next flush.
+    /// Returns `(indices, id_map, loaded_clean)`. The id_map maps
+    /// `"{index_key}:{internal_id}"` to `(doc_id, internal_id)` and is loaded
+    /// from the blob written by `flush`. When no id_map blob exists (first open
+    /// or pre-fix databases), the returned map is empty and vector search will
+    /// fall back to HNSW integer IDs until the next flush. `loaded_clean`
+    /// names the artifacts restored from a valid stored form.
     pub(in crate::nodedb::core::open) async fn restore_hnsw_indices(
         storage: &Arc<S>,
-    ) -> NodeDbResult<(HashMap<String, HnswIndex>, HashMap<String, (String, u32)>)> {
+    ) -> NodeDbResult<(
+        HashMap<String, HnswIndex>,
+        HashMap<String, (String, u32)>,
+        HnswLoadedClean,
+    )> {
         let mut hnsw_indices = HashMap::new();
+        let mut loaded_clean = HnswLoadedClean::default();
         // Collections whose index was rebuilt from durable vectors: their
         // internal ids are freshly assigned, so the persisted `hnsw_id_map`
         // entries for them are stale and must be replaced, not merged.
@@ -65,7 +102,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             }
         }
         if names.is_empty() {
-            return Ok((hnsw_indices, HashMap::new()));
+            return Ok((hnsw_indices, HashMap::new(), loaded_clean));
         }
 
         // On native targets, check if vector segment operations are available.
@@ -117,6 +154,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                                                     collection = %name,
                                                     "HNSW restored with pagedb vector segment backing"
                                                 );
+                                                loaded_clean.segments.push(name.clone());
                                                 true
                                             }
                                             Err(e) => {
@@ -151,6 +189,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                             let attached = true;
 
                             if attached {
+                                loaded_clean.graphs.push(name.clone());
                                 hnsw_indices.insert(name.clone(), index);
                             } else {
                                 #[cfg(not(target_arch = "wasm32"))]
@@ -211,10 +250,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
         {
             Some(envelope) => match crate::storage::checksum::unwrap(&envelope) {
                 Some(bytes) => match zerompk::from_msgpack::<Vec<(String, String, u32)>>(&bytes) {
-                    Ok(entries) => entries
-                        .into_iter()
-                        .map(|(k, doc_id, iid)| (k, (doc_id, iid)))
-                        .collect(),
+                    Ok(entries) => {
+                        loaded_clean.id_map = true;
+                        entries
+                            .into_iter()
+                            .map(|(k, doc_id, iid)| (k, (doc_id, iid)))
+                            .collect()
+                    }
                     Err(e) => {
                         tracing::error!(
                             error = %e,
@@ -242,6 +284,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         #[cfg(not(target_arch = "wasm32"))]
         let id_map = {
             let mut id_map = id_map;
+            if !rebuilt_id_maps.is_empty() {
+                loaded_clean.id_map = false;
+            }
             for (name, rebuilt) in rebuilt_id_maps {
                 let prefix = format!("{name}:");
                 id_map.retain(|k, _| !k.starts_with(&prefix));
@@ -250,7 +295,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             id_map
         };
 
-        Ok((hnsw_indices, id_map))
+        Ok((hnsw_indices, id_map, loaded_clean))
     }
 }
 

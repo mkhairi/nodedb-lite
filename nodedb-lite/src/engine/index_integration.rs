@@ -13,7 +13,6 @@
 //! or `ColumnarEngine.insert()` to maintain secondary indexes. Call
 //! `deindex_row_text` before `delete()` to remove text index entries.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 use nodedb_types::columnar::ColumnType;
@@ -24,6 +23,7 @@ use nodedb_vector::HnswIndex;
 use crate::engine::fts::FtsCollectionManager;
 use crate::engine::spatial::SpatialIndexManager;
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::TrackedMap;
 use crate::nodedb::lock_ext::LockExt;
 
 /// Index a row from a strict or columnar collection into secondary indexes.
@@ -40,7 +40,7 @@ pub fn index_row(
     row_id: &str,
     columns: &[nodedb_types::columnar::ColumnDef],
     values: &[Value],
-    hnsw_indices: &Mutex<HashMap<String, HnswIndex>>,
+    hnsw_indices: &TrackedMap<HnswIndex>,
     spatial: &Mutex<SpatialIndexManager>,
     fts: &Mutex<FtsCollectionManager>,
 ) -> Result<(), LiteError> {
@@ -117,7 +117,7 @@ fn index_vector(
     _doc_id: &str,
     value: &Value,
     dim: u32,
-    hnsw_indices: &Mutex<HashMap<String, HnswIndex>>,
+    hnsw_indices: &TrackedMap<HnswIndex>,
 ) {
     let vector: Vec<f32> = match value {
         Value::Array(arr) => arr
@@ -147,9 +147,9 @@ fn index_vector(
 
     let index_key = format!("{collection}:{field}");
     let mut indices = hnsw_indices.lock_or_recover();
-    let index = indices
-        .entry(index_key)
-        .or_insert_with(|| HnswIndex::new(dim as usize, nodedb_types::HnswParams::default()));
+    let index = indices.get_or_insert_with(&index_key, || {
+        HnswIndex::new(dim as usize, nodedb_types::HnswParams::default())
+    });
     // insert() takes Vec<f32> and returns Result — ignore error for index integration.
     let _ = index.insert(vector);
 }
@@ -191,6 +191,15 @@ mod tests {
 
     use super::*;
     use crate::engine::fts::FtsCollectionManager;
+    use crate::nodedb::flush_gens::{FlushArtifact, FlushGens};
+
+    fn tracked_hnsw() -> TrackedMap<HnswIndex> {
+        TrackedMap::new(
+            std::collections::HashMap::new(),
+            Arc::new(FlushGens::default()),
+            FlushArtifact::HnswGraph,
+        )
+    }
 
     /// Build a real, uncapped governor for these index-integration tests.
     fn test_governor() -> Arc<MemoryGovernor> {
@@ -227,7 +236,7 @@ mod tests {
             }),
         ];
 
-        let hnsw = Mutex::new(HashMap::new());
+        let hnsw = tracked_hnsw();
         let spatial = Mutex::new(SpatialIndexManager::new(test_spatial_memory()));
         let text = Mutex::new(FtsCollectionManager::new(test_governor()));
 
@@ -253,7 +262,7 @@ mod tests {
             ]),
         ];
 
-        let hnsw = Mutex::new(HashMap::new());
+        let hnsw = tracked_hnsw();
         let spatial = Mutex::new(SpatialIndexManager::new(test_spatial_memory()));
         let text = Mutex::new(FtsCollectionManager::new(test_governor()));
 
@@ -276,7 +285,7 @@ mod tests {
             Value::String("hello world search test".into()),
         ];
 
-        let hnsw = Mutex::new(HashMap::new());
+        let hnsw = tracked_hnsw();
         let spatial = Mutex::new(SpatialIndexManager::new(test_spatial_memory()));
         let text = Mutex::new(FtsCollectionManager::new(test_governor()));
 
@@ -298,7 +307,7 @@ mod tests {
         ];
         let values = vec![Value::Integer(1), Value::Integer(42)];
 
-        let hnsw = Mutex::new(HashMap::new());
+        let hnsw = tracked_hnsw();
         let spatial = Mutex::new(SpatialIndexManager::new(test_spatial_memory()));
         let text = Mutex::new(FtsCollectionManager::new(test_governor()));
 

@@ -162,10 +162,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
                     item.id,
                     embedding,
                 );
-                self.storage
-                    .batch_write(std::slice::from_ref(&op))
-                    .await
-                    .map_err(NodeDbError::storage)?;
+                let written = self.storage.batch_write(std::slice::from_ref(&op)).await;
+                self.vector_state
+                    .mark_vector_rows_changed(item.vector_collection);
+                written.map_err(NodeDbError::storage)?;
             }
 
             self.index_document_text(item.doc_collection, doc_id, &item.doc.fields)?;

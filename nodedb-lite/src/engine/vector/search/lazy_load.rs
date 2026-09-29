@@ -81,6 +81,11 @@ pub(super) async fn ensure_index_loaded<S: StorageEngine>(
         give_up!();
     };
 
+    // Whether `index` is still exactly the stored checkpoint. A rebuild below
+    // replaces it with a graph no flush has written.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut loaded_from_checkpoint = true;
+
     // On native targets, attach vector segment backing if available.
     //
     // With segment backing the checkpoint is GRAPH-ONLY — its node vector bytes
@@ -151,6 +156,13 @@ pub(super) async fn ensure_index_loaded<S: StorageEngine>(
                         map.replace_index(index_key, id_map);
                     }
                     index = rebuilt;
+                    loaded_from_checkpoint = false;
+                    // The stored segment could not serve the index, so the
+                    // next flush must replace it.
+                    vector_state.flush_gens.bump(
+                        crate::nodedb::flush_gens::FlushArtifact::VectorSegment,
+                        index_key,
+                    );
                 }
                 Ok(None) | Err(_) => {
                     // Nothing durable to rebuild from: publishing the
@@ -171,10 +183,16 @@ pub(super) async fn ensure_index_loaded<S: StorageEngine>(
     }
 
     tracing::info!(index_key, "lazy-loaded HNSW collection from storage");
-    vector_state
-        .hnsw_indices
-        .lock_or_recover()
-        .insert(index_key.to_string(), index);
+    {
+        let mut indices = vector_state.hnsw_indices.lock_or_recover();
+        if loaded_from_checkpoint {
+            // Identical to the stored checkpoint, so the next flush has
+            // nothing to rewrite for its graph.
+            indices.insert_clean(index_key.to_string(), index);
+        } else {
+            indices.insert(index_key.to_string(), index);
+        }
+    }
 
     // Try to restore a persisted sidecar. On failure, fall through to
     // ensure_sidecar which retrains from the live HNSW vectors.

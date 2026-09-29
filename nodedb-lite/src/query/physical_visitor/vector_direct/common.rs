@@ -122,13 +122,14 @@ pub(super) async fn insert_node<S: StorageEngine>(
     // Durable row first: it is the source of truth both the in-memory index
     // and the pagedb segment are rebuilt from.
     let op = crate::engine::vector::durable::put_op(index_key, doc_id, embedding);
-    vector_state
+    let written = vector_state
         .storage
         .batch_write(std::slice::from_ref(&op))
-        .await
-        .map_err(|e| LiteError::Storage {
-            detail: format!("{op_name}: durable vector write failed: {e}"),
-        })?;
+        .await;
+    vector_state.mark_vector_rows_changed(index_key);
+    written.map_err(|e| LiteError::Storage {
+        detail: format!("{op_name}: durable vector write failed: {e}"),
+    })?;
     let internal_id = {
         let dtype = {
             let configs = vector_state.per_index_config.lock_or_recover();
@@ -180,11 +181,12 @@ pub(super) async fn remove_durable<S: StorageEngine>(
     doc_id: &str,
     op_name: &str,
 ) -> Result<(), LiteError> {
-    crate::engine::vector::durable::remove(&*vector_state.storage, index_key, doc_id)
-        .await
-        .map_err(|e| LiteError::Storage {
-            detail: format!("{op_name}: durable vector remove failed: {e}"),
-        })
+    let removed =
+        crate::engine::vector::durable::remove(&*vector_state.storage, index_key, doc_id).await;
+    vector_state.mark_vector_rows_changed(index_key);
+    removed.map_err(|e| LiteError::Storage {
+        detail: format!("{op_name}: durable vector remove failed: {e}"),
+    })
 }
 
 /// The stored payload row of `doc_id`, or `None` when no row exists.

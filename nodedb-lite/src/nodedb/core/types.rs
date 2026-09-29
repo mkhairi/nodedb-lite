@@ -150,6 +150,10 @@ pub struct NodeDbLite<S: StorageEngine> {
     /// checkpoint knows to delete. Serializing them keeps the sequence a
     /// single writer's to allocate.
     pub(crate) flush_lock: tokio::sync::Mutex<()>,
+    /// Generation counters that let `flush` skip derived artifacts that have
+    /// not changed since they were last made durable. Shared with
+    /// `vector_state`, whose lock guards bump them.
+    pub(crate) flush_gens: Arc<crate::nodedb::flush_gens::FlushGens>,
     /// When `false`, KV operations go directly to storage, bypassing Loro.
     pub(crate) sync_enabled: bool,
     /// The KV write buffer and read cache, shared with the query engine so a
