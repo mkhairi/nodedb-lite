@@ -154,8 +154,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
     ///
     /// Dirty-aware: an HNSW graph, the vector id-map, a vector segment, a CSR
     /// graph checkpoint, or a meta entry that has not changed since this
-    /// handle last made it durable is not written again. [`flush_full`](Self::flush_full) writes all of
-    /// them regardless.
+    /// handle last made it durable is not written again.
+    /// [`flush_full`](Self::flush_full) writes all of them regardless.
     pub async fn flush(&self) -> NodeDbResult<()> {
         self.flush_pass(false).await
     }
