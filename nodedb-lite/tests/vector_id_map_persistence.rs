@@ -36,6 +36,7 @@ async fn vector_search_returns_real_doc_id_after_flush_and_reopen() {
 
         // Explicit flush: HNSW checkpoint + id_map land on disk.
         db.flush().await.unwrap();
+        db.shutdown().await;
     }
 
     // ── Reopen + search ────────────────────────────────────────────────────────
@@ -87,6 +88,7 @@ async fn vector_search_multiple_collections_preserve_ids_after_reopen() {
         }
 
         db.flush().await.unwrap();
+        db.shutdown().await;
     }
 
     // ── Reopen + verify each collection independently ──────────────────────────
