@@ -2,7 +2,6 @@
 
 //! Entry point for executing a `GraphOp::Match` against the in-memory CSR map.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nodedb_graph::CsrIndex;
@@ -12,6 +11,7 @@ use nodedb_types::value::Value;
 
 use crate::engine::crdt::CrdtEngine;
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::TrackedMap;
 
 use super::ast::MatchQuery;
 use super::executor::{HydrationCtx, execute_query};
@@ -25,7 +25,7 @@ use super::executor::{HydrationCtx, execute_query};
 /// are evaluated by hydrating the bound node's CRDT document. When absent and
 /// a predicate references a sub-field, a typed storage error is returned.
 pub async fn graph_match(
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     query_bytes: &[u8],
     frontier_bitmap: Option<&SurrogateBitmap>,
     crdt: Option<&Arc<Mutex<CrdtEngine>>>,
@@ -90,7 +90,7 @@ pub async fn graph_match(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use nodedb_graph::CsrIndex;
     use nodedb_types::value::Value;
@@ -168,10 +168,10 @@ mod tests {
         }
     }
 
-    fn make_csr_map(csr: CsrIndex) -> Arc<Mutex<HashMap<String, CsrIndex>>> {
+    fn make_csr_map(csr: CsrIndex) -> Arc<crate::nodedb::flush_gens::TrackedMap<CsrIndex>> {
         let mut map = HashMap::new();
         map.insert("col".to_string(), csr);
-        Arc::new(Mutex::new(map))
+        crate::query::engine::test_csr_map(map)
     }
 
     /// Node-label + edge-label filter.
@@ -385,7 +385,7 @@ mod tests {
         // CSR map — collection "people".
         let mut csr_map_inner = HashMap::new();
         csr_map_inner.insert("people".to_string(), csr);
-        let csr_map = Arc::new(Mutex::new(csr_map_inner));
+        let csr_map = crate::query::engine::test_csr_map(csr_map_inner);
 
         // MATCH (a:Person)-[:KNOWS]->(b) WHERE a.name = 'Alice' RETURN a
         // Both alice and bob satisfy the KNOWS pattern (each has one edge to charlie).

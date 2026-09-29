@@ -115,9 +115,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         {
             let memory = self.memory_for(nodedb_mem::EngineId::Graph);
             let mut csr_map = self.csr.lock_or_recover();
-            let csr = csr_map
-                .entry(collection.to_string())
-                .or_insert_with(|| crate::engine::graph::index::CsrIndex::new(memory));
+            let csr = csr_map.get_or_insert_with(collection, || {
+                crate::engine::graph::index::CsrIndex::new(memory)
+            });
             for &(src, dst, label) in edges {
                 let _ = csr.add_edge(src, label, dst);
             }

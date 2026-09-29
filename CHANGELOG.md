@@ -23,7 +23,7 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `NodeDbLite::flush_artifact_write_count(artifact, collection)` and
   `flush_artifact_is_dirty(artifact, collection)` report per-artifact flush
   writes and pending state for `FlushArtifact::{HnswGraph, HnswIdMap,
-  VectorSegment}`.
+  VectorSegment, CsrGraph}`.
 
 ### Fixed
 
@@ -45,7 +45,15 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `meta:hnsw_collections` and `meta:last_flushed_mid` entries are written only
   when their value changes. An idle store with vector data now makes no HNSW
   or meta writes per tick; before, it rewrote the full vector segment each
-  time. CSR, FTS, sparse, and spatial flush paths are unchanged.
+  time. FTS, sparse, and spatial flush paths are unchanged.
+
+- `flush()` no longer rewrites every CSR graph on every tick. Each graph
+  collection's adjacency checkpoint carries a mutation generation and is
+  written only when dirty, as a pagedb graph segment or a `csr:<collection>`
+  blob. A failed segment write leaves the collection dirty, and the next flush
+  retries it. `meta:csr_collections` is written in sorted order, and only when
+  the set of collections changes. A graph restored from its stored checkpoint
+  starts clean. A graph rebuilt from edge documents at open starts dirty.
 
 - Shutdown no longer aborts an in-flight auto-flush or auto-compaction after
   5 s; it waits for the pass to finish, so a stop during a long flush cannot

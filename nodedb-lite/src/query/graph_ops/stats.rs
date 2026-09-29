@@ -2,8 +2,7 @@
 
 //! Stats handler — node_count, edge_count, avg_degree, max_degree, density.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use nodedb_mem::ScopedMemory;
 use nodedb_types::result::QueryResult;
@@ -11,6 +10,7 @@ use nodedb_types::value::Value;
 
 use crate::engine::graph::index::CsrIndex;
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::TrackedMap;
 use crate::storage::engine::StorageEngine;
 
 use super::temporal;
@@ -18,7 +18,7 @@ use super::temporal;
 /// Handle `GraphOp::Stats`.
 pub async fn graph_stats<S: StorageEngine>(
     storage: &Arc<S>,
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     memory: &ScopedMemory,
     collection: Option<&str>,
     as_of: Option<i64>,
@@ -61,7 +61,7 @@ pub async fn graph_stats<S: StorageEngine>(
 
 async fn single_collection_stats<S: StorageEngine>(
     storage: &Arc<S>,
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     memory: &ScopedMemory,
     collection: &str,
     as_of: Option<i64>,

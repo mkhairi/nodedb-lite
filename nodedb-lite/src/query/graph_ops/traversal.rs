@@ -2,8 +2,7 @@
 
 //! Hop, Neighbors, NeighborsMulti, Path, Subgraph handlers.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use nodedb_graph::traversal::DEFAULT_MAX_VISITED;
 use nodedb_graph::{Direction, GraphTraversalOptions};
@@ -13,6 +12,7 @@ use nodedb_types::value::Value;
 
 use crate::engine::graph::index::CsrIndex;
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::TrackedMap;
 
 fn node_row(node: &str) -> Vec<Value> {
     vec![Value::String(node.to_string())]
@@ -34,7 +34,7 @@ fn max_visited(options: &GraphTraversalOptions) -> usize {
 /// Handle `GraphOp::Hop` — BFS traversal from start nodes.
 #[allow(clippy::too_many_arguments)]
 pub fn hop(
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     collection: &str,
     start_nodes: &[String],
     edge_label: Option<&str>,
@@ -73,7 +73,7 @@ pub fn hop(
 
 /// Handle `GraphOp::Neighbors` — immediate 1-hop neighbors.
 pub fn neighbors(
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     collection: &str,
     node_id: &str,
     edge_label: Option<&str>,
@@ -100,7 +100,7 @@ pub fn neighbors(
 
 /// Handle `GraphOp::NeighborsMulti` — batched 1-hop neighbors lookup.
 pub fn neighbors_multi(
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     collection: &str,
     node_ids: &[String],
     edge_label: Option<&str>,
@@ -153,7 +153,7 @@ pub fn neighbors_multi(
 /// Handle `GraphOp::Path` — shortest path between two nodes.
 #[allow(clippy::too_many_arguments)]
 pub fn path(
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     collection: &str,
     src: &str,
     dst: &str,
@@ -199,7 +199,7 @@ pub fn path(
 
 /// Handle `GraphOp::Subgraph` — BFS edge materialization.
 pub fn subgraph(
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     collection: &str,
     start_nodes: &[String],
     edge_label: Option<&str>,
@@ -233,14 +233,14 @@ pub fn subgraph(
 mod tests {
     use super::*;
 
-    fn make_csr_map_with_graph() -> Arc<Mutex<HashMap<String, CsrIndex>>> {
+    fn make_csr_map_with_graph() -> Arc<TrackedMap<CsrIndex>> {
         let mut csr = CsrIndex::new(crate::query::graph_ops::test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("b", "KNOWS", "c").unwrap();
         csr.add_edge("a", "WORKS", "d").unwrap();
-        let mut map = HashMap::new();
+        let mut map = std::collections::HashMap::new();
         map.insert("social".to_string(), csr);
-        Arc::new(Mutex::new(map))
+        crate::query::engine::test_csr_map(map)
     }
 
     #[test]

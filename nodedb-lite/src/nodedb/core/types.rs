@@ -15,6 +15,7 @@ use crate::engine::htap::HtapBridge;
 use crate::engine::sparse_vector::SparseVectorState;
 use crate::engine::strict::StrictEngine;
 use crate::engine::vector::VectorState;
+use crate::nodedb::flush_gens::TrackedMap;
 use crate::storage::engine::StorageEngine;
 
 /// Storage key constants.
@@ -35,8 +36,9 @@ pub struct NodeDbLite<S: StorageEngine> {
     pub(crate) storage: Arc<S>,
     /// Shared HNSW runtime state (indices, ID map, search_ef).
     pub(crate) vector_state: Arc<VectorState<S>>,
-    /// Per-collection CSR graph indices, keyed by collection name.
-    pub(crate) csr: Arc<Mutex<HashMap<String, CsrIndex>>>,
+    /// Per-collection CSR graph indices, keyed by collection name. Mutable
+    /// access marks the touched collections dirty for flush.
+    pub(crate) csr: Arc<TrackedMap<CsrIndex>>,
     /// CRDT engine for delta generation and sync.
     /// Arc-wrapped for sharing with the query engine's TableProvider.
     pub(crate) crdt: Arc<Mutex<CrdtEngine>>,
@@ -152,7 +154,7 @@ pub struct NodeDbLite<S: StorageEngine> {
     pub(crate) flush_lock: tokio::sync::Mutex<()>,
     /// Generation counters that let `flush` skip derived artifacts that have
     /// not changed since they were last made durable. Shared with
-    /// `vector_state`, whose lock guards bump them.
+    /// `vector_state` and `csr`, whose lock guards bump them.
     pub(crate) flush_gens: Arc<crate::nodedb::flush_gens::FlushGens>,
     /// When `false`, KV operations go directly to storage, bypassing Loro.
     pub(crate) sync_enabled: bool,

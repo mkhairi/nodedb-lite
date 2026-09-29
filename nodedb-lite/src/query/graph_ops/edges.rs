@@ -3,7 +3,7 @@
 //! EdgePut, EdgePutBatch, EdgeDelete, EdgeDeleteBatch handlers.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use nodedb_mem::ScopedMemory;
 use nodedb_physical::physical_plan::graph::BatchEdge;
@@ -14,6 +14,7 @@ use nodedb_types::value::Value;
 use crate::engine::graph::history;
 use crate::engine::graph::index::CsrIndex;
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::TrackedMap;
 use crate::runtime::now_millis_i64;
 use crate::storage::engine::{StorageEngine, WriteOp};
 
@@ -68,7 +69,7 @@ pub struct EdgePutArgs<'a> {
 /// Handle `GraphOp::EdgePut`.
 pub async fn edge_put<S: StorageEngine>(
     storage: &Arc<S>,
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     memory: &ScopedMemory,
     args: EdgePutArgs<'_>,
 ) -> Result<QueryResult, LiteError> {
@@ -83,9 +84,7 @@ pub async fn edge_put<S: StorageEngine>(
     // Insert into CSR.
     {
         let mut map = csr_map.lock().map_err(|_| LiteError::LockPoisoned)?;
-        let csr = map
-            .entry(collection.to_string())
-            .or_insert_with(|| CsrIndex::new(memory.clone()));
+        let csr = map.get_or_insert_with(collection, || CsrIndex::new(memory.clone()));
         csr.add_edge(src_id, label, dst_id)
             .map_err(|e| LiteError::Storage {
                 detail: e.to_string(),
@@ -125,7 +124,7 @@ pub async fn edge_put<S: StorageEngine>(
 /// Handle `GraphOp::EdgePutBatch`.
 pub async fn edge_put_batch<S: StorageEngine>(
     storage: &Arc<S>,
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     memory: &ScopedMemory,
     edges: &[BatchEdge],
 ) -> Result<QueryResult, LiteError> {
@@ -140,9 +139,8 @@ pub async fn edge_put_batch<S: StorageEngine>(
     {
         let mut map = csr_map.lock().map_err(|_| LiteError::LockPoisoned)?;
         for e in edges {
-            let csr = map
-                .entry(e.collection.as_str().to_string())
-                .or_insert_with(|| CsrIndex::new(memory.clone()));
+            let csr =
+                map.get_or_insert_with(e.collection.as_str(), || CsrIndex::new(memory.clone()));
             csr.add_edge(&e.src_id, &e.label, &e.dst_id)
                 .map_err(|g| LiteError::Storage {
                     detail: g.to_string(),
@@ -189,7 +187,7 @@ pub async fn edge_put_batch<S: StorageEngine>(
 /// Handle `GraphOp::EdgeDelete`.
 pub async fn edge_delete<S: StorageEngine>(
     storage: &Arc<S>,
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     collection: &str,
     src_id: &str,
     label: &str,
@@ -226,7 +224,7 @@ pub async fn edge_delete<S: StorageEngine>(
 /// Handle `GraphOp::EdgeDeleteBatch`.
 pub async fn edge_delete_batch<S: StorageEngine>(
     storage: &Arc<S>,
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     edges: &[BatchEdge],
 ) -> Result<QueryResult, LiteError> {
     if edges.is_empty() {
@@ -276,8 +274,8 @@ pub async fn edge_delete_batch<S: StorageEngine>(
 mod tests {
     use super::*;
 
-    fn make_csr_map() -> Arc<Mutex<HashMap<String, CsrIndex>>> {
-        Arc::new(Mutex::new(HashMap::new()))
+    fn make_csr_map() -> Arc<TrackedMap<CsrIndex>> {
+        crate::query::engine::test_csr_map(HashMap::new())
     }
 
     #[test]
@@ -296,9 +294,7 @@ mod tests {
         let memory = crate::query::graph_ops::test_memory();
         let map = make_csr_map();
         let mut locked = map.lock().unwrap();
-        let csr = locked
-            .entry("g".to_string())
-            .or_insert_with(|| CsrIndex::new(memory.clone()));
+        let csr = locked.get_or_insert_with("g", || CsrIndex::new(memory.clone()));
         csr.add_edge("a", "E", "b").unwrap();
         assert!(csr.contains_node("a"));
         assert!(csr.contains_node("b"));

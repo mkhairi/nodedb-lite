@@ -12,9 +12,7 @@ use std::sync::Arc;
 /// empty string when none is found (which will produce an empty result set
 /// rather than an error — correct for "no such graph" semantics).
 pub(super) fn resolve_collection_for_nodes(
-    csr_map: &Arc<
-        std::sync::Mutex<std::collections::HashMap<String, crate::engine::graph::index::CsrIndex>>,
-    >,
+    csr_map: &Arc<crate::nodedb::flush_gens::TrackedMap<crate::engine::graph::index::CsrIndex>>,
     node_ids: &[String],
 ) -> String {
     let Ok(map) = csr_map.lock() else {

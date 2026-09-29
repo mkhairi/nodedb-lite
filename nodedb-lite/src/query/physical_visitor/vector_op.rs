@@ -560,7 +560,7 @@ mod tests {
             fts_state,
             sparse_state: Arc::new(crate::engine::sparse_vector::SparseVectorState::new()),
             spatial,
-            csr: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            csr: crate::query::engine::test_csr_map(std::collections::HashMap::new()),
             governor,
             kv_local: crate::query::engine::test_kv_local(),
         })

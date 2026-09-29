@@ -152,9 +152,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
     /// Persist all in-memory state to storage (call before shutdown).
     ///
-    /// Dirty-aware: an HNSW graph, the vector id-map, a vector segment, or a
-    /// meta entry that has not changed since this handle last made it durable
-    /// is not written again. [`flush_full`](Self::flush_full) writes all of
+    /// Dirty-aware: an HNSW graph, the vector id-map, a vector segment, a CSR
+    /// graph checkpoint, or a meta entry that has not changed since this
+    /// handle last made it durable is not written again. [`flush_full`](Self::flush_full) writes all of
     /// them regardless.
     pub async fn flush(&self) -> NodeDbResult<()> {
         self.flush_pass(false).await
@@ -347,31 +347,56 @@ impl<S: StorageEngine> NodeDbLite<S> {
         //   - B+ tree receives only the collection-name index (META_CSR_COLLECTIONS)
         // Otherwise (WASM or non-pagedb native backends):
         //   - CSR blob → B+ tree (Namespace::Graph, CRC32C wrapped)
+        //
+        // Each collection's checkpoint is serialized and written only when
+        // dirty. Its generation is captured here, under the CSR lock the bytes
+        // are serialized under, so an edge added after this point leaves the
+        // collection dirty for the next flush.
         #[cfg(not(target_arch = "wasm32"))]
         let graph_seg_ext = self.storage.as_graph_segment_ext();
         #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
-        let csr_segment_data: Vec<(String, Vec<u8>)> = {
+        let (csr_blob_flushes, csr_segment_flushes) = {
             let csr_map = self.csr.lock_or_recover();
-            let names: Vec<String> = csr_map.keys().cloned().collect();
+            // Sorted so the encoded list is a function of the set of names,
+            // not of the map's iteration order, and compares equal across
+            // ticks while the set is unchanged.
+            let mut entries: Vec<_> = csr_map.iter().collect();
+            entries.sort_by_key(|(name, _)| *name);
+            let names: Vec<String> = entries.iter().map(|(name, _)| (*name).clone()).collect();
             let names_bytes = zerompk::to_msgpack_vec(&names)
                 .map_err(|e| NodeDbError::serialization("msgpack", e))?;
-            ops.push(WriteOp::Put {
-                ns: Namespace::Meta,
-                key: META_CSR_COLLECTIONS.to_vec(),
-                value: names_bytes,
-            });
+            if full
+                || self
+                    .flush_gens
+                    .meta_changed(META_CSR_COLLECTIONS, &names_bytes)
+            {
+                ops.push(WriteOp::Put {
+                    ns: Namespace::Meta,
+                    key: META_CSR_COLLECTIONS.to_vec(),
+                    value: names_bytes.clone(),
+                });
+                meta_writes.push((META_CSR_COLLECTIONS, names_bytes));
+            }
 
-            // Mutated only via the native segment-ext path, compiled out on wasm32.
+            // Blobs put in the batch below, marked flushed once it commits.
+            let mut blob_flushes: Vec<ArtifactFlush> = Vec::new();
+            // Segments written after the batch, each marked flushed once its
+            // own write succeeds. Mutated only via the native segment-ext
+            // path, compiled out on wasm32.
             #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-            let mut segment_data: Vec<(String, Vec<u8>)> = Vec::new();
-            for (name, index) in csr_map.iter() {
+            let mut segment_flushes: Vec<(ArtifactFlush, Vec<u8>)> = Vec::new();
+            for (name, index) in entries {
+                let Some(planned) = self.flush_gens.plan(FlushArtifact::CsrGraph, name, full)
+                else {
+                    continue;
+                };
                 match index.checkpoint_to_bytes() {
                     Ok(checkpoint) => {
                         #[cfg(not(target_arch = "wasm32"))]
                         {
                             if graph_seg_ext.is_some() {
                                 // Pagedb segment path: collect for post-batch write.
-                                segment_data.push((name.clone(), checkpoint));
+                                segment_flushes.push((planned, checkpoint));
                             } else {
                                 // Legacy B+ tree path.
                                 let key = format!("csr:{name}");
@@ -380,6 +405,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                                     key: key.into_bytes(),
                                     value: crate::storage::checksum::wrap(&checkpoint),
                                 });
+                                blob_flushes.push(planned);
                             }
                         }
                         #[cfg(target_arch = "wasm32")]
@@ -390,9 +416,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
                                 key: key.into_bytes(),
                                 value: crate::storage::checksum::wrap(&checkpoint),
                             });
+                            blob_flushes.push(planned);
                         }
                     }
                     Err(e) => {
+                        // Not planned as written, so it stays dirty and the
+                        // next flush tries again.
                         tracing::error!(
                             collection = %name,
                             error = %e,
@@ -401,7 +430,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                     }
                 }
             }
-            segment_data
+            (blob_flushes, segment_flushes)
         };
 
         // ── Persist HNSW vector_id_map ──
@@ -636,12 +665,16 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .await
             .map_err(NodeDbError::storage)?;
 
-        // The graph blobs, the id-map, and the meta entries in the batch are
-        // durable now. Record the generations captured when they were
-        // serialized, never the current ones: a mutation made since keeps its
-        // artifact dirty. A failed batch returned above, so nothing is marked
-        // and the next flush writes all of it again.
-        for planned in graph_flushes.iter().chain(id_map_flush.iter()) {
+        // The graph blobs, the CSR blobs, the id-map, and the meta entries in
+        // the batch are durable now. Record the generations captured when they
+        // were serialized, never the current ones: a mutation made since keeps
+        // its artifact dirty. A failed batch returned above, so nothing is
+        // marked and the next flush writes all of it again.
+        for planned in graph_flushes
+            .iter()
+            .chain(csr_blob_flushes.iter())
+            .chain(id_map_flush.iter())
+        {
             self.flush_gens.mark_flushed(planned);
             self.flush_gens.record_write(planned);
         }
@@ -710,16 +743,28 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         // ── Write CSR adjacency segments to pagedb (native PagedbStorage only) ──
+        //
+        // Only dirty collections are planned. A segment is marked flushed only
+        // after its write succeeds; the error branch below leaves it dirty, so
+        // the next flush retries it.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ext) = graph_seg_ext {
-            for (name, checkpoint) in &csr_segment_data {
-                if let Err(e) = ext.write_graph_segment(name, checkpoint).await {
-                    tracing::error!(
-                        collection = %name,
-                        error = %e,
-                        "CSR adjacency segment write failed; \
-                         graph state may be lost on cold restart"
-                    );
+            for (planned, checkpoint) in &csr_segment_flushes {
+                let name = planned.key();
+                match ext.write_graph_segment(name, checkpoint).await {
+                    Ok(()) => {
+                        self.flush_gens.mark_flushed(planned);
+                        self.flush_gens.record_write(planned);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            collection = %name,
+                            error = %e,
+                            "CSR adjacency segment write failed; \
+                             graph state may be lost on cold restart; \
+                             the segment stays dirty and the next flush retries it"
+                        );
+                    }
                 }
             }
         }
@@ -958,5 +1003,97 @@ mod tests {
             "a paged-in entry carries the payload that will be pushed"
         );
         assert_eq!(crdt.pending_count(), WRITES - head.len());
+    }
+
+    const GRAPH_A: &str = "graph_a";
+    const GRAPH_B: &str = "graph_b";
+
+    /// A store holding one flushed edge in each of two graph collections,
+    /// both written through the query engine's graph ops.
+    async fn db_with_two_clean_graphs() -> std::sync::Arc<NodeDbLite<PagedbStorageMem>> {
+        let storage = PagedbStorageMem::open_in_memory().await.expect("storage");
+        let config = LiteConfig {
+            auto_flush_ms: 0,
+            ..LiteConfig::default()
+        };
+        let db = NodeDbLite::open_with_config(storage, config)
+            .await
+            .expect("open");
+        for collection in [GRAPH_A, GRAPH_B] {
+            query_edge_put(&db, collection, "a", "b").await;
+        }
+        db.flush().await.expect("flush");
+        for collection in [GRAPH_A, GRAPH_B] {
+            assert!(
+                !db.flush_artifact_is_dirty(FlushArtifact::CsrGraph, collection),
+                "a completed flush leaves {collection} clean"
+            );
+        }
+        db
+    }
+
+    async fn query_edge_put(
+        db: &NodeDbLite<PagedbStorageMem>,
+        collection: &str,
+        src: &str,
+        dst: &str,
+    ) {
+        let memory = db.memory_for(nodedb_mem::EngineId::Graph);
+        crate::query::graph_ops::edges::edge_put(
+            &db.storage,
+            &db.query_engine.csr,
+            &memory,
+            crate::query::graph_ops::edges::EdgePutArgs {
+                collection,
+                src_id: src,
+                label: "LINK",
+                dst_id: dst,
+                properties: &[],
+            },
+        )
+        .await
+        .expect("edge_put");
+    }
+
+    /// The query engine shares the store's CSR map, so an edge it adds
+    /// dirties the collection it names and no other.
+    #[tokio::test]
+    async fn query_path_edge_put_dirties_only_its_collection() {
+        let db = db_with_two_clean_graphs().await;
+
+        query_edge_put(&db, GRAPH_A, "b", "c").await;
+
+        assert!(db.flush_artifact_is_dirty(FlushArtifact::CsrGraph, GRAPH_A));
+        assert!(
+            !db.flush_artifact_is_dirty(FlushArtifact::CsrGraph, GRAPH_B),
+            "an edge in one collection must not dirty another"
+        );
+        let b_before = db.flush_artifact_write_count(FlushArtifact::CsrGraph, GRAPH_B);
+        db.flush().await.expect("flush");
+        assert!(!db.flush_artifact_is_dirty(FlushArtifact::CsrGraph, GRAPH_A));
+        assert_eq!(
+            db.flush_artifact_write_count(FlushArtifact::CsrGraph, GRAPH_B),
+            b_before,
+            "the untouched collection is not rewritten"
+        );
+    }
+
+    /// A node label added through the query engine dirties its collection.
+    #[tokio::test]
+    async fn query_path_node_label_dirties_its_collection() {
+        let db = db_with_two_clean_graphs().await;
+        let memory = db.memory_for(nodedb_mem::EngineId::Graph);
+
+        crate::query::graph_ops::labels::set_node_labels(
+            &db.query_engine.csr,
+            &memory,
+            GRAPH_B,
+            "a",
+            &["Person".to_string()],
+        )
+        .expect("set_node_labels");
+
+        assert!(db.flush_artifact_is_dirty(FlushArtifact::CsrGraph, GRAPH_B));
+        assert!(!db.flush_artifact_is_dirty(FlushArtifact::CsrGraph, GRAPH_A));
     }
 }

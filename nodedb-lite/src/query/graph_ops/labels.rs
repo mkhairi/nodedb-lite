@@ -2,27 +2,25 @@
 
 //! SetNodeLabels and RemoveNodeLabels handlers.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use nodedb_mem::ScopedMemory;
 use nodedb_types::result::QueryResult;
 
 use crate::engine::graph::index::CsrIndex;
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::TrackedMap;
 
 /// Handle `GraphOp::SetNodeLabels`.
 pub fn set_node_labels(
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     memory: &ScopedMemory,
     collection: &str,
     node_id: &str,
     labels: &[String],
 ) -> Result<QueryResult, LiteError> {
     let mut map = csr_map.lock().map_err(|_| LiteError::LockPoisoned)?;
-    let csr = map
-        .entry(collection.to_string())
-        .or_insert_with(|| CsrIndex::new(memory.clone()));
+    let csr = map.get_or_insert_with(collection, || CsrIndex::new(memory.clone()));
 
     for label in labels {
         csr.add_node_label(node_id, label)
@@ -41,7 +39,7 @@ pub fn set_node_labels(
 
 /// Handle `GraphOp::RemoveNodeLabels`.
 pub fn remove_node_labels(
-    csr_map: &Arc<Mutex<HashMap<String, CsrIndex>>>,
+    csr_map: &Arc<TrackedMap<CsrIndex>>,
     collection: &str,
     node_id: &str,
     labels: &[String],
@@ -65,12 +63,12 @@ pub fn remove_node_labels(
 mod tests {
     use super::*;
 
-    fn make_csr_map_with_node() -> Arc<Mutex<HashMap<String, CsrIndex>>> {
+    fn make_csr_map_with_node() -> Arc<TrackedMap<CsrIndex>> {
         let mut csr = CsrIndex::new(crate::query::graph_ops::test_memory());
         csr.add_edge("alice", "KNOWS", "bob").unwrap();
-        let mut map = HashMap::new();
+        let mut map = std::collections::HashMap::new();
         map.insert("social".to_string(), csr);
-        Arc::new(Mutex::new(map))
+        crate::query::engine::test_csr_map(map)
     }
 
     #[test]

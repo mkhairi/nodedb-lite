@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Flush writes a derived HNSW artifact only when it changed.
+//! Flush writes a derived HNSW or CSR artifact only when it changed.
 //!
 //! `flush()` runs on a timer. Rewriting every collection's graph checkpoint,
-//! the vector id-map, and every vector segment on each tick costs their full
-//! size whether or not anything changed: an idle store with a large vector
-//! collection rewrote hundreds of megabytes per tick.
+//! the vector id-map, every vector segment, and every CSR adjacency checkpoint
+//! on each tick costs their full size whether or not anything changed: an
+//! idle store with a large vector collection rewrote hundreds of megabytes
+//! per tick.
 //!
 //! These assert on per-artifact write counters and on the keys a probing
 //! storage wrapper saw, not on elapsed time, so they fail for the reason they
@@ -30,11 +31,14 @@ use nodedb_lite::{
     Encryption, LiteConfig, NodeDbLite, PagedbStorageDefault, StorageEngine, WriteOp,
 };
 use nodedb_types::Namespace;
+use nodedb_types::id::NodeId;
 use tokio::sync::Notify;
 
 const DIM: usize = 8;
 const ALPHA: &str = "alpha";
 const BETA: &str = "beta";
+const GRAPH_A: &str = "graph_a";
+const GRAPH_B: &str = "graph_b";
 
 /// Upper bound on waiting for a flush to reach a gated write. Reaching it
 /// means the flush never planned the write the test is racing.
@@ -198,11 +202,21 @@ struct Probe {
     graph_batch_gate: Gate,
     /// Parks a vector segment write for a collection, before it is applied.
     segment_gate: Gate,
+    /// Collection of every successful CSR graph segment write.
+    graph_segment_writes: Mutex<Vec<String>>,
+    /// Makes every CSR graph segment write fail while set.
+    fail_graph_segment_writes: AtomicBool,
+    /// Parks a CSR graph segment write for a collection, before it is applied.
+    graph_segment_gate: Gate,
 }
 
 impl Probe {
     fn take_puts(&self) -> Vec<(Namespace, Vec<u8>)> {
         std::mem::take(&mut *self.puts.lock().unwrap())
+    }
+
+    fn take_graph_segment_writes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.graph_segment_writes.lock().unwrap())
     }
 }
 
@@ -214,6 +228,17 @@ fn hnsw_and_meta_puts(puts: &[(Namespace, Vec<u8>)]) -> Vec<String> {
                 || (*ns == Namespace::Meta
                     && (key.as_slice() == b"meta:hnsw_collections"
                         || key.as_slice() == b"meta:last_flushed_mid"))
+        })
+        .map(|(ns, key)| format!("{ns:?}/{}", String::from_utf8_lossy(key)))
+        .collect()
+}
+
+/// Puts a flush makes for a CSR blob or the CSR collection list.
+fn csr_puts(puts: &[(Namespace, Vec<u8>)]) -> Vec<String> {
+    puts.iter()
+        .filter(|(ns, key)| {
+            (*ns == Namespace::Graph && key.starts_with(b"csr:"))
+                || (*ns == Namespace::Meta && key.as_slice() == b"meta:csr_collections")
         })
         .map(|(ns, key)| format!("{ns:?}/{}", String::from_utf8_lossy(key)))
         .collect()
@@ -235,6 +260,14 @@ impl ProbeStorage {
             .as_vector_segment_ext()
             .ok_or_else(|| LiteError::Storage {
                 detail: "probe: inner storage has no vector segment support".into(),
+            })
+    }
+
+    fn graph_segments(&self) -> Result<&dyn GraphSegmentExt, LiteError> {
+        self.inner
+            .as_graph_segment_ext()
+            .ok_or_else(|| LiteError::Storage {
+                detail: "probe: inner storage has no graph segment support".into(),
             })
     }
 }
@@ -331,7 +364,7 @@ impl StorageEngine for ProbeStorage {
     }
 
     fn as_graph_segment_ext(&self) -> Option<&dyn GraphSegmentExt> {
-        self.inner.as_graph_segment_ext()
+        Some(self)
     }
 
     fn as_spatial_segment_ext(&self) -> Option<&dyn SpatialSegmentExt> {
@@ -369,6 +402,37 @@ impl VectorSegmentExt for ProbeStorage {
     async fn delete_vector_segment(&self, collection_name: &str) -> Result<(), LiteError> {
         self.segments()?
             .delete_vector_segment(collection_name)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl GraphSegmentExt for ProbeStorage {
+    async fn write_graph_segment(&self, collection: &str, bytes: &[u8]) -> Result<(), LiteError> {
+        self.probe.graph_segment_gate.pass(collection).await;
+        if self.probe.fail_graph_segment_writes.load(Ordering::SeqCst) {
+            return Err(LiteError::Storage {
+                detail: format!("probe: injected graph segment write failure for {collection}"),
+            });
+        }
+        self.graph_segments()?
+            .write_graph_segment(collection, bytes)
+            .await?;
+        self.probe
+            .graph_segment_writes
+            .lock()
+            .unwrap()
+            .push(collection.to_string());
+        Ok(())
+    }
+
+    async fn open_graph_segment(&self, collection: &str) -> Result<Option<Box<[u8]>>, LiteError> {
+        self.graph_segments()?.open_graph_segment(collection).await
+    }
+
+    async fn delete_graph_segment(&self, collection: &str) -> Result<(), LiteError> {
+        self.graph_segments()?
+            .delete_graph_segment(collection)
             .await
     }
 }
@@ -701,4 +765,304 @@ async fn flush_full_writes_every_artifact_even_when_clean() {
         );
     }
     assert!(!any_dirty(&db, ALPHA));
+}
+
+// ---------------------------------------------------------------------------
+// CSR graph
+// ---------------------------------------------------------------------------
+
+async fn add_edge<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str, src: &str, dst: &str) {
+    let src = NodeId::try_new(src).expect("node id");
+    let dst = NodeId::try_new(dst).expect("node id");
+    db.graph_insert_edge(collection, &src, &dst, "LINK", None)
+        .await
+        .expect("graph_insert_edge");
+}
+
+/// Successful CSR checkpoint writes for `collection`.
+fn csr_writes<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str) -> u64 {
+    db.flush_artifact_write_count(FlushArtifact::CsrGraph, collection)
+}
+
+fn csr_dirty<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str) -> bool {
+    db.flush_artifact_is_dirty(FlushArtifact::CsrGraph, collection)
+}
+
+/// Every `(src, label, dst)` edge reachable in one hop from `start`, sorted.
+async fn one_hop_edges<S: StorageEngine>(
+    db: &NodeDbLite<S>,
+    collection: &str,
+    start: &str,
+) -> Vec<(String, String, String)> {
+    let start = NodeId::try_new(start).expect("node id");
+    let subgraph = db
+        .graph_traverse(collection, &start, 1, None)
+        .await
+        .expect("graph_traverse");
+    let mut edges: Vec<(String, String, String)> = subgraph
+        .edges
+        .into_iter()
+        .map(|e| {
+            (
+                e.from.as_str().to_string(),
+                e.label,
+                e.to.as_str().to_string(),
+            )
+        })
+        .collect();
+    edges.sort();
+    edges
+}
+
+/// A second flush with no graph mutation in between writes no CSR segment,
+/// no CSR blob, and no CSR collection list.
+#[tokio::test]
+async fn second_flush_without_mutation_writes_no_csr_segment_or_meta() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("csr_idle.pagedb")).await;
+
+    add_edge(&db, GRAPH_A, "a", "b").await;
+    db.flush().await.expect("first flush");
+    assert_eq!(
+        csr_writes(&db, GRAPH_A),
+        1,
+        "the first flush writes the graph"
+    );
+    assert_eq!(probe.take_graph_segment_writes(), vec![GRAPH_A.to_string()]);
+    assert!(
+        !csr_dirty(&db, GRAPH_A),
+        "a completed flush leaves the graph clean"
+    );
+    probe.take_puts();
+
+    db.flush().await.expect("idle flush");
+
+    assert_eq!(
+        csr_writes(&db, GRAPH_A),
+        1,
+        "an idle flush must not rewrite the graph"
+    );
+    assert_eq!(
+        probe.take_graph_segment_writes(),
+        Vec::<String>::new(),
+        "an idle flush must not write a CSR segment"
+    );
+    assert_eq!(
+        csr_puts(&probe.take_puts()),
+        Vec::<String>::new(),
+        "an idle flush must not put a CSR blob or an unchanged collection list"
+    );
+}
+
+/// An edge added to one graph collection makes the next flush rewrite that
+/// collection's checkpoint only.
+#[tokio::test]
+async fn edge_rewrites_only_the_touched_collections_csr() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open_manual_flush(&dir.path().join("csr_edge.pagedb")).await;
+
+    add_edge(&db, GRAPH_A, "a", "b").await;
+    add_edge(&db, GRAPH_B, "x", "y").await;
+    db.flush().await.expect("seed flush");
+    let (a_before, b_before) = (csr_writes(&db, GRAPH_A), csr_writes(&db, GRAPH_B));
+
+    add_edge(&db, GRAPH_A, "b", "c").await;
+    assert!(csr_dirty(&db, GRAPH_A));
+    assert!(!csr_dirty(&db, GRAPH_B));
+    db.flush().await.expect("flush after edge");
+
+    assert_eq!(
+        csr_writes(&db, GRAPH_A),
+        a_before + 1,
+        "the touched collection's graph is rewritten"
+    );
+    assert_eq!(
+        csr_writes(&db, GRAPH_B),
+        b_before,
+        "an untouched collection's graph is not rewritten"
+    );
+}
+
+/// An edge that lands while the collection's CSR segment write is in flight
+/// keeps the graph dirty, and the next flush writes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edge_during_the_csr_segment_write_leaves_the_graph_dirty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("csr_race.pagedb")).await;
+    add_edge(&db, GRAPH_A, "a", "b").await;
+
+    probe.graph_segment_gate.arm(GRAPH_A);
+    let flushing = tokio::spawn({
+        let db = Arc::clone(&db);
+        async move { db.flush().await }
+    });
+    probe.graph_segment_gate.wait_entered().await;
+    // The flush has captured the generation and serialized the checkpoint;
+    // this edge is not in it.
+    add_edge(&db, GRAPH_A, "b", "c").await;
+    probe.graph_segment_gate.release();
+    flushing.await.expect("join").expect("racing flush");
+
+    assert_eq!(
+        csr_writes(&db, GRAPH_A),
+        1,
+        "the in-flight segment write itself succeeded"
+    );
+    assert!(
+        csr_dirty(&db, GRAPH_A),
+        "an edge added after the capture must keep the graph dirty"
+    );
+
+    db.flush().await.expect("follow-up flush");
+    assert_eq!(
+        csr_writes(&db, GRAPH_A),
+        2,
+        "the next flush writes the graph again"
+    );
+    assert!(!csr_dirty(&db, GRAPH_A));
+}
+
+/// A CSR segment write that fails leaves the graph dirty, and the next flush
+/// retries it.
+#[tokio::test]
+async fn failed_csr_segment_write_is_retried_by_the_next_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("csr_fail.pagedb")).await;
+    add_edge(&db, GRAPH_A, "a", "b").await;
+
+    probe
+        .fail_graph_segment_writes
+        .store(true, Ordering::SeqCst);
+    db.flush()
+        .await
+        .expect("a CSR segment write error is logged, not returned");
+    assert_eq!(csr_writes(&db, GRAPH_A), 0, "the segment did not land");
+    assert!(
+        csr_dirty(&db, GRAPH_A),
+        "a failed segment write must not be recorded as flushed"
+    );
+
+    probe
+        .fail_graph_segment_writes
+        .store(false, Ordering::SeqCst);
+    db.flush().await.expect("retry flush");
+    assert_eq!(csr_writes(&db, GRAPH_A), 1, "the retry writes the segment");
+    assert_eq!(probe.take_graph_segment_writes(), vec![GRAPH_A.to_string()]);
+    assert!(!csr_dirty(&db, GRAPH_A));
+}
+
+/// A graph restored from its stored checkpoint keeps its neighbors and starts
+/// clean, so the first flush after a reopen does not rewrite it.
+#[tokio::test]
+async fn csr_restored_from_its_checkpoint_keeps_neighbors_and_starts_clean() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("csr_reopen.pagedb");
+
+    let before = {
+        let db = open_manual_flush(&path).await;
+        add_edge(&db, GRAPH_A, "a", "b").await;
+        add_edge(&db, GRAPH_A, "a", "c").await;
+        add_edge(&db, GRAPH_B, "x", "y").await;
+        db.flush().await.expect("flush");
+        db.flush().await.expect("idle flush");
+        let before = (
+            one_hop_edges(&db, GRAPH_A, "a").await,
+            one_hop_edges(&db, GRAPH_B, "x").await,
+        );
+        db.shutdown().await;
+        before
+    };
+    assert_eq!(before.0.len(), 2, "both edges out of `a` are reachable");
+
+    let db = open_manual_flush(&path).await;
+    for collection in [GRAPH_A, GRAPH_B] {
+        assert!(
+            !csr_dirty(&db, collection),
+            "{collection} restored from its checkpoint starts clean"
+        );
+    }
+    let after = (
+        one_hop_edges(&db, GRAPH_A, "a").await,
+        one_hop_edges(&db, GRAPH_B, "x").await,
+    );
+    assert_eq!(after, before, "neighbors must survive the reopen");
+
+    db.flush().await.expect("first flush after reopen");
+    assert_eq!(
+        (csr_writes(&db, GRAPH_A), csr_writes(&db, GRAPH_B)),
+        (0, 0),
+        "the first flush after a reopen must not rewrite a restored graph"
+    );
+}
+
+/// A graph rebuilt from its edge documents at open, because no checkpoint
+/// was listed, is written by the first flush.
+#[tokio::test]
+async fn csr_rebuilt_at_open_is_written_by_the_first_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("csr_rebuilt.pagedb");
+    {
+        let db = open_manual_flush(&path).await;
+        add_edge(&db, GRAPH_A, "a", "b").await;
+        db.flush().await.expect("flush");
+        db.shutdown().await;
+    }
+    // Without the collection list, open finds no checkpoint and rebuilds the
+    // graph from the edge documents.
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .expect("open storage");
+        storage
+            .delete(Namespace::Meta, b"meta:csr_collections")
+            .await
+            .expect("delete the CSR collection list");
+    }
+
+    let db = open_manual_flush(&path).await;
+    assert_eq!(
+        one_hop_edges(&db, GRAPH_A, "a").await,
+        vec![("a".to_string(), "LINK".to_string(), "b".to_string())],
+        "the rebuild restores the edge"
+    );
+    assert!(
+        csr_dirty(&db, GRAPH_A),
+        "a graph rebuilt at open has no stored form matching it"
+    );
+
+    db.flush().await.expect("first flush after rebuild");
+    assert_eq!(csr_writes(&db, GRAPH_A), 1);
+    assert!(!csr_dirty(&db, GRAPH_A));
+}
+
+/// `flush_full()` writes every CSR collection and the collection list even
+/// when all are clean.
+#[tokio::test]
+async fn flush_full_writes_every_csr_collection_and_the_meta() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("csr_full.pagedb")).await;
+    add_edge(&db, GRAPH_A, "a", "b").await;
+    add_edge(&db, GRAPH_B, "x", "y").await;
+    db.flush().await.expect("flush");
+    db.flush().await.expect("idle flush");
+    assert!(!csr_dirty(&db, GRAPH_A) && !csr_dirty(&db, GRAPH_B));
+    let before = (csr_writes(&db, GRAPH_A), csr_writes(&db, GRAPH_B));
+    probe.take_puts();
+    probe.take_graph_segment_writes();
+
+    db.flush_full().await.expect("flush_full");
+
+    assert_eq!(
+        (csr_writes(&db, GRAPH_A), csr_writes(&db, GRAPH_B)),
+        (before.0 + 1, before.1 + 1)
+    );
+    let mut segments = probe.take_graph_segment_writes();
+    segments.sort();
+    assert_eq!(segments, vec![GRAPH_A.to_string(), GRAPH_B.to_string()]);
+    let puts = csr_puts(&probe.take_puts());
+    assert!(
+        puts.iter().any(|p| p == "Meta/meta:csr_collections"),
+        "flush_full must put the CSR collection list; saw {puts:?}"
+    );
+    assert!(!csr_dirty(&db, GRAPH_A) && !csr_dirty(&db, GRAPH_B));
 }

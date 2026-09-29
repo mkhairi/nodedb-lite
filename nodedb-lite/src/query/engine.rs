@@ -3,7 +3,6 @@
 //! Parses SQL with nodedb-sql, then executes against CRDT, strict,
 //! and columnar engines directly — no DataFusion dependency.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nodedb_mem::MemoryGovernor;
@@ -22,6 +21,7 @@ use crate::engine::strict::StrictEngine;
 use crate::engine::vector::VectorState;
 use crate::error::LiteError;
 use crate::nodedb::KvLocalState;
+use crate::nodedb::flush_gens::TrackedMap;
 use crate::sequence::LiteSequenceRegistry;
 use crate::storage::engine::StorageEngine;
 
@@ -46,7 +46,8 @@ pub struct LiteQueryEngine<S: StorageEngine> {
     pub(in crate::query) spatial: Arc<Mutex<SpatialIndexManager>>,
     pub(crate) cancellation: CancellationRegistry,
     /// Per-collection CSR graph indices shared with the owning NodeDbLite.
-    pub(crate) csr: Arc<Mutex<HashMap<String, CsrIndex>>>,
+    /// Mutable access marks the touched collections dirty for flush.
+    pub(crate) csr: Arc<TrackedMap<CsrIndex>>,
     /// Memory budget governor, shared with the owning NodeDbLite.
     pub(crate) governor: Arc<MemoryGovernor>,
     /// Sequence registry backing `nextval` / `currval` / `setval` in a
@@ -77,7 +78,7 @@ pub struct LiteQueryEngineParams<S: StorageEngine> {
     pub fts_state: Arc<FtsState>,
     pub sparse_state: Arc<SparseVectorState>,
     pub spatial: Arc<Mutex<SpatialIndexManager>>,
-    pub csr: Arc<Mutex<HashMap<String, CsrIndex>>>,
+    pub csr: Arc<TrackedMap<CsrIndex>>,
     pub governor: Arc<MemoryGovernor>,
     pub kv_local: Arc<KvLocalState>,
 }
@@ -578,10 +579,23 @@ pub(crate) async fn test_engine() -> LiteQueryEngine<crate::PagedbStorageMem> {
         fts_state,
         sparse_state: Arc::new(SparseVectorState::new()),
         spatial,
-        csr: Arc::new(Mutex::new(HashMap::new())),
+        csr: test_csr_map(std::collections::HashMap::new()),
         governor,
         kv_local: test_kv_local(),
     })
+}
+
+/// A CSR map for engines and graph ops built outside `NodeDbLite`. Nothing
+/// flushes it, so its generations are private to it.
+#[cfg(test)]
+pub(crate) fn test_csr_map(
+    map: std::collections::HashMap<String, CsrIndex>,
+) -> Arc<TrackedMap<CsrIndex>> {
+    Arc::new(TrackedMap::new(
+        map,
+        Arc::new(crate::nodedb::flush_gens::FlushGens::default()),
+        crate::nodedb::flush_gens::FlushArtifact::CsrGraph,
+    ))
 }
 
 /// A KV write buffer and cache for engines built outside `NodeDbLite`.
