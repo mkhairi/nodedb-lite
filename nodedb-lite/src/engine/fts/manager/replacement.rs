@@ -68,12 +68,28 @@ impl FtsCollectionManager {
             ..
         } = replacement;
         let system = index_key(&collection, "_geohash");
+        let removed: Vec<String> = self
+            .indices
+            .keys()
+            .filter(|key| key_of_collection(key, &collection) && *key != &system)
+            .filter(|key| !indices.contains_key(*key))
+            .cloned()
+            .collect();
+        let published: Vec<String> = indices.keys().cloned().collect();
         self.indices
             .retain(|key, _| !key_of_collection(key, &collection) || key == &system);
         self.retained
             .retain(|key, _| !key_of_collection(key, &collection) || key == &system);
         self.indices.extend(indices);
         self.retained.extend(retained);
+        // A published index replaces the stored form under its key; one the
+        // replacement left out is deleted by the next flush.
+        for key in published {
+            self.mark_created(&key);
+        }
+        for key in removed {
+            self.mark_removed(&key);
+        }
         self.remove_declaration_policy(&collection);
         if let Some(declaration) = &record.declaration {
             self.collection_analyzers

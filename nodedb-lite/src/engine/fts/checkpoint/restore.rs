@@ -32,6 +32,9 @@ pub(crate) struct RestoredFts {
     /// schemaless documents. `false` for an older checkpoint, whose
     /// schemaless documents need re-indexing to gain them.
     pub per_field_layout: bool,
+    /// The stored index list, recorded as written so an unchanged list is
+    /// not written again.
+    pub stored_catalog: Vec<u8>,
 }
 
 fn decode_err(what: &str, e: impl std::fmt::Display) -> NodeDbError {
@@ -209,5 +212,6 @@ where
         surrogate_to_id,
         next_surrogate: state.next_surrogate,
         per_field_layout,
+        stored_catalog: keys_bytes,
     })
 }

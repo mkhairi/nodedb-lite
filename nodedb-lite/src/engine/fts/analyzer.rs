@@ -24,6 +24,33 @@ use super::manager::{FtsCollectionManager, resident_index};
 use crate::engine::fts::LiteFtsIndex;
 use crate::error::LiteError;
 
+/// Bind `analyzer` and `fuzzy` to the index under `key`, each when given.
+///
+/// Returns whether a stored value changed. Both are meta blobs a flush
+/// persists with the index, so a binding the index already holds leaves it
+/// clean.
+pub(in crate::engine::fts) fn bind_text_config(
+    idx: &LiteFtsIndex,
+    key: &str,
+    analyzer: Option<&str>,
+    fuzzy: Option<bool>,
+) -> Result<bool, nodedb_fts::backend::memory::MemoryError> {
+    let mut changed = false;
+    if let Some(name) = analyzer
+        && idx.get_collection_analyzer(0, 0, key)?.as_deref() != Some(name)
+    {
+        idx.set_collection_analyzer(0, 0, key, name)?;
+        changed = true;
+    }
+    if let Some(fuzzy) = fuzzy
+        && idx.get_collection_fuzzy(0, 0, key)? != fuzzy
+    {
+        idx.set_collection_fuzzy(0, 0, key, fuzzy)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
 impl FtsCollectionManager {
     /// Bind `analyzer_name` to every index belonging to `collection`, and
     /// retain it so indexes created later inherit the same analyzer.
@@ -39,9 +66,11 @@ impl FtsCollectionManager {
         self.collection_analyzers
             .insert(collection.to_string(), analyzer_name.to_string());
         for key in self.collection_keys(collection) {
-            if let Some(idx) = self.indices.get(&key) {
-                idx.set_collection_analyzer(0, 0, &key, analyzer_name)
-                    .map_err(|e| fts_err(collection, e))?;
+            if let Some(idx) = self.indices.get(&key)
+                && bind_text_config(idx, &key, Some(analyzer_name), None)
+                    .map_err(|e| fts_err(collection, e))?
+            {
+                self.mark_index(&key);
             }
         }
         Ok(())
@@ -54,9 +83,11 @@ impl FtsCollectionManager {
         self.collection_fuzzy_defaults
             .insert(collection.to_string(), fuzzy);
         for key in self.collection_keys(collection) {
-            if let Some(idx) = self.indices.get(&key) {
-                idx.set_collection_fuzzy(0, 0, &key, fuzzy)
-                    .map_err(|e| fts_err(collection, e))?;
+            if let Some(idx) = self.indices.get(&key)
+                && bind_text_config(idx, &key, None, Some(fuzzy))
+                    .map_err(|e| fts_err(collection, e))?
+            {
+                self.mark_index(&key);
             }
         }
         Ok(())
@@ -102,6 +133,8 @@ impl FtsCollectionManager {
 mod tests {
     use super::FtsCollectionManager;
     use crate::engine::fts::manager::test_governor;
+    use crate::nodedb::flush_gens::{FlushArtifact, FlushGens};
+    use std::sync::Arc;
 
     const DOC_KEY: &str = "col";
 
@@ -231,5 +264,40 @@ mod tests {
         assert_eq!(mgr.fuzzy_for("a:b"), Some(true));
         assert_eq!(mgr.analyzer_for("a"), None);
         assert_eq!(mgr.fuzzy_for("a"), None);
+    }
+
+    #[test]
+    fn rebinding_config_marks_an_index_dirty_only_when_it_changes() {
+        let gens = Arc::new(FlushGens::default());
+        let mut mgr = FtsCollectionManager::with_gens(test_governor(), Arc::clone(&gens));
+        mgr.index_document("col", "doc1", "the quick brown fox")
+            .expect("index update must succeed");
+        mgr.index_document("other", "doc2", "a lazy dog")
+            .expect("index update must succeed");
+        gens.mark_clean(FlushArtifact::FtsIndex, DOC_KEY);
+        gens.mark_clean(FlushArtifact::FtsIndex, "other");
+
+        mgr.set_collection_analyzer("col", "german")
+            .expect("bind analyzer");
+        assert!(
+            gens.is_dirty(FlushArtifact::FtsIndex, DOC_KEY),
+            "a new analyzer changes the index's stored meta"
+        );
+        assert!(
+            !gens.is_dirty(FlushArtifact::FtsIndex, "other"),
+            "another collection's index is untouched"
+        );
+
+        gens.mark_clean(FlushArtifact::FtsIndex, DOC_KEY);
+        mgr.set_collection_analyzer("col", "german")
+            .expect("bind analyzer");
+        mgr.set_collection_fuzzy("col", false).expect("bind fuzzy");
+        assert!(
+            !gens.is_dirty(FlushArtifact::FtsIndex, DOC_KEY),
+            "binding the value the index already holds changes nothing"
+        );
+
+        mgr.set_collection_fuzzy("col", true).expect("bind fuzzy");
+        assert!(gens.is_dirty(FlushArtifact::FtsIndex, DOC_KEY));
     }
 }

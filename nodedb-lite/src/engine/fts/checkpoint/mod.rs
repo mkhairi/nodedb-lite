@@ -13,9 +13,13 @@ mod serialize;
 mod trust;
 mod write;
 
+pub(crate) use format::COLLECTIONS_KEY;
 pub(crate) use restore::restore_fts;
+#[cfg(test)]
 pub(crate) use serialize::serialize_fts;
+pub(crate) use serialize::{FtsFlush, catalog_changed, plan_fts};
 pub(crate) use trust::{
-    checkpoint_compatible, persist_checkpoint_complete, persist_checkpoint_incomplete,
+    CHECKPOINT_STATE_KEY, checkpoint_compatible, encode_checkpoint_complete,
+    encode_checkpoint_incomplete, persist_checkpoint_complete, persist_checkpoint_incomplete,
 };
-pub(crate) use write::write_serialized_fts;
+pub(crate) use write::write_planned_fts;

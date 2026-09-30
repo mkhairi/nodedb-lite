@@ -181,9 +181,37 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // `crdt` guard but committed after it is released, so concurrent
         // flushes would hand out the same numbers. See `flush_lock`.
         let _flush_guard = self.flush_lock.lock().await;
-        crate::engine::fts::checkpoint::persist_checkpoint_incomplete(self.storage.as_ref())
-            .await
+        // The checkpoint-state marker reads incomplete while the FTS state
+        // on disk may lag memory. It is skipped when the FTS index has
+        // nothing to write and the stored marker already reads what this
+        // flush would end with: FTS mutations wait for the exclusive admission
+        // this flush holds, so the stored index stays current throughout.
+        let fts_markers = {
+            use crate::engine::fts::checkpoint::{
+                CHECKPOINT_STATE_KEY, encode_checkpoint_complete, encode_checkpoint_incomplete,
+            };
+            let fts = self.fts_state.manager.lock_or_recover();
+            let end_state = if self.fts_state.checkpoint_trusted() {
+                encode_checkpoint_complete(&fts.declaration_revisions())
+            } else {
+                encode_checkpoint_incomplete()
+            }
             .map_err(NodeDbError::from)?;
+            full || fts.checkpoint_pending(full)
+                || self
+                    .flush_gens
+                    .meta_changed(CHECKPOINT_STATE_KEY, &end_state)
+        };
+        if fts_markers {
+            crate::engine::fts::checkpoint::persist_checkpoint_incomplete(self.storage.as_ref())
+                .await
+                .map_err(NodeDbError::from)?;
+            self.flush_gens.mark_meta_written(
+                crate::engine::fts::checkpoint::CHECKPOINT_STATE_KEY,
+                crate::engine::fts::checkpoint::encode_checkpoint_incomplete()
+                    .map_err(NodeDbError::from)?,
+            );
+        }
 
         // Drain the buffered KV writes first — they have their own batch-commit
         // path. Without this, `flush()` (and the auto-flush timer) would not
@@ -422,22 +450,27 @@ impl<S: StorageEngine> NodeDbLite<S> {
         .await?;
 
         // ── Persist FTS indices (separate batch — potentially large) ──
-        // Serialize is synchronous (no I/O); do it inside the lock so we don't
-        // need to clone FtsIndex.  The resulting ops + segment blobs are written
-        // to storage after the lock is released.
-        let (fts_ops, fts_segment_writes) = {
-            let fts = self.fts_state.manager.lock_or_recover();
-            let (indices, id_to_surrogate, next_surrogate) = fts.checkpoint_data();
-            crate::engine::fts::checkpoint::serialize_fts(indices, id_to_surrogate, next_surrogate)
-                .map_err(|e| NodeDbError::storage(format!("fts serialize: {e}")))?
-        };
-        crate::engine::fts::checkpoint::write_serialized_fts(
+        // Only dirty indexes, a changed surrogate map, a changed index list,
+        // and dropped indexes are planned. Planning is synchronous (no I/O)
+        // and runs inside the lock, so each captured generation describes
+        // exactly the bytes serialized. The writes run after it is released.
+        let fts_flush = self
+            .fts_state
+            .manager
+            .lock_or_recover()
+            .checkpoint_dirty(full)
+            .map_err(|e| NodeDbError::storage(format!("fts serialize: {e}")))?;
+        let fts_written = crate::engine::fts::checkpoint::write_planned_fts(
             self.storage.as_ref(),
-            fts_ops,
-            fts_segment_writes,
+            fts_flush,
+            &self.flush_gens,
         )
         .await
         .map_err(|e| NodeDbError::storage(format!("fts flush: {e}")))?;
+        self.fts_state
+            .manager
+            .lock_or_recover()
+            .forget_dropped(&fts_written);
 
         // ── Persist sparse-vector inverted indices ────────────────────────────
         // Same shape as the FTS block: serialize synchronously under the lock,
@@ -481,7 +514,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             q.flush_staging().await.map_err(NodeDbError::from)?;
         }
 
-        if self.fts_state.checkpoint_trusted() {
+        if fts_markers && self.fts_state.checkpoint_trusted() {
             let revisions = self
                 .fts_state
                 .manager
@@ -493,6 +526,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
             )
             .await
             .map_err(NodeDbError::from)?;
+            self.flush_gens.mark_meta_written(
+                crate::engine::fts::checkpoint::CHECKPOINT_STATE_KEY,
+                crate::engine::fts::checkpoint::encode_checkpoint_complete(&revisions)
+                    .map_err(NodeDbError::from)?,
+            );
         }
         Ok(())
     }
