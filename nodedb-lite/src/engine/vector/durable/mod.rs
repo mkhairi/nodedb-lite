@@ -42,4 +42,4 @@ mod rows;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use rows::rebuild_index;
-pub(crate) use rows::{list_collections, load_collection, put_op, remove};
+pub(crate) use rows::{list_collections, list_doc_ids, load_collection, put_op, remove};
