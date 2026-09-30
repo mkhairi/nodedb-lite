@@ -71,6 +71,18 @@ impl<S: StorageEngine> NodeDbLite<S> {
         .await
     }
 
+    /// Document ids that have a durable vector row in `collection`, sorted.
+    ///
+    /// Exact membership: the same set a rebuild restores the index from, so it
+    /// is not limited by ANN recall or `k`. Cost is one prefix scan of the
+    /// collection's rows. It reads keys only, decodes no vectors, and does not
+    /// load the index or take the HNSW or id-map locks.
+    pub async fn vector_ids(&self, collection: &str) -> NodeDbResult<Vec<String>> {
+        crate::engine::vector::durable::list_doc_ids(&*self.storage, collection)
+            .await
+            .map_err(NodeDbError::storage)
+    }
+
     /// Insert a single embedding into the collection's default HNSW index and
     /// persist its document fields (including the embedding dimension) to CRDT
     /// storage. Lazily creates the HNSW index on first insert.

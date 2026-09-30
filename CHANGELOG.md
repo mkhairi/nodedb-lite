@@ -18,6 +18,9 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `NodeDbLite::vector_ids(collection)` returns the sorted doc ids that have a
+  durable vector row in `collection`. It is exact membership, the same set a
+  rebuild restores from, and costs one prefix scan without decoding vectors.
 - `NodeDbLite::flush_full()` writes every dirty-tracked flush artifact
   whether or not it changed. `flush()` stays the dirty-aware pass.
 - `NodeDbLite::flush_artifact_write_count(artifact, collection)` and

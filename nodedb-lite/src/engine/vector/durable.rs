@@ -182,6 +182,37 @@ pub(crate) async fn load_collection<S: StorageEngine>(
     Ok(out)
 }
 
+/// Document ids with a durable vector row in `collection`, sorted.
+///
+/// Reads keys only: values pass through the streaming scan undecoded, so a
+/// row that [`load_collection`] would skip as malformed still counts here.
+/// Ids are cut with [`collection_prefix`], which ends in the `:` delimiter, so
+/// `c1` never matches rows of `c10`.
+pub(crate) async fn list_doc_ids<S: StorageEngine>(
+    storage: &S,
+    collection: &str,
+) -> Result<Vec<String>, LiteError> {
+    let prefix = collection_prefix(collection);
+    let mut ids: Vec<String> = Vec::new();
+    storage
+        .scan_prefix_streaming(Namespace::Vector, &prefix, &mut |(row_key, _)| {
+            match row_key
+                .get(prefix.len()..)
+                .and_then(|b| std::str::from_utf8(b).ok())
+            {
+                Some(doc_id) => ids.push(doc_id.to_owned()),
+                None => tracing::warn!(
+                    collection,
+                    "durable vector row has a non-UTF-8 key; skipping"
+                ),
+            }
+            Ok(true)
+        })
+        .await?;
+    ids.sort_unstable();
+    Ok(ids)
+}
+
 /// Rebuild `collection`'s HNSW from its durable vectors.
 ///
 /// The single implementation shared by every recovery path — open-time restore
