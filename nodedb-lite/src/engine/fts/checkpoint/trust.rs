@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 use super::format::{LAYOUT_KEY, LAYOUT_PER_FIELD};
 
+/// `Namespace::Meta` key of the checkpoint state.
+pub(crate) const CHECKPOINT_STATE_KEY: &[u8] = KEY;
 const KEY: &[u8] = b"fts_checkpoint_state";
 const FORMAT: u32 = 1;
 const SEMANTICS: u32 = 1;
@@ -21,11 +23,36 @@ struct CheckpointState {
     revisions: BTreeMap<String, u64>,
 }
 
-async fn persist<S: StorageEngine>(storage: &S, state: &CheckpointState) -> Result<(), LiteError> {
-    let bytes = zerompk::to_msgpack_vec(state).map_err(|error| LiteError::Serialization {
+fn encode(state: &CheckpointState) -> Result<Vec<u8>, LiteError> {
+    zerompk::to_msgpack_vec(state).map_err(|error| LiteError::Serialization {
         detail: format!("FTS checkpoint state: {error}"),
-    })?;
-    storage.put(Namespace::Meta, KEY, &bytes).await
+    })
+}
+
+async fn persist<S: StorageEngine>(storage: &S, state: &CheckpointState) -> Result<(), LiteError> {
+    storage.put(Namespace::Meta, KEY, &encode(state)?).await
+}
+
+/// The stored bytes of an incomplete checkpoint state.
+pub(crate) fn encode_checkpoint_incomplete() -> Result<Vec<u8>, LiteError> {
+    encode(&CheckpointState {
+        format_version: FORMAT,
+        semantics_version: SEMANTICS,
+        complete: false,
+        revisions: BTreeMap::new(),
+    })
+}
+
+/// The stored bytes of a complete checkpoint state at `revisions`.
+pub(crate) fn encode_checkpoint_complete(
+    revisions: &BTreeMap<String, u64>,
+) -> Result<Vec<u8>, LiteError> {
+    encode(&CheckpointState {
+        format_version: FORMAT,
+        semantics_version: SEMANTICS,
+        complete: true,
+        revisions: revisions.clone(),
+    })
 }
 
 pub(crate) async fn persist_checkpoint_incomplete<S: StorageEngine>(

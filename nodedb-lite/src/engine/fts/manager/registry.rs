@@ -24,6 +24,7 @@ use nodedb_types::Surrogate;
 
 use crate::engine::fts::LiteFtsIndex;
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::{ArtifactFlush, FTS_SURROGATES_KEY, FlushArtifact, FlushGens};
 
 /// A resolved FTS result with the original string doc_id restored.
 pub struct FtsResult {
@@ -150,10 +151,27 @@ pub struct FtsCollectionManager {
     pub(in crate::engine::fts) collection_fuzzy_defaults: HashMap<String, bool>,
     /// Memory governor bound into every `FtsIndex` this manager creates.
     pub(in crate::engine::fts) governor: Arc<MemoryGovernor>,
+    /// Index keys removed whose stored segment, doc lengths, and meta blobs
+    /// no flush has deleted yet. A key leaves the set once its deletion is
+    /// durable, or when the index is created again.
+    pub(in crate::engine::fts) dropped: HashSet<String>,
+    /// Flush dirty tracking for every index, under its index key, and for
+    /// the surrogate map. Every mutation of an index marks it here; a call
+    /// that changes nothing marks nothing, so an idle index is not rewritten.
+    pub(in crate::engine::fts) gens: Arc<FlushGens>,
 }
 
 impl FtsCollectionManager {
+    /// Create an empty manager with its own, unshared flush tracking.
     pub fn new(governor: Arc<MemoryGovernor>) -> Self {
+        Self::with_gens(governor, Arc::new(FlushGens::default()))
+    }
+
+    /// Create an empty manager that records its mutations in `gens`.
+    ///
+    /// The store passes its own `FlushGens`, so its flush sees which indexes
+    /// changed.
+    pub(crate) fn with_gens(governor: Arc<MemoryGovernor>, gens: Arc<FlushGens>) -> Self {
         Self {
             retained: HashMap::new(),
             declarations: std::collections::BTreeMap::new(),
@@ -167,7 +185,28 @@ impl FtsCollectionManager {
             collection_analyzers: HashMap::new(),
             collection_fuzzy_defaults: HashMap::new(),
             governor,
+            dropped: HashSet::new(),
+            gens,
         }
+    }
+
+    /// Mark the index under `key` dirty for the next flush.
+    pub(in crate::engine::fts) fn mark_index(&self, key: &str) {
+        self.gens.bump(FlushArtifact::FtsIndex, key);
+    }
+
+    /// Mark the index under `key` created. Its write replaces whatever a
+    /// dropped index left in storage under the same key.
+    pub(in crate::engine::fts) fn mark_created(&mut self, key: &str) {
+        self.dropped.remove(key);
+        self.mark_index(key);
+    }
+
+    /// Mark the index under `key` removed: dirty, and its stored form due
+    /// for deletion by the next flush.
+    pub(in crate::engine::fts) fn mark_removed(&mut self, key: &str) {
+        self.mark_index(key);
+        self.dropped.insert(key.to_owned());
     }
 
     /// Look up or allocate a dense surrogate for a string `doc_id`.
@@ -194,6 +233,8 @@ impl FtsCollectionManager {
         })?;
         self.id_to_surrogate.insert(doc_id.to_owned(), s);
         self.surrogate_to_id.insert(s, doc_id.to_owned());
+        self.gens
+            .bump(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY);
         Ok(Surrogate(s))
     }
 
@@ -256,8 +297,74 @@ impl FtsCollectionManager {
 
     // ── Checkpoint helpers (used by core.rs flush/restore) ────────────────────
 
+    /// Serialize the indexes, surrogate map, and index list the next flush
+    /// must write, and the deletions of dropped indexes.
+    ///
+    /// Plans each write under this manager's lock, which the caller holds
+    /// through `&self`, so every captured generation describes exactly the
+    /// bytes serialized. `full` writes all of them.
+    pub(crate) fn checkpoint_dirty(
+        &self,
+        full: bool,
+    ) -> nodedb_types::error::NodeDbResult<crate::engine::fts::checkpoint::FtsFlush> {
+        crate::engine::fts::checkpoint::plan_fts(
+            &self.indices,
+            &self.dropped,
+            &self.id_to_surrogate,
+            self.next_surrogate,
+            full,
+            &self.gens,
+        )
+    }
+
+    /// Whether the next flush has any FTS state to write: a dirty index or
+    /// surrogate map, a dropped index, or a changed index list.
+    pub(crate) fn checkpoint_pending(&self, full: bool) -> bool {
+        full || !self.dropped.is_empty()
+            || self
+                .gens
+                .is_dirty(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY)
+            || self
+                .indices
+                .keys()
+                .any(|key| self.gens.is_dirty(FlushArtifact::FtsIndex, key))
+            || crate::engine::fts::checkpoint::catalog_changed(&self.indices, &self.gens)
+    }
+
+    /// Forget the dropped indexes whose stored forms a flush deleted.
+    ///
+    /// `written` lists the index writes that flush made durable. A key that
+    /// was created again, or dropped again since, keeps its current state.
+    pub(crate) fn forget_dropped(&mut self, written: &[ArtifactFlush]) {
+        for planned in written {
+            let key = planned.key();
+            if !self.indices.contains_key(key) && !self.gens.is_dirty(FlushArtifact::FtsIndex, key)
+            {
+                self.dropped.remove(key);
+            }
+        }
+    }
+
+    /// Record the restored checkpoint as this handle's own stored form.
+    ///
+    /// Every index loaded from it and the surrogate map start clean, and the
+    /// stored index list counts as written, so a flush rewrites none of them
+    /// until they change. Call after [`Self::load_checkpoint`].
+    pub(crate) fn mark_checkpoint_clean(&self, stored_catalog: &[u8]) {
+        for key in self.indices.keys() {
+            self.gens.mark_clean(FlushArtifact::FtsIndex, key);
+        }
+        self.gens
+            .mark_clean(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY);
+        self.gens.mark_meta_written(
+            crate::engine::fts::checkpoint::COLLECTIONS_KEY,
+            stored_catalog.to_vec(),
+        );
+    }
+
     /// Borrow the index map, surrogate map, and next-surrogate counter for
-    /// serialization.  Called by `checkpoint::serialize_fts`.
+    /// serialization.  Called by `checkpoint::serialize_fts` in tests.
+    #[cfg(test)]
     pub(crate) fn checkpoint_data(
         &self,
     ) -> (
@@ -290,6 +397,14 @@ impl FtsCollectionManager {
                 )
             })
             .collect();
+        // Indexes this load replaces or adds no longer match a stored form
+        // this handle wrote; `mark_checkpoint_clean` vouches for the ones the
+        // restore read back.
+        for key in self.indices.keys().chain(indices.keys()) {
+            self.mark_index(key);
+        }
+        self.gens
+            .bump(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY);
         self.indices = indices;
         self.id_to_surrogate = id_to_surrogate;
         self.surrogate_to_id = surrogate_to_id;
