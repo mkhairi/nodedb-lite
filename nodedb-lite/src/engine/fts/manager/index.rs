@@ -147,7 +147,11 @@ impl FtsCollectionManager {
             let fresh = self.new_index_for(collection, key)?;
             self.indices.insert(key.to_owned(), fresh);
             self.retained.insert(key.to_owned(), retained);
+            self.mark_created(key);
         }
+        // The write below replaces this document's postings, so the index
+        // changes. Re-indexing identical text over-marks; it never misses.
+        self.mark_index(key);
         let tokens = self
             .indices
             .get(key)
@@ -194,6 +198,9 @@ impl FtsCollectionManager {
             .map_err(|e| fts_err(collection, e))?
             .is_some();
         if held {
+            // Marked before the removal: one that fails partway still left
+            // the index changed.
+            self.mark_index(key);
             idx.remove_document(0, 0, key, surrogate)
                 .map_err(|e| fts_err(collection, e))?;
         }
@@ -243,6 +250,8 @@ mod tests {
 
     use super::super::registry::test_governor;
     use super::FtsCollectionManager;
+    use crate::nodedb::flush_gens::{FTS_SURROGATES_KEY, FlushArtifact, FlushGens};
+    use std::sync::Arc;
 
     fn doc(pairs: &[(&str, &str)]) -> HashMap<String, Value> {
         pairs
@@ -395,5 +404,57 @@ mod tests {
             .expect("removal must succeed");
         assert!(removed.is_none(), "unknown surrogate must return None");
         assert_eq!(hits(&mgr, "", "hello"), vec!["doc1"]);
+    }
+
+    // ── Flush dirty tracking ──────────────────────────────────────────────────
+
+    #[test]
+    fn only_a_real_change_marks_an_index_or_the_surrogates_dirty() {
+        let gens = Arc::new(FlushGens::default());
+        let mut mgr = FtsCollectionManager::with_gens(test_governor(), Arc::clone(&gens));
+        mgr.index_document("col", "doc1", "the quick brown fox")
+            .expect("index update must succeed");
+        mgr.index_document("col", "doc2", "a lazy dog")
+            .expect("index update must succeed");
+        mgr.index_field("col", "title", "doc1", "quick")
+            .expect("index update must succeed");
+        let clean = |key: &str| gens.mark_clean(FlushArtifact::FtsIndex, key);
+        clean("col");
+        clean("col:title");
+        gens.mark_clean(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY);
+
+        mgr.remove_document("col", "never_indexed")
+            .expect("removal must succeed");
+        mgr.remove_field("col", "body", "doc1")
+            .expect("removal must succeed");
+        mgr.remove_field("col", "title", "doc2")
+            .expect("removal must succeed");
+        mgr.drop_collection("nothing_here");
+        for key in ["col", "col:title"] {
+            assert!(
+                !gens.is_dirty(FlushArtifact::FtsIndex, key),
+                "a call that changes nothing must not mark {key} dirty"
+            );
+        }
+
+        mgr.index_document("col", "doc1", "a slow turtle")
+            .expect("index update must succeed");
+        assert!(gens.is_dirty(FlushArtifact::FtsIndex, "col"));
+        assert!(!gens.is_dirty(FlushArtifact::FtsIndex, "col:title"));
+        assert!(
+            !gens.is_dirty(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY),
+            "re-indexing a known document allocates no surrogate"
+        );
+
+        mgr.index_document("col", "doc3", "brand new words")
+            .expect("index update must succeed");
+        assert!(gens.is_dirty(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY));
+
+        clean("col:title");
+        mgr.drop_collection("col");
+        assert!(
+            gens.is_dirty(FlushArtifact::FtsIndex, "col:title"),
+            "a dropped index must be flushed so its stored form is deleted"
+        );
     }
 }

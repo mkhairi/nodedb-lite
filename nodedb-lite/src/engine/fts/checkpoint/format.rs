@@ -27,9 +27,14 @@
 //! |-----------------------------------|------------------------------------|
 //! | `fts:{index_key}:mt:{scoped_term}`| MessagePack `Vec<SerPosting>`      |
 //!
-//! Every flush writes the whole state and removes each key and segment the
-//! flush did not write, so a dropped index or a retracted term does not come
-//! back on restore.
+//! A flush writes only the indexes that changed since this handle last wrote
+//! them, the surrogate map only when a surrogate was allocated, and the index
+//! list only when the set of indexes changed. A changed index is written
+//! whole: an empty one writes an empty segment and doc-length list, and a
+//! rewritten index on the KV path deletes the terms it no longer holds. A
+//! dropped index has its segment, doc lengths and meta blobs deleted, and a
+//! changed index list also removes every key and segment no current index
+//! owns, so a dropped index or a retracted term does not come back on restore.
 //!
 //! ## Rationale: memtable vs segment storage
 //!
@@ -44,7 +49,7 @@ use nodedb_types::Surrogate;
 use serde::{Deserialize, Serialize};
 
 /// Key of the index key list.
-pub(super) const COLLECTIONS_KEY: &[u8] = b"fts:_collections";
+pub(crate) const COLLECTIONS_KEY: &[u8] = b"fts:_collections";
 
 /// Key of the surrogate maps.
 pub(super) const SURROGATES_KEY: &[u8] = b"fts:_surrogates";

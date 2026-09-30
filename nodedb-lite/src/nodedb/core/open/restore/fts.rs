@@ -17,8 +17,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
     pub(in crate::nodedb::core::open) async fn restore_fts_indices(
         storage: &Arc<S>,
         governor: &Arc<MemoryGovernor>,
+        flush_gens: &Arc<crate::nodedb::flush_gens::FlushGens>,
     ) -> NodeDbResult<(crate::engine::fts::FtsCollectionManager, bool)> {
-        let mut mgr = crate::engine::fts::FtsCollectionManager::new(Arc::clone(governor));
+        let mut mgr = crate::engine::fts::FtsCollectionManager::with_gens(
+            Arc::clone(governor),
+            Arc::clone(flush_gens),
+        );
         let declarations = crate::engine::fts::catalog::load_declarations(storage.as_ref()).await?;
         mgr.load_declarations(declarations);
         if !crate::engine::fts::checkpoint::checkpoint_compatible(
@@ -42,6 +46,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
                     restored.surrogate_to_id,
                     restored.next_surrogate,
                 );
+                // Every index restore read back matches its stored form, so
+                // it starts clean. One the declarations create next, or a
+                // rebuild re-indexes, is marked dirty as it changes.
+                mgr.mark_checkpoint_clean(&restored.stored_catalog);
                 mgr.ensure_declaration_indices()?;
                 Ok((mgr, complete))
             }

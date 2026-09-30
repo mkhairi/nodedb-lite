@@ -70,6 +70,18 @@ impl FtsCollectionManager {
     }
 
     pub(crate) fn ensure_declaration_indices(&mut self) -> Result<(), LiteError> {
+        let mut created: Vec<String> = Vec::new();
+        let result = self.ensure_declaration_indices_inner(&mut created);
+        for key in created {
+            self.mark_created(&key);
+        }
+        result
+    }
+
+    fn ensure_declaration_indices_inner(
+        &mut self,
+        created: &mut Vec<String>,
+    ) -> Result<(), LiteError> {
         for (collection, record) in &self.declarations {
             let Some(declaration) = &record.declaration else {
                 continue;
@@ -82,6 +94,7 @@ impl FtsCollectionManager {
                     let index = self.new_index_for(collection, &key)?;
                     self.indices.insert(key.clone(), index);
                     self.retained.insert(key.clone(), retained);
+                    created.push(key.clone());
                 }
                 let index = self.indices.get(&key).ok_or_else(|| {
                     super::registry::fts_err(
@@ -89,22 +102,39 @@ impl FtsCollectionManager {
                         format!("declared index '{key}' is absent"),
                     )
                 })?;
-                index
-                    .set_collection_analyzer(0, 0, &key, &declaration.analyzer)
-                    .map_err(|error| super::registry::fts_err(collection, error))?;
-                index
-                    .set_collection_fuzzy(0, 0, &key, declaration.fuzzy)
-                    .map_err(|error| super::registry::fts_err(collection, error))?;
+                // The analyzer and fuzzy flag are meta blobs a flush persists
+                // with the index, so an index whose binding changes is dirty.
+                let changed = super::super::analyzer::bind_text_config(
+                    index,
+                    &key,
+                    Some(&declaration.analyzer),
+                    Some(declaration.fuzzy),
+                )
+                .map_err(|error| super::registry::fts_err(collection, error))?;
+                if changed {
+                    self.gens
+                        .bump(crate::nodedb::flush_gens::FlushArtifact::FtsIndex, &key);
+                }
             }
         }
         Ok(())
     }
 
     pub(crate) fn remove_collection_postings(&mut self, collection: &str) {
+        let removed: Vec<String> = self
+            .indices
+            .keys()
+            .filter(|key| super::registry::key_of_collection(key, collection))
+            .cloned()
+            .collect();
         self.indices
             .retain(|key, _| !super::registry::key_of_collection(key, collection));
         self.retained
             .retain(|key, _| !super::registry::key_of_collection(key, collection));
+        // The next flush deletes each removed index's stored form.
+        for key in removed {
+            self.mark_removed(&key);
+        }
     }
 
     pub(crate) fn remove_declaration_policy(&mut self, collection: &str) {
