@@ -23,9 +23,10 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `NodeDbLite::flush_artifact_write_count(artifact, collection)` and
   `flush_artifact_is_dirty(artifact, collection)` report per-artifact flush
   writes and pending state for `FlushArtifact::{HnswGraph, HnswIdMap,
-  VectorSegment, CsrGraph, SparseIndex, SpatialRtree, SpatialDocMap}`.
-  `spatial_rtree_key(collection, field)` builds the key a `SpatialRtree` is
-  tracked under.
+  VectorSegment, CsrGraph, SparseIndex, SpatialRtree, SpatialDocMap, FtsIndex,
+  FtsSurrogates}`. `spatial_rtree_key(collection, field)` builds the key a
+  `SpatialRtree` is tracked under. `FTS_SURROGATES_KEY` is the key
+  `FtsSurrogates` is tracked under.
 
 ### Fixed
 
@@ -47,7 +48,7 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `meta:hnsw_collections` and `meta:last_flushed_mid` entries are written only
   when their value changes. An idle store with vector data now makes no HNSW
   or meta writes per tick; before, it rewrote the full vector segment each
-  time. The FTS flush path is unchanged.
+  time.
 
 - `flush()` no longer rewrites every CSR graph on every tick. Each graph
   collection's adjacency checkpoint carries a mutation generation and is
@@ -74,6 +75,29 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Before, it aborted the flush and skipped the FTS and sparse writes after
   it. A tree restored from its checkpoint starts clean. A tree rebuilt at
   open starts dirty.
+
+- `flush()` no longer rewrites every full-text index on every tick. Each
+  index carries a mutation generation and is written only when dirty: its
+  posting segment, doc lengths, and meta blobs together. `fts:_surrogates` is
+  written only when a new surrogate is allocated, so updating an existing
+  document does not rewrite it. `fts:_collections` is written in sorted
+  order, and only when the set of indexes changes. A failed FTS segment write
+  is logged and leaves the index dirty, and the next flush retries it. Before,
+  it aborted the flush and skipped the sparse writes after it. An index
+  restored with its postings, doc lengths, and meta blobs all decoded starts
+  clean. One rebuilt at open, or with any part undecodable, starts dirty. A
+  `flush()` with nothing to write now issues no storage batch at all.
+
+- A document deleted from a full-text index no longer comes back after a
+  reopen when it was the index's last document. The flush skipped an index
+  with no postings, so the segment and doc lengths stored before the delete
+  stayed on disk and the reopen restored them. An empty index now writes an
+  empty segment and an empty doc-length list. `DROP COLLECTION` and
+  `TRUNCATE` now delete the dropped indexes' segments, doc lengths, and meta
+  blobs. Before, they stayed on disk, and an index created again under the
+  same key that was empty at its next flush restored the dropped documents.
+  Without FTS segments, a flush also deletes the stored per-term entries an
+  index no longer holds.
 
 - Shutdown no longer aborts an in-flight auto-flush or auto-compaction after
   5 s; it waits for the pass to finish, so a stop during a long flush cannot

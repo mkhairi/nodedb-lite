@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Flush writes a derived HNSW, CSR, sparse, or spatial artifact only when it
-//! changed.
+//! Flush writes a derived HNSW, CSR, sparse, spatial, or full-text artifact
+//! only when it changed.
 //!
 //! `flush()` runs on a timer. Rewriting every collection's graph checkpoint,
 //! the vector id-map, every vector segment, every CSR adjacency checkpoint,
-//! every sparse index, and every spatial R-tree and doc-map on each tick costs
-//! their full size whether or not anything changed: an idle store with a
-//! large vector collection rewrote hundreds of megabytes per tick.
+//! every sparse index, every spatial R-tree and doc-map, and every full-text
+//! index on each tick costs their full size whether or not anything changed:
+//! an idle store with a large vector collection rewrote hundreds of megabytes
+//! per tick.
 //!
 //! These assert on per-artifact write counters and on the keys a probing
 //! storage wrapper saw, not on elapsed time, so they fail for the reason they
@@ -20,7 +21,7 @@ use std::time::Duration;
 use nodedb_client::NodeDb;
 use nodedb_lite::engine::vector::pagedb_backing::PagedbBacking;
 use nodedb_lite::error::LiteError;
-use nodedb_lite::nodedb::{FlushArtifact, ID_MAP_KEY, spatial_rtree_key};
+use nodedb_lite::nodedb::{FTS_SURROGATES_KEY, FlushArtifact, ID_MAP_KEY, spatial_rtree_key};
 use nodedb_lite::storage::array_segment_ext::ArraySegmentExt;
 use nodedb_lite::storage::columnar_segment_ext::ColumnarSegmentExt;
 use nodedb_lite::storage::engine::{CompactionOutcome, KvPair};
@@ -34,6 +35,7 @@ use nodedb_lite::{
 use nodedb_types::document::Document;
 use nodedb_types::geometry::Geometry;
 use nodedb_types::id::NodeId;
+use nodedb_types::text_search::TextSearchParams;
 use nodedb_types::value::Value;
 use nodedb_types::{BoundingBox, Namespace};
 use tokio::sync::Notify;
@@ -87,6 +89,15 @@ async fn open_manual_flush(path: &std::path::Path) -> Arc<NodeDbLite<PagedbStora
 
 /// Open over a [`ProbeStorage`], returning the probe that controls it.
 async fn open_probed(path: &std::path::Path) -> (Arc<NodeDbLite<ProbeStorage>>, Arc<Probe>) {
+    open_probed_with(path, manual_flush_config()).await
+}
+
+/// Open over a [`ProbeStorage`] with `config`, returning the probe that
+/// controls it.
+async fn open_probed_with(
+    path: &std::path::Path,
+    config: LiteConfig,
+) -> (Arc<NodeDbLite<ProbeStorage>>, Arc<Probe>) {
     let inner = PagedbStorageDefault::open(path, Encryption::Plaintext)
         .await
         .expect("open storage");
@@ -95,7 +106,7 @@ async fn open_probed(path: &std::path::Path) -> (Arc<NodeDbLite<ProbeStorage>>, 
         inner,
         probe: Arc::clone(&probe),
     };
-    let db = NodeDbLite::open_with_config(storage, manual_flush_config())
+    let db = NodeDbLite::open_with_config(storage, config)
         .await
         .expect("open db");
     (db, probe)
@@ -215,7 +226,7 @@ struct Probe {
     fail_graph_segment_writes: AtomicBool,
     /// Parks a CSR graph segment write for a collection, before it is applied.
     graph_segment_gate: Gate,
-    /// `(namespace, key)` of every delete a committed batch carried.
+    /// `(namespace, key)` of every committed delete, in a batch or on its own.
     deletes: Mutex<Vec<(Namespace, Vec<u8>)>>,
     /// Every committed non-empty batch, as the `(namespace, key)` of each op.
     batches: Mutex<Vec<BatchKeys>>,
@@ -225,6 +236,16 @@ struct Probe {
     fail_spatial_segment_writes: AtomicBool,
     /// Parks a spatial segment write for a collection, before it is applied.
     spatial_segment_gate: Gate,
+    /// Collection of every successful vector segment write.
+    vector_segment_writes: Mutex<Vec<String>>,
+    /// Index key of every successful FTS segment write.
+    fts_segment_writes: Mutex<Vec<String>>,
+    /// Index key of every successful FTS segment delete.
+    fts_segment_deletes: Mutex<Vec<String>>,
+    /// Makes every FTS segment write fail while set.
+    fail_fts_segment_writes: AtomicBool,
+    /// Parks an FTS segment write for an index key, before it is applied.
+    fts_segment_gate: Gate,
 }
 
 impl Probe {
@@ -249,6 +270,24 @@ impl Probe {
         let mut writes = std::mem::take(&mut *self.spatial_segment_writes.lock().unwrap());
         writes.sort();
         writes
+    }
+
+    fn take_vector_segment_writes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.vector_segment_writes.lock().unwrap())
+    }
+
+    /// Successful FTS segment writes, sorted.
+    fn take_fts_segment_writes(&self) -> Vec<String> {
+        let mut writes = std::mem::take(&mut *self.fts_segment_writes.lock().unwrap());
+        writes.sort();
+        writes
+    }
+
+    /// Successful FTS segment deletes, sorted.
+    fn take_fts_segment_deletes(&self) -> Vec<String> {
+        let mut deletes = std::mem::take(&mut *self.fts_segment_deletes.lock().unwrap());
+        deletes.sort();
+        deletes
     }
 }
 
@@ -310,6 +349,14 @@ impl ProbeStorage {
                 detail: "probe: inner storage has no spatial segment support".into(),
             })
     }
+
+    fn fts_segments(&self) -> Result<&dyn FtsSegmentExt, LiteError> {
+        self.inner
+            .as_fts_segment_ext()
+            .ok_or_else(|| LiteError::Storage {
+                detail: "probe: inner storage has no FTS segment support".into(),
+            })
+    }
 }
 
 #[async_trait::async_trait]
@@ -325,7 +372,9 @@ impl StorageEngine for ProbeStorage {
     }
 
     async fn delete(&self, ns: Namespace, key: &[u8]) -> Result<(), LiteError> {
-        self.inner.delete(ns, key).await
+        self.inner.delete(ns, key).await?;
+        self.probe.deletes.lock().unwrap().push((ns, key.to_vec()));
+        Ok(())
     }
 
     async fn scan_prefix(&self, ns: Namespace, prefix: &[u8]) -> Result<Vec<KvPair>, LiteError> {
@@ -407,7 +456,7 @@ impl StorageEngine for ProbeStorage {
     }
 
     fn as_fts_segment_ext(&self) -> Option<&dyn FtsSegmentExt> {
-        self.inner.as_fts_segment_ext()
+        Some(self)
     }
 
     fn as_columnar_segment_ext(&self) -> Option<&dyn ColumnarSegmentExt> {
@@ -440,7 +489,13 @@ impl VectorSegmentExt for ProbeStorage {
         }
         self.segments()?
             .write_vector_segment(collection_name, dim, vectors, surrogate_ids)
-            .await
+            .await?;
+        self.probe
+            .vector_segment_writes
+            .lock()
+            .unwrap()
+            .push(collection_name.to_string());
+        Ok(())
     }
 
     async fn open_vector_segment(
@@ -533,6 +588,45 @@ impl SpatialSegmentExt for ProbeStorage {
         self.spatial_segments()?
             .delete_spatial_segment(collection, field)
             .await
+    }
+}
+
+#[async_trait::async_trait]
+impl FtsSegmentExt for ProbeStorage {
+    async fn write_fts_segment(&self, index_key: &str, bytes: &[u8]) -> Result<(), LiteError> {
+        self.probe.fts_segment_gate.pass(index_key).await;
+        if self.probe.fail_fts_segment_writes.load(Ordering::SeqCst) {
+            return Err(LiteError::Storage {
+                detail: format!("probe: injected FTS segment write failure for {index_key}"),
+            });
+        }
+        self.fts_segments()?
+            .write_fts_segment(index_key, bytes)
+            .await?;
+        self.probe
+            .fts_segment_writes
+            .lock()
+            .unwrap()
+            .push(index_key.to_string());
+        Ok(())
+    }
+
+    async fn open_fts_segment(&self, index_key: &str) -> Result<Option<Box<[u8]>>, LiteError> {
+        self.fts_segments()?.open_fts_segment(index_key).await
+    }
+
+    async fn delete_fts_segment(&self, index_key: &str) -> Result<(), LiteError> {
+        self.fts_segments()?.delete_fts_segment(index_key).await?;
+        self.probe
+            .fts_segment_deletes
+            .lock()
+            .unwrap()
+            .push(index_key.to_string());
+        Ok(())
+    }
+
+    async fn list_fts_segments(&self, prefix: &str) -> Result<Vec<String>, LiteError> {
+        self.fts_segments()?.list_fts_segments(prefix).await
     }
 }
 
@@ -1684,84 +1778,620 @@ async fn flush_full_writes_every_spatial_tree_doc_map_and_catalog_entry() {
 }
 
 // ---------------------------------------------------------------------------
-// Every tracked engine together
+// Full-text search
 // ---------------------------------------------------------------------------
 
-/// Ops outside the FTS engine. FTS is excluded on purpose: its flush is not
-/// dirty-tracked yet and still writes `fts:_collections` and
-/// `fts:_surrogates` on every tick.
-fn non_fts(ops: &[(Namespace, Vec<u8>)]) -> Vec<String> {
+const NOTES: &str = "notes";
+const MEMOS: &str = "memos";
+
+/// The key a collection's whole-document text index is tracked under.
+fn fts_key(collection: &str) -> String {
+    format!("{collection}:_doc")
+}
+
+fn fts_writes<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str) -> u64 {
+    db.flush_artifact_write_count(FlushArtifact::FtsIndex, &fts_key(collection))
+}
+
+fn fts_dirty<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str) -> bool {
+    db.flush_artifact_is_dirty(FlushArtifact::FtsIndex, &fts_key(collection))
+}
+
+fn surrogate_writes<S: StorageEngine>(db: &NodeDbLite<S>) -> u64 {
+    db.flush_artifact_write_count(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY)
+}
+
+fn surrogates_dirty<S: StorageEngine>(db: &NodeDbLite<S>) -> bool {
+    db.flush_artifact_is_dirty(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY)
+}
+
+/// Write a document whose only field holds `text`.
+async fn put_text<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str, id: &str, text: &str) {
+    let mut doc = Document::new(id);
+    doc.set("body", Value::String(text.into()));
+    db.document_put(collection, doc)
+        .await
+        .expect("document_put");
+}
+
+/// Ids of the documents a text query matches, sorted.
+async fn text_hits<S: StorageEngine>(
+    db: &NodeDbLite<S>,
+    collection: &str,
+    query: &str,
+) -> Vec<String> {
+    let hits = db
+        .text_search(collection, "", query, 10, TextSearchParams::default(), None)
+        .await
+        .expect("text_search");
+    let mut ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+    ids.sort();
+    ids
+}
+
+/// `<namespace>/<key>` of each op, in order.
+fn op_names(ops: &[(Namespace, Vec<u8>)]) -> Vec<String> {
     ops.iter()
-        .filter(|(ns, _)| *ns != Namespace::Fts)
         .map(|(ns, key)| format!("{ns:?}/{}", String::from_utf8_lossy(key)))
         .collect()
 }
 
-/// With vectors, edges, sparse vectors, and geometries all flushed, a second
-/// flush writes nothing for any of those engines: no put, no delete, no
-/// batch, and no vector, graph, or spatial segment.
-///
-/// The seed writes no document text, and FTS keys are excluded from every
-/// assertion (see [`non_fts`]).
+/// Ops under `Namespace::Fts`, sorted.
+fn fts_ops(ops: &[(Namespace, Vec<u8>)]) -> Vec<String> {
+    let mut out: Vec<String> = ops
+        .iter()
+        .filter(|(ns, _)| *ns == Namespace::Fts)
+        .map(|(ns, key)| format!("{ns:?}/{}", String::from_utf8_lossy(key)))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Committed non-empty batches carrying any `Namespace::Fts` op.
+fn fts_batches(batches: &[BatchKeys]) -> usize {
+    batches
+        .iter()
+        .filter(|batch| batch.iter().any(|(ns, _)| *ns == Namespace::Fts))
+        .count()
+}
+
+/// A second flush with no text mutation in between writes no FTS key, runs
+/// no FTS batch, and writes no FTS segment.
 #[tokio::test]
-async fn second_flush_writes_nothing_for_vectors_edges_sparse_or_spatial() {
+async fn second_flush_without_mutation_writes_no_fts_key_or_segment() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (db, probe) = open_probed(&dir.path().join("all_idle.pagedb")).await;
-    insert(&db, ALPHA, 0..4).await;
-    add_edge(&db, GRAPH_A, "a", "b").await;
-    sparse_insert(&db, "a", "d1", 1);
+    let (db, probe) = open_probed(&dir.path().join("fts_idle.pagedb")).await;
+    put_text(&db, NOTES, "n1", "phoenix rises").await;
+
+    db.flush().await.expect("first flush");
+    assert_eq!(
+        (fts_writes(&db, NOTES), surrogate_writes(&db)),
+        (1, 1),
+        "the first flush writes the index and the surrogate map"
+    );
+    assert!(!fts_dirty(&db, NOTES) && !surrogates_dirty(&db));
+    probe.take_puts();
+    probe.take_deletes();
+    probe.take_batches();
+    probe.take_fts_segment_writes();
+
+    db.flush().await.expect("idle flush");
+
+    assert_eq!(fts_ops(&probe.take_puts()), Vec::<String>::new());
+    assert_eq!(fts_ops(&probe.take_deletes()), Vec::<String>::new());
+    assert_eq!(
+        fts_batches(&probe.take_batches()),
+        0,
+        "an idle flush must not run an FTS batch"
+    );
+    assert_eq!(probe.take_fts_segment_writes(), Vec::<String>::new());
+    assert_eq!((fts_writes(&db, NOTES), surrogate_writes(&db)), (1, 1));
+}
+
+/// A text write to one collection makes the next flush rewrite that
+/// collection's index only. The set of indexes is unchanged, so the index
+/// list is not written either.
+#[tokio::test]
+async fn text_write_rewrites_only_its_collections_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("fts_touch.pagedb")).await;
+    put_text(&db, NOTES, "n1", "phoenix rises").await;
+    put_text(&db, MEMOS, "m1", "ember glows").await;
+    db.flush().await.expect("seed flush");
+    let memos_before = fts_writes(&db, MEMOS);
+    probe.take_puts();
+    probe.take_fts_segment_writes();
+
+    put_text(&db, NOTES, "n2", "ashes settle").await;
+    assert!(fts_dirty(&db, NOTES));
+    assert!(!fts_dirty(&db, MEMOS));
+    db.flush().await.expect("flush after the text write");
+
+    assert_eq!(probe.take_fts_segment_writes(), vec![fts_key(NOTES)]);
+    let puts = fts_ops(&probe.take_puts());
+    assert!(
+        !puts.iter().any(|p| p.contains(&fts_key(MEMOS))),
+        "an untouched collection's index must not be put; saw {puts:?}"
+    );
+    assert!(
+        !puts.iter().any(|p| p == "Fts/fts:_collections"),
+        "an unchanged index list must not be put; saw {puts:?}"
+    );
+    assert_eq!(fts_writes(&db, MEMOS), memos_before);
+}
+
+/// Updating a document that already has a surrogate allocates none, so the
+/// surrogate map is not rewritten. The index itself is.
+#[tokio::test]
+async fn updating_a_document_does_not_rewrite_the_surrogate_map() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("fts_update.pagedb")).await;
+    put_text(&db, NOTES, "n1", "phoenix rises").await;
+    db.flush().await.expect("seed flush");
+    let (index_before, surrogates_before) = (fts_writes(&db, NOTES), surrogate_writes(&db));
+    probe.take_puts();
+
+    put_text(&db, NOTES, "n1", "phoenix sleeps").await;
+    assert!(fts_dirty(&db, NOTES), "the document's terms changed");
+    assert!(
+        !surrogates_dirty(&db),
+        "an update of a known document must not dirty the surrogate map"
+    );
+    db.flush().await.expect("flush after the update");
+
+    let puts = fts_ops(&probe.take_puts());
+    assert!(
+        !puts.iter().any(|p| p == "Fts/fts:_surrogates"),
+        "the surrogate map must not be put; saw {puts:?}"
+    );
+    assert_eq!(surrogate_writes(&db), surrogates_before);
+    assert_eq!(fts_writes(&db, NOTES), index_before + 1);
+}
+
+/// A text write that lands while the index's segment write is in flight
+/// keeps the index dirty, and the next flush writes it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_write_during_the_fts_segment_write_leaves_the_index_dirty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("fts_race.pagedb")).await;
+    put_text(&db, NOTES, "n1", "phoenix rises").await;
+
+    probe.fts_segment_gate.arm(&fts_key(NOTES));
+    let flushing = tokio::spawn({
+        let db = Arc::clone(&db);
+        async move { db.flush().await }
+    });
+    probe.fts_segment_gate.wait_entered().await;
+    // The flush has captured the index's generation and serialized it; this
+    // document is not in it.
+    put_text(&db, NOTES, "n2", "ashes settle").await;
+    probe.fts_segment_gate.release();
+    flushing.await.expect("join").expect("racing flush");
+
+    assert_eq!(
+        fts_writes(&db, NOTES),
+        1,
+        "the in-flight index write itself succeeded"
+    );
+    assert!(
+        fts_dirty(&db, NOTES),
+        "a write after the capture must keep the index dirty"
+    );
+
+    db.flush().await.expect("follow-up flush");
+    assert_eq!(
+        fts_writes(&db, NOTES),
+        2,
+        "the next flush writes the index again"
+    );
+    assert!(!fts_dirty(&db, NOTES));
+}
+
+/// An FTS segment write that fails leaves the index dirty and keeps its doc
+/// lengths out of the batch, and the next flush retries it.
+#[tokio::test]
+async fn failed_fts_segment_write_is_retried_by_the_next_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("fts_fail.pagedb")).await;
+    put_text(&db, NOTES, "n1", "phoenix rises").await;
+
+    probe.fail_fts_segment_writes.store(true, Ordering::SeqCst);
+    db.flush()
+        .await
+        .expect("an FTS segment write error is logged, not returned");
+    assert_eq!(fts_writes(&db, NOTES), 0, "the segment did not land");
+    assert!(
+        fts_dirty(&db, NOTES),
+        "a failed segment write must not be recorded as flushed"
+    );
+    let puts = fts_ops(&probe.take_puts());
+    assert!(
+        !puts
+            .iter()
+            .any(|p| *p == format!("Fts/fts:{}:doclens", fts_key(NOTES))),
+        "the doc lengths of an index whose segment failed stay out of the batch; saw {puts:?}"
+    );
+    assert_eq!(surrogate_writes(&db), 1, "the surrogate map landed");
+
+    probe.fail_fts_segment_writes.store(false, Ordering::SeqCst);
+    db.flush().await.expect("retry flush");
+    assert_eq!(fts_writes(&db, NOTES), 1, "the retry writes the index");
+    assert_eq!(probe.take_fts_segment_writes(), vec![fts_key(NOTES)]);
+    assert_eq!(
+        surrogate_writes(&db),
+        1,
+        "the clean surrogate map is not rewritten"
+    );
+    assert!(!fts_dirty(&db, NOTES));
+}
+
+/// An index and surrogate map restored from their stored forms start clean,
+/// so the first flush after a reopen writes no FTS key or segment.
+#[tokio::test]
+async fn fts_restored_from_its_checkpoint_starts_clean() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fts_reopen.pagedb");
+    {
+        let db = open_manual_flush(&path).await;
+        put_text(&db, NOTES, "n1", "phoenix rises").await;
+        put_text(&db, MEMOS, "m1", "ember glows").await;
+        db.flush().await.expect("flush");
+        db.shutdown().await;
+    }
+
+    let (db, probe) = open_probed(&path).await;
+    for collection in [NOTES, MEMOS] {
+        assert!(
+            !fts_dirty(&db, collection),
+            "{collection} restored from its checkpoint starts clean"
+        );
+    }
+    assert!(
+        !surrogates_dirty(&db),
+        "a decoded surrogate map starts clean"
+    );
+    assert_eq!(
+        text_hits(&db, NOTES, "phoenix").await,
+        vec!["n1".to_string()]
+    );
+    probe.take_puts();
+    probe.take_fts_segment_writes();
+
+    db.flush().await.expect("first flush after reopen");
+    assert_eq!(probe.take_fts_segment_writes(), Vec::<String>::new());
+    assert_eq!(
+        fts_ops(&probe.take_puts()),
+        Vec::<String>::new(),
+        "the first flush after a reopen must not rewrite restored FTS state"
+    );
+    assert_eq!(
+        (
+            fts_writes(&db, NOTES),
+            fts_writes(&db, MEMOS),
+            surrogate_writes(&db)
+        ),
+        (0, 0, 0)
+    );
+}
+
+/// An index rebuilt from the documents at open, because no index list was
+/// stored, is written by the first flush.
+#[tokio::test]
+async fn fts_rebuilt_at_open_is_written_by_the_first_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fts_rebuilt.pagedb");
+    {
+        let db = open_manual_flush(&path).await;
+        put_text(&db, NOTES, "n1", "phoenix rises").await;
+        db.flush().await.expect("flush");
+        db.shutdown().await;
+    }
+    // Without the index list, open finds no checkpoint and rebuilds the
+    // index from the stored documents.
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .expect("open storage");
+        storage
+            .delete(Namespace::Fts, b"fts:_collections")
+            .await
+            .expect("delete the FTS index list");
+    }
+
+    let db = open_manual_flush(&path).await;
+    assert_eq!(
+        text_hits(&db, NOTES, "phoenix").await,
+        vec!["n1".to_string()],
+        "the rebuild restores the document"
+    );
+    assert!(
+        fts_dirty(&db, NOTES),
+        "an index rebuilt at open has no stored form matching it"
+    );
+    assert!(surrogates_dirty(&db));
+
+    db.flush().await.expect("first flush after rebuild");
+    assert_eq!((fts_writes(&db, NOTES), surrogate_writes(&db)), (1, 1));
+    assert!(!fts_dirty(&db, NOTES) && !surrogates_dirty(&db));
+}
+
+/// `flush_full()` writes every FTS index, the surrogate map, and the index
+/// list even when all are clean.
+#[tokio::test]
+async fn flush_full_writes_every_fts_index_and_the_surrogate_map() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed(&dir.path().join("fts_full.pagedb")).await;
+    put_text(&db, NOTES, "n1", "phoenix rises").await;
+    put_text(&db, MEMOS, "m1", "ember glows").await;
+    db.flush().await.expect("flush");
+    db.flush().await.expect("idle flush");
+    let before = (
+        fts_writes(&db, NOTES),
+        fts_writes(&db, MEMOS),
+        surrogate_writes(&db),
+    );
+    probe.take_puts();
+    probe.take_fts_segment_writes();
+
+    db.flush_full().await.expect("flush_full");
+
+    assert_eq!(
+        probe.take_fts_segment_writes(),
+        vec![fts_key(MEMOS), fts_key(NOTES)]
+    );
+    let puts = fts_ops(&probe.take_puts());
+    for expected in [
+        "Fts/fts:_collections".to_string(),
+        "Fts/fts:_surrogates".to_string(),
+        format!("Fts/fts:{}:doclens", fts_key(MEMOS)),
+        format!("Fts/fts:{}:doclens", fts_key(NOTES)),
+    ] {
+        assert!(
+            puts.contains(&expected),
+            "flush_full must put {expected}; saw {puts:?}"
+        );
+    }
+    assert_eq!(
+        (
+            fts_writes(&db, NOTES),
+            fts_writes(&db, MEMOS),
+            surrogate_writes(&db)
+        ),
+        (before.0 + 1, before.1 + 1, before.2 + 1)
+    );
+}
+
+/// Deleting the last document of an index empties it. The flush must store
+/// that empty state, or the reopen restores the postings stored before the
+/// delete and the document matches again.
+#[tokio::test]
+async fn deleting_the_last_document_does_not_resurrect_it_on_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fts_last_doc.pagedb");
+    {
+        let db = open_manual_flush(&path).await;
+        put_text(&db, NOTES, "n1", "phoenix rises").await;
+        db.flush().await.expect("flush");
+        db.document_delete(NOTES, "n1")
+            .await
+            .expect("document_delete");
+        assert_eq!(text_hits(&db, NOTES, "phoenix").await, Vec::<String>::new());
+        db.flush().await.expect("flush after the delete");
+        db.shutdown().await;
+    }
+
+    let db = open_manual_flush(&path).await;
+    assert_eq!(
+        text_hits(&db, NOTES, "phoenix").await,
+        Vec::<String>::new(),
+        "a deleted document must not match after a reopen"
+    );
+}
+
+/// `TRUNCATE` drops the collection's index. The next flush deletes its
+/// stored segment and doc lengths, and a later idle flush deletes nothing.
+#[tokio::test]
+async fn truncated_collection_deletes_its_stored_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fts_truncate.pagedb");
+    {
+        let (db, probe) = open_probed(&path).await;
+        put_text(&db, NOTES, "n1", "phoenix rises").await;
+        db.flush().await.expect("seed flush");
+        probe.take_deletes();
+
+        db.execute_sql(&format!("TRUNCATE {NOTES}"), &[])
+            .await
+            .expect("TRUNCATE");
+        assert!(
+            fts_dirty(&db, NOTES),
+            "a dropped index must be flushed so its stored form is deleted"
+        );
+        db.flush().await.expect("flush after truncate");
+
+        assert_eq!(probe.take_fts_segment_deletes(), vec![fts_key(NOTES)]);
+        let deletes = fts_ops(&probe.take_deletes());
+        assert!(
+            deletes.contains(&format!("Fts/fts:{}:doclens", fts_key(NOTES))),
+            "the dropped index's doc lengths must be deleted; saw {deletes:?}"
+        );
+        assert!(!fts_dirty(&db, NOTES));
+
+        db.flush().await.expect("idle flush");
+        assert_eq!(probe.take_fts_segment_deletes(), Vec::<String>::new());
+        assert_eq!(fts_ops(&probe.take_deletes()), Vec::<String>::new());
+        db.shutdown().await;
+    }
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .expect("open storage");
+        let doclens = format!("fts:{}:doclens", fts_key(NOTES));
+        assert_eq!(
+            storage
+                .get(Namespace::Fts, doclens.as_bytes())
+                .await
+                .expect("get"),
+            None,
+            "no doc lengths stay behind for a dropped index"
+        );
+        let segments = storage
+            .as_fts_segment_ext()
+            .expect("pagedb has FTS segments");
+        assert!(
+            segments
+                .open_fts_segment(&fts_key(NOTES))
+                .await
+                .expect("open_fts_segment")
+                .is_none(),
+            "no segment stays behind for a dropped index"
+        );
+    }
+
+    let db = open_manual_flush(&path).await;
+    assert_eq!(text_hits(&db, NOTES, "phoenix").await, Vec::<String>::new());
+}
+
+/// A collection dropped and created again under the same index key must not
+/// bring back the documents it held before the drop.
+#[tokio::test]
+async fn recreated_index_does_not_resurrect_dropped_documents() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fts_recreate.pagedb");
+    {
+        let db = open_manual_flush(&path).await;
+        put_text(&db, NOTES, "n1", "phoenix rises").await;
+        db.flush().await.expect("seed flush");
+
+        db.execute_sql(&format!("TRUNCATE {NOTES}"), &[])
+            .await
+            .expect("TRUNCATE");
+        put_text(&db, NOTES, "n2", "ember glows").await;
+        db.document_delete(NOTES, "n2")
+            .await
+            .expect("document_delete");
+        db.flush().await.expect("flush after the re-create");
+        db.shutdown().await;
+    }
+
+    let db = open_manual_flush(&path).await;
+    assert_eq!(
+        text_hits(&db, NOTES, "phoenix").await,
+        Vec::<String>::new(),
+        "a document dropped with its collection must not match after a reopen"
+    );
+    assert_eq!(text_hits(&db, NOTES, "ember").await, Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------------------
+// Every tracked engine together
+// ---------------------------------------------------------------------------
+
+/// Write through every engine a flush persists: vectors, an edge, document
+/// text, a sparse vector, a geometry, and a KV entry.
+async fn seed_every_engine<S: StorageEngine>(db: &NodeDbLite<S>) {
+    insert(db, ALPHA, 0..4).await;
+    add_edge(db, GRAPH_A, "a", "b").await;
+    put_text(db, NOTES, "n1", "phoenix rises").await;
+    sparse_insert(db, "a", "d1", 1);
     db.spatial_insert(PLACES, LOC, "p1", &point(1));
+    db.kv_put("kv", "k1", b"v1").await.expect("kv_put");
+}
+
+/// Write counters of every dirty-tracked artifact the seed creates.
+fn tracked_writes<S: StorageEngine>(db: &NodeDbLite<S>) -> Vec<u64> {
+    let (graph, segment) = writes(db, ALPHA);
+    vec![
+        graph,
+        segment,
+        id_map_writes(db),
+        csr_writes(db, GRAPH_A),
+        sparse_writes(db, SPARSE, "a"),
+        rtree_writes(db, PLACES, LOC),
+        docmap_writes(db, PLACES),
+        fts_writes(db, NOTES),
+        surrogate_writes(db),
+    ]
+}
+
+/// Seed every engine, flush, then flush again with no mutation in between.
+/// The second flush must write nothing: no put, no delete, no batch, no
+/// vector, graph, FTS, or spatial segment, and no CRDT snapshot or delta.
+async fn assert_second_flush_writes_nothing(config: LiteConfig, file: &str) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, probe) = open_probed_with(&dir.path().join(file), config).await;
+    seed_every_engine(&db).await;
 
     db.flush().await.expect("first flush");
     let before = (
-        writes(&db, ALPHA),
-        id_map_writes(&db),
-        csr_writes(&db, GRAPH_A),
-        sparse_writes(&db, SPARSE, "a"),
-        rtree_writes(&db, PLACES, LOC),
-        docmap_writes(&db, PLACES),
+        tracked_writes(&db),
+        db.crdt_snapshot_export_count(),
+        db.crdt_delta_write_count(),
     );
     probe.take_puts();
     probe.take_deletes();
     probe.take_batches();
+    probe.take_vector_segment_writes();
     probe.take_graph_segment_writes();
     probe.take_spatial_segment_writes();
+    probe.take_fts_segment_writes();
+    probe.take_fts_segment_deletes();
 
     db.flush().await.expect("idle flush");
 
     assert_eq!(
-        non_fts(&probe.take_puts()),
+        op_names(&probe.take_puts()),
         Vec::<String>::new(),
-        "an idle flush must not put anything outside FTS"
+        "an idle flush must not put anything"
     );
     assert_eq!(
-        non_fts(&probe.take_deletes()),
+        op_names(&probe.take_deletes()),
         Vec::<String>::new(),
-        "an idle flush must not delete anything outside FTS"
+        "an idle flush must not delete anything"
     );
     let batches: Vec<Vec<String>> = probe
         .take_batches()
         .iter()
-        .map(|batch| non_fts(batch.as_slice()))
-        .filter(|ops| !ops.is_empty())
+        .map(|batch| op_names(batch.as_slice()))
         .collect();
     assert_eq!(
         batches,
         Vec::<Vec<String>>::new(),
-        "an idle flush must not run a batch outside FTS"
+        "an idle flush must not commit a batch"
     );
+    assert_eq!(probe.take_vector_segment_writes(), Vec::<String>::new());
     assert_eq!(probe.take_graph_segment_writes(), Vec::<String>::new());
     assert_eq!(probe.take_spatial_segment_writes(), Vec::<String>::new());
+    assert_eq!(probe.take_fts_segment_writes(), Vec::<String>::new());
+    assert_eq!(probe.take_fts_segment_deletes(), Vec::<String>::new());
     assert_eq!(
         (
-            writes(&db, ALPHA),
-            id_map_writes(&db),
-            csr_writes(&db, GRAPH_A),
-            sparse_writes(&db, SPARSE, "a"),
-            rtree_writes(&db, PLACES, LOC),
-            docmap_writes(&db, PLACES),
+            tracked_writes(&db),
+            db.crdt_snapshot_export_count(),
+            db.crdt_delta_write_count(),
         ),
         before,
-        "no tracked artifact is rewritten"
+        "no tracked artifact, CRDT snapshot, or CRDT delta is written again"
     );
+}
+
+/// With every engine flushed, a second flush writes nothing at all.
+///
+/// Sync is on, the default: the store stages CRDT deltas and outbound FTS
+/// and spatial entries for Origin.
+#[tokio::test]
+async fn second_flush_writes_nothing_at_all() {
+    let config = manual_flush_config();
+    assert!(config.sync_enabled, "the default config replicates");
+    assert_second_flush_writes_nothing(config, "all_idle.pagedb").await;
+}
+
+/// The same with sync off, where nothing is staged for Origin.
+#[tokio::test]
+async fn second_flush_writes_nothing_at_all_with_sync_disabled() {
+    let config = LiteConfig {
+        sync_enabled: false,
+        ..manual_flush_config()
+    };
+    assert_second_flush_writes_nothing(config, "all_idle_local.pagedb").await;
 }

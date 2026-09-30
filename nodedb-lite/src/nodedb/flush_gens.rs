@@ -55,10 +55,24 @@ pub enum FlushArtifact {
     /// Tracked under the collection. Every copy holds the doc-map of the
     /// whole collection, so a change to any one field dirties all of them.
     SpatialDocMap,
+    /// One full-text index: its `fts/seg/<index_key>` posting segment, or its
+    /// `fts:<index_key>:mt:<term>` entries when the storage has no FTS
+    /// segments, plus its `fts:<index_key>:doclens` blob and its
+    /// `fts:<index_key>:meta:<subkey>` blobs. All of them derive from the one
+    /// index, so they are written together. Tracked under its
+    /// `<collection>:<field>` index key.
+    FtsIndex,
+    /// The store-wide `fts:_surrogates` blob. Tracked under
+    /// [`FTS_SURROGATES_KEY`].
+    FtsSurrogates,
 }
 
 /// Collection key the store-wide [`FlushArtifact::HnswIdMap`] is tracked under.
 pub const ID_MAP_KEY: &str = "";
+
+/// Collection key the store-wide [`FlushArtifact::FtsSurrogates`] is tracked
+/// under.
+pub const FTS_SURROGATES_KEY: &str = "";
 
 /// Key a [`FlushArtifact::SpatialRtree`] is tracked under.
 ///
@@ -99,9 +113,6 @@ pub(crate) struct ArtifactFlush {
 
 impl ArtifactFlush {
     /// The collection this write belongs to.
-    // Read only by the vector and graph segment writes, which wasm32 does not
-    // have.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn key(&self) -> &str {
         &self.key
     }

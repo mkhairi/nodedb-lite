@@ -17,7 +17,7 @@ pub use collection::{CollectionMeta, TransactionOp};
 pub use core::kv_local::KvLocalState;
 pub use core::{NodeDbLite, SyncGate};
 pub use diagnostic::DiagnosticDump;
-pub use flush_gens::{FlushArtifact, ID_MAP_KEY, spatial_rtree_key};
+pub use flush_gens::{FTS_SURROGATES_KEY, FlushArtifact, ID_MAP_KEY, spatial_rtree_key};
 pub use health::{HealthStatus, OverallStatus};
 pub(crate) use lock_ext::LockExt;
 pub use trait_impl::BatchItem;

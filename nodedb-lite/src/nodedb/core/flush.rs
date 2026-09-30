@@ -48,9 +48,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// handle was opened.
     ///
     /// [`FlushArtifact::HnswIdMap`] is one store-wide blob: pass
-    /// [`ID_MAP_KEY`] (the empty string) as its collection. A counter, not a
-    /// timing, so a caller can assert on it directly: an idle store must not
-    /// advance it.
+    /// [`ID_MAP_KEY`] (the empty string) as its collection. So is
+    /// [`FlushArtifact::FtsSurrogates`]: pass
+    /// [`FTS_SURROGATES_KEY`](crate::nodedb::FTS_SURROGATES_KEY). A
+    /// [`FlushArtifact::FtsIndex`] is tracked under its `<collection>:<field>`
+    /// index key. A counter, not a timing, so a caller can assert on it
+    /// directly: an idle store must not advance it.
     pub fn flush_artifact_write_count(&self, artifact: FlushArtifact, collection: &str) -> u64 {
         self.flush_gens.write_count(artifact, collection)
     }
@@ -153,9 +156,10 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// Persist all in-memory state to storage (call before shutdown).
     ///
     /// Dirty-aware: an HNSW graph, the vector id-map, a vector segment, a CSR
-    /// graph checkpoint, a sparse index, a spatial R-tree or doc-map, or a
-    /// meta or catalog entry that has not changed since this handle last made
-    /// it durable is not written again.
+    /// graph checkpoint, a sparse index, a spatial R-tree or doc-map, a
+    /// full-text index or the FTS surrogate map, or a meta or catalog entry
+    /// that has not changed since this handle last made it durable is not
+    /// written again. A pass with nothing to write issues no batch.
     /// [`flush_full`](Self::flush_full) writes all of them regardless.
     pub async fn flush(&self) -> NodeDbResult<()> {
         self.flush_pass(false).await
@@ -661,10 +665,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
             (graph_flushes, segment_flushes)
         };
 
-        self.storage
-            .batch_write(&ops)
-            .await
-            .map_err(NodeDbError::storage)?;
+        // An idle pass has nothing to put, so it issues no batch at all.
+        if !ops.is_empty() {
+            self.storage
+                .batch_write(&ops)
+                .await
+                .map_err(NodeDbError::storage)?;
+        }
 
         // The graph blobs, the CSR blobs, the id-map, and the meta entries in
         // the batch are durable now. Record the generations captured when they
@@ -785,20 +792,30 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // ── Persist FTS indices (separate batch — potentially large) ──
         // Serialize is synchronous (no I/O); do it inside the lock so we don't
         // need to clone FtsIndex.  The resulting ops + segment blobs are written
-        // to storage after the lock is released.
-        let (fts_ops, fts_segment_writes) = {
-            let fts = self.fts_state.manager.lock_or_recover();
-            let (indices, id_to_surrogate, next_surrogate) = fts.checkpoint_data();
-            crate::engine::fts::checkpoint::serialize_fts(indices, id_to_surrogate, next_surrogate)
-                .map_err(|e| NodeDbError::storage(format!("fts serialize: {e}")))?
-        };
-        crate::engine::fts::checkpoint::write_serialized_fts(
+        // to storage after the lock is released. Only dirty indexes, a changed
+        // surrogate map, and a changed index list are serialized, and each
+        // generation is captured under the same lock, so a text write after
+        // this point leaves its artifact dirty.
+        let fts_flush = self
+            .fts_state
+            .manager
+            .lock_or_recover()
+            .checkpoint_dirty(full)
+            .map_err(|e| NodeDbError::storage(format!("fts serialize: {e}")))?;
+        let fts_written = crate::engine::fts::checkpoint::write_serialized_fts(
             self.storage.as_ref(),
-            fts_ops,
-            fts_segment_writes,
+            fts_flush,
+            &self.flush_gens,
         )
         .await
         .map_err(|e| NodeDbError::storage(format!("fts flush: {e}")))?;
+        // A dropped index whose stored form is deleted now needs no later flush.
+        if !fts_written.is_empty() {
+            self.fts_state
+                .manager
+                .lock_or_recover()
+                .forget_dropped(&fts_written);
+        }
 
         // ── Persist sparse-vector inverted indices ────────────────────────────
         // Same shape as the FTS block: serialize synchronously under the lock,

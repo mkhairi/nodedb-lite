@@ -29,30 +29,42 @@ impl FtsCollectionManager {
     ///
     /// Unrecognized names fall back to the standard analyzer inside
     /// nodedb-fts at resolve time, matching Origin's behavior.
+    ///
+    /// The analyzer is a meta blob a flush persists with each index, so every
+    /// index whose bound analyzer changes is marked dirty. Binding the name an
+    /// index already holds marks nothing.
     pub fn set_collection_analyzer(&mut self, collection: &str, analyzer_name: &str) {
         self.collection_analyzers
             .insert(collection.to_string(), analyzer_name.to_string());
 
-        let prefix = format!("{collection}:");
-        for (key, idx) in self.indices.iter_mut() {
-            if key.starts_with(&prefix) {
-                let _ = idx.set_collection_analyzer(0, 0, key, analyzer_name);
+        self.update_collection_indexes(collection, |key, idx| {
+            if matches!(
+                idx.get_collection_analyzer(0, 0, key),
+                Ok(Some(current)) if current == analyzer_name
+            ) {
+                return false;
             }
-        }
+            let _ = idx.set_collection_analyzer(0, 0, key, analyzer_name);
+            true
+        });
     }
 
     /// Bind the default fuzzy-matching flag to every index belonging to
     /// `collection`, and retain it so indexes created later inherit it.
+    ///
+    /// Every index whose flag changes is marked dirty. Binding the value an
+    /// index already holds marks nothing.
     pub fn set_collection_fuzzy(&mut self, collection: &str, fuzzy: bool) {
         self.collection_fuzzy_defaults
             .insert(collection.to_string(), fuzzy);
 
-        let prefix = format!("{collection}:");
-        for (key, idx) in self.indices.iter_mut() {
-            if key.starts_with(&prefix) {
-                let _ = idx.set_collection_fuzzy(0, 0, key, fuzzy);
+        self.update_collection_indexes(collection, |key, idx| {
+            if matches!(idx.get_collection_fuzzy(0, 0, key), Ok(current) if current == fuzzy) {
+                return false;
             }
-        }
+            let _ = idx.set_collection_fuzzy(0, 0, key, fuzzy);
+            true
+        });
     }
 
     /// Analyzer bound to the collection owning `key`, if any.
@@ -98,17 +110,17 @@ impl FtsCollectionManager {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::FtsCollectionManager;
     use crate::engine::fts::manager::test_governor;
+    use crate::nodedb::flush_gens::{FlushArtifact, FlushGens};
 
     const DOC_KEY: &str = "col:_doc";
 
     /// Read back the analyzer and fuzzy default persisted on `col:_doc`.
     fn doc_index_config(mgr: &FtsCollectionManager) -> (Option<String>, bool) {
-        let idx = mgr
-            .indices
-            .get(DOC_KEY)
-            .expect("whole-document index must exist");
+        let idx = mgr.index(DOC_KEY).expect("whole-document index must exist");
         (
             idx.get_collection_analyzer(0, 0, DOC_KEY)
                 .expect("meta read must succeed"),
@@ -160,7 +172,7 @@ mod tests {
         // DDL order: config first, documents afterwards — no index exists yet.
         mgr.set_collection_analyzer("col", "german");
         mgr.set_collection_fuzzy("col", true);
-        assert!(mgr.indices.is_empty());
+        assert!(mgr.is_empty());
 
         mgr.index_document("col", "doc1", "der schnelle braune fuchs")
             .expect("index update must succeed");
@@ -180,7 +192,7 @@ mod tests {
             .expect("index update must succeed");
 
         let key = "col:title";
-        let idx = mgr.indices.get(key).expect("field index must exist");
+        let idx = mgr.index(key).expect("field index must exist");
         assert_eq!(
             idx.get_collection_analyzer(0, 0, key)
                 .expect("meta read must succeed")
@@ -206,6 +218,39 @@ mod tests {
         assert!(!fuzzy);
         assert_eq!(mgr.analyzer_for_key(DOC_KEY), None);
         assert_eq!(mgr.fuzzy_for_key(DOC_KEY), None);
+    }
+
+    #[test]
+    fn rebinding_config_marks_an_index_dirty_only_when_it_changes() {
+        let gens = Arc::new(FlushGens::default());
+        let mut mgr = FtsCollectionManager::with_gens(test_governor(), Arc::clone(&gens));
+        mgr.index_document("col", "doc1", "the quick brown fox")
+            .expect("index update must succeed");
+        mgr.index_document("other", "doc2", "a lazy dog")
+            .expect("index update must succeed");
+        gens.mark_clean(FlushArtifact::FtsIndex, DOC_KEY);
+        gens.mark_clean(FlushArtifact::FtsIndex, "other:_doc");
+
+        mgr.set_collection_analyzer("col", "german");
+        assert!(
+            gens.is_dirty(FlushArtifact::FtsIndex, DOC_KEY),
+            "a new analyzer changes the index's stored meta"
+        );
+        assert!(
+            !gens.is_dirty(FlushArtifact::FtsIndex, "other:_doc"),
+            "another collection's index is untouched"
+        );
+
+        gens.mark_clean(FlushArtifact::FtsIndex, DOC_KEY);
+        mgr.set_collection_analyzer("col", "german");
+        mgr.set_collection_fuzzy("col", false);
+        assert!(
+            !gens.is_dirty(FlushArtifact::FtsIndex, DOC_KEY),
+            "binding the value the index already holds changes nothing"
+        );
+
+        mgr.set_collection_fuzzy("col", true);
+        assert!(gens.is_dirty(FlushArtifact::FtsIndex, DOC_KEY));
     }
 
     #[test]

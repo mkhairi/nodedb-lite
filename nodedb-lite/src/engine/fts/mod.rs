@@ -25,12 +25,12 @@ pub type LiteFtsIndex = FtsIndex<MemoryBackend>;
 /// non-durable one at no memory saving: everything drained before a checkpoint
 /// is absent from it and gone at the next open (NDB-AQL-37).
 ///
-/// Ceiling: the checkpoint is not incremental, so it re-serializes the whole
-/// vocabulary on every flush — cost now grows with total terms rather than
-/// being capped at the old 100k spill threshold. If that write cost starts to
-/// matter, the upgrade path is a dirty-term checkpoint, or teaching
-/// `serialize_fts` to persist the backend's segments too; it is not to start
-/// dropping postings again.
+/// Ceiling: the checkpoint is not incremental within an index, so a flush
+/// re-serializes the whole vocabulary of every index that changed — cost now
+/// grows with that index's terms rather than being capped at the old 100k
+/// spill threshold. If that write cost starts to matter, the upgrade path is
+/// a dirty-term checkpoint, or teaching `serialize_fts` to persist the
+/// backend's segments too; it is not to start dropping postings again.
 pub(crate) const LITE_MEMTABLE_CONFIG: nodedb_fts::MemtableConfig = nodedb_fts::MemtableConfig {
     max_postings: usize::MAX,
     max_terms: usize::MAX,

@@ -105,14 +105,14 @@ impl<S: StorageEngine> NodeDbLite<S> {
         )
         .await?;
 
-        // ── Restore FTS indices ──
-        let fts_manager = Self::restore_fts_indices(&storage, &governor).await?;
-
         // Artifacts restored from a valid stored form start clean; everything
         // else starts dirty, so the first flush writes what open rebuilt.
-        // Created before the sparse and spatial restores, whose managers
+        // Created before the FTS, sparse, and spatial restores, whose managers
         // record their mutations in it.
         let flush_gens = Arc::new(crate::nodedb::flush_gens::FlushGens::default());
+
+        // ── Restore FTS indices ──
+        let fts_manager = Self::restore_fts_indices(&storage, &governor, &flush_gens).await?;
 
         // ── Restore sparse-vector inverted indices ──
         let (sparse_manager, sparse_checkpoint_present) =

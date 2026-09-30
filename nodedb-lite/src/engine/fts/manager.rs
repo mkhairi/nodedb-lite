@@ -8,21 +8,31 @@
 //!   restored on `NodeDbLite::open` without re-tokenizing source documents.
 //!
 //! This is the canonical FTS implementation for Lite.
+//!
+//! Every mutation goes through a `&mut self` method here, and each one marks
+//! the index it changed dirty for flush. A call that changes nothing marks
+//! nothing, so an idle index is not rewritten. The surrogate map is marked
+//! dirty only when a new surrogate is allocated.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tracing;
 
 use nodedb_fts::FtsIndex;
 use nodedb_fts::FtsSearchParams;
+use nodedb_fts::backend::FtsBackend;
 use nodedb_fts::backend::memory::MemoryBackend;
 use nodedb_fts::posting::QueryMode as FtsQueryMode;
 use nodedb_mem::MemoryGovernor;
 use nodedb_types::Surrogate;
+use nodedb_types::error::NodeDbResult;
 use nodedb_types::text_search::{QueryMode, TextSearchParams};
 
 use crate::error::LiteError;
+use crate::nodedb::flush_gens::{ArtifactFlush, FTS_SURROGATES_KEY, FlushArtifact, FlushGens};
+
+use super::checkpoint::{FtsFlush, RestoredFts};
 
 /// A resolved FTS result with the original string doc_id restored.
 pub struct FtsResult {
@@ -39,6 +49,16 @@ fn fts_err(collection: &str, e: impl std::fmt::Display) -> LiteError {
     }
 }
 
+/// Whether `idx` stores a document length for `surrogate`. A read error
+/// counts as stored, so a caller that marks on it over-marks rather than
+/// missing a change.
+fn holds_length(idx: &FtsIndex<MemoryBackend>, key: &str, surrogate: Surrogate) -> bool {
+    !matches!(
+        idx.backend().read_doc_length(0, 0, key, surrogate),
+        Ok(None)
+    )
+}
+
 /// Manages per-collection (and per-field) in-memory full-text search indexes.
 ///
 /// Each `(collection, field)` pair gets its own `FtsIndex<MemoryBackend>`.
@@ -47,7 +67,14 @@ fn fts_err(collection: &str, e: impl std::fmt::Display) -> LiteError {
 pub struct FtsCollectionManager {
     /// Key: `"{collection}:{field}"` → FTS index.
     /// Whole-document index uses key `"{collection}:_doc"`.
-    pub(super) indices: HashMap<String, FtsIndex<MemoryBackend>>,
+    ///
+    /// Private: every mutation must go through a method that marks the index
+    /// dirty for flush.
+    indices: HashMap<String, FtsIndex<MemoryBackend>>,
+    /// Index keys `drop_collection` removed whose stored segment, doc lengths,
+    /// and meta blobs no flush has deleted yet. A key leaves the set once its
+    /// deletion is durable, or when the index is created again.
+    dropped: HashSet<String>,
     /// Forward map: original string doc_id → dense u32 surrogate.
     ///
     /// Surrogates **must** be dense (0, 1, 2, …) because `nodedb_fts::Memtable`
@@ -81,12 +108,25 @@ pub struct FtsCollectionManager {
     pub(super) collection_fuzzy_defaults: HashMap<String, bool>,
     /// Memory governor bound into every `FtsIndex` this manager creates.
     pub(super) governor: Arc<MemoryGovernor>,
+    /// Flush dirty tracking for every index, under its index key, and for
+    /// the surrogate map.
+    gens: Arc<FlushGens>,
 }
 
 impl FtsCollectionManager {
+    /// Create an empty manager with its own, unshared flush tracking.
     pub fn new(governor: Arc<MemoryGovernor>) -> Self {
+        Self::with_gens(governor, Arc::new(FlushGens::default()))
+    }
+
+    /// Create an empty manager that records its mutations in `gens`.
+    ///
+    /// The store passes its own `FlushGens`, so its flush sees which indexes
+    /// changed.
+    pub(crate) fn with_gens(governor: Arc<MemoryGovernor>, gens: Arc<FlushGens>) -> Self {
         Self {
             indices: HashMap::new(),
+            dropped: HashSet::new(),
             id_to_surrogate: HashMap::new(),
             surrogate_to_id: HashMap::new(),
             // Start at 1: Surrogate(0) is the unassigned sentinel and is
@@ -96,7 +136,13 @@ impl FtsCollectionManager {
             collection_analyzers: HashMap::new(),
             collection_fuzzy_defaults: HashMap::new(),
             governor,
+            gens,
         }
+    }
+
+    /// Mark the index under `key` dirty.
+    fn mark_index(&self, key: &str) {
+        self.gens.bump(FlushArtifact::FtsIndex, key);
     }
 
     /// Look up or allocate a dense surrogate for a string `doc_id`.
@@ -115,6 +161,8 @@ impl FtsCollectionManager {
             .expect("FTS surrogate counter overflowed u32");
         self.id_to_surrogate.insert(doc_id.to_owned(), s);
         self.surrogate_to_id.insert(s, doc_id.to_owned());
+        self.gens
+            .bump(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY);
         Surrogate(s)
     }
 
@@ -148,26 +196,80 @@ impl FtsCollectionManager {
         }
         let surrogate = self.surrogate_for(doc_id);
         let key = format!("{collection}:_doc");
-        let fresh = self.new_index_for(&key);
-        let idx = self.indices.entry(key.clone()).or_insert(fresh);
-        // Remove old entry first (upsert semantics).
-        idx.remove_document(0, 0, &key, surrogate)
-            .map_err(|e| fts_err(collection, e))?;
-        idx.index_document(0, 0, &key, surrogate, text)
-            .map_err(|e| fts_err(collection, e))
+        self.upsert_text(collection, &key, surrogate, text)
     }
 
     /// Remove a document from the whole-document index.
     pub fn remove_document(&mut self, collection: &str, doc_id: &str) -> Result<(), LiteError> {
+        let key = format!("{collection}:_doc");
+        self.remove_text(collection, &key, doc_id)
+    }
+
+    /// Replace the entry for `surrogate` in the index under `key` with
+    /// `text`, creating the index when absent (upsert semantics).
+    ///
+    /// Marks the index dirty when it was created, when the document was in
+    /// it before or is in it after, when its posting count changed, or when
+    /// the write failed partway. Re-indexing identical text over-marks; a
+    /// call that touches nothing does not mark.
+    fn upsert_text(
+        &mut self,
+        collection: &str,
+        key: &str,
+        surrogate: Surrogate,
+        text: &str,
+    ) -> Result<(), LiteError> {
+        if !self.indices.contains_key(key) {
+            let fresh = self.new_index_for(key);
+            self.indices.insert(key.to_owned(), fresh);
+            // The write of the new index replaces whatever the dropped one
+            // left in storage.
+            self.dropped.remove(key);
+            self.mark_index(key);
+        }
+        let Some(idx) = self.indices.get(key) else {
+            return Ok(());
+        };
+        let held = holds_length(idx, key, surrogate);
+        let postings_before = idx.memtable().posting_count();
+        // Remove old entry first (upsert semantics).
+        let result = idx
+            .remove_document(0, 0, key, surrogate)
+            .map_err(|e| fts_err(collection, e))
+            .and_then(|()| {
+                idx.index_document(0, 0, key, surrogate, text)
+                    .map_err(|e| fts_err(collection, e))
+            });
+        if held
+            || holds_length(idx, key, surrogate)
+            || idx.memtable().posting_count() != postings_before
+            || result.is_err()
+        {
+            self.mark_index(key);
+        }
+        result
+    }
+
+    /// Remove `doc_id` from the index under `key`.
+    ///
+    /// Marks the index dirty only when the document held a length or
+    /// postings there, or when the removal failed partway.
+    fn remove_text(&mut self, collection: &str, key: &str, doc_id: &str) -> Result<(), LiteError> {
         let Some(surrogate) = self.lookup_surrogate(doc_id) else {
             return Ok(());
         };
-        let key = format!("{collection}:_doc");
-        if let Some(idx) = self.indices.get_mut(&key) {
-            idx.remove_document(0, 0, &key, surrogate)
-                .map_err(|e| fts_err(collection, e))?;
+        let Some(idx) = self.indices.get(key) else {
+            return Ok(());
+        };
+        let held = holds_length(idx, key, surrogate);
+        let postings_before = idx.memtable().posting_count();
+        let result = idx
+            .remove_document(0, 0, key, surrogate)
+            .map_err(|e| fts_err(collection, e));
+        if held || idx.memtable().posting_count() != postings_before || result.is_err() {
+            self.mark_index(key);
         }
-        Ok(())
+        result
     }
 
     /// Search the whole-document index for a collection.
@@ -463,12 +565,7 @@ impl FtsCollectionManager {
         }
         let surrogate = self.surrogate_for(doc_id);
         let key = format!("{collection}:{field}");
-        let fresh = self.new_index_for(&key);
-        let idx = self.indices.entry(key.clone()).or_insert(fresh);
-        idx.remove_document(0, 0, &key, surrogate)
-            .map_err(|e| fts_err(collection, e))?;
-        idx.index_document(0, 0, &key, surrogate, text)
-            .map_err(|e| fts_err(collection, e))
+        self.upsert_text(collection, &key, surrogate, text)
     }
 
     /// Remove all field entries for a document across all fields in a collection.
@@ -478,15 +575,8 @@ impl FtsCollectionManager {
         field: &str,
         doc_id: &str,
     ) -> Result<(), LiteError> {
-        let Some(surrogate) = self.lookup_surrogate(doc_id) else {
-            return Ok(());
-        };
         let key = format!("{collection}:{field}");
-        if let Some(idx) = self.indices.get_mut(&key) {
-            idx.remove_document(0, 0, &key, surrogate)
-                .map_err(|e| fts_err(collection, e))?;
-        }
-        Ok(())
+        self.remove_text(collection, &key, doc_id)
     }
 
     /// Number of distinct collection prefixes with active indexes.
@@ -499,34 +589,106 @@ impl FtsCollectionManager {
     }
 
     /// Drop all FTS indexes for a collection (called on collection drop/truncate).
+    ///
+    /// Each removed index is marked dirty and remembered, so the next flush
+    /// deletes its stored segment, doc lengths, and meta blobs.
     pub fn drop_collection(&mut self, collection: &str) {
         let prefix = format!("{collection}:");
-        self.indices.retain(|k, _| !k.starts_with(&prefix));
+        let removed: Vec<String> = self
+            .indices
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in removed {
+            self.indices.remove(&key);
+            self.mark_index(&key);
+            self.dropped.insert(key);
+        }
+    }
+
+    /// Apply `update` to every index belonging to `collection`.
+    ///
+    /// `update` returns whether it changed the index. Each index it changed
+    /// is marked dirty.
+    pub(super) fn update_collection_indexes(
+        &mut self,
+        collection: &str,
+        mut update: impl FnMut(&str, &FtsIndex<MemoryBackend>) -> bool,
+    ) {
+        let prefix = format!("{collection}:");
+        for (key, idx) in &self.indices {
+            if key.starts_with(&prefix) && update(key.as_str(), idx) {
+                self.gens.bump(FlushArtifact::FtsIndex, key);
+            }
+        }
     }
 
     // ── Checkpoint helpers (used by core.rs flush/restore) ────────────────────
 
-    /// Borrow the index map, surrogate map, and next-surrogate counter for
-    /// serialization.  Called by `checkpoint::flush_fts`.
-    pub(crate) fn checkpoint_data(
-        &self,
-    ) -> (
-        &HashMap<String, FtsIndex<MemoryBackend>>,
-        &HashMap<String, u32>,
-        u32,
-    ) {
-        (&self.indices, &self.id_to_surrogate, self.next_surrogate)
+    /// Serialize the indexes, surrogate map, and index list the next flush
+    /// must write, and the deletions of dropped indexes.
+    ///
+    /// Plans each write under this manager's lock, which the caller holds
+    /// through `&self`, so every captured generation describes exactly the
+    /// bytes serialized. `full` writes all of them.
+    pub(crate) fn checkpoint_dirty(&self, full: bool) -> NodeDbResult<FtsFlush> {
+        super::checkpoint::serialize_fts(
+            &self.indices,
+            &self.dropped,
+            &self.id_to_surrogate,
+            self.next_surrogate,
+            full,
+            &self.gens,
+        )
+    }
+
+    /// Forget the dropped indexes whose stored forms a flush deleted.
+    ///
+    /// `written` lists the index writes that flush made durable. A key that
+    /// was created again, or dropped again since, keeps its current state.
+    pub(crate) fn forget_dropped(&mut self, written: &[ArtifactFlush]) {
+        for planned in written {
+            let key = planned.key();
+            if !self.indices.contains_key(key) && !self.gens.is_dirty(FlushArtifact::FtsIndex, key)
+            {
+                self.dropped.remove(key);
+            }
+        }
     }
 
     /// Replace internal state from a restored checkpoint.  Called by
     /// `restore_fts_indices` in `core.rs` when a valid checkpoint is found.
-    pub(crate) fn load_checkpoint(
-        &mut self,
-        indices: HashMap<String, FtsIndex<MemoryBackend>>,
-        id_to_surrogate: HashMap<String, u32>,
-        surrogate_to_id: HashMap<u32, String>,
-        next_surrogate: u32,
-    ) {
+    ///
+    /// An index in `restored.decoded` matches its stored form and starts
+    /// clean. Any other index starts dirty, so the next flush writes it. The
+    /// surrogate map starts clean only when it decoded. The stored index list
+    /// is recorded as written, so an unchanged list is not written again.
+    pub(crate) fn load_checkpoint(&mut self, restored: RestoredFts) {
+        let RestoredFts {
+            indices,
+            id_to_surrogate,
+            surrogate_to_id,
+            next_surrogate,
+            decoded,
+            surrogates_decoded,
+            stored_catalog,
+        } = restored;
+        for key in self.indices.keys().chain(indices.keys()) {
+            self.mark_index(key);
+        }
+        for key in indices.keys().filter(|key| decoded.contains(*key)) {
+            self.gens.mark_clean(FlushArtifact::FtsIndex, key);
+        }
+        self.gens
+            .bump(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY);
+        if surrogates_decoded {
+            self.gens
+                .mark_clean(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY);
+        }
+        if let Some((key, value)) = stored_catalog {
+            self.gens.mark_meta_written(key, value);
+        }
         self.indices = indices;
         self.id_to_surrogate = id_to_surrogate;
         self.surrogate_to_id = surrogate_to_id;
@@ -534,6 +696,12 @@ impl FtsCollectionManager {
         // origin_surrogate_to_doc_id is not persisted across restarts because
         // origin surrogates are only relevant for the lifetime of a sync session;
         // FtsIndexDoc frames re-register the mapping on re-sync.
+    }
+
+    /// The index under `key`, for tests that inspect one index directly.
+    #[cfg(test)]
+    pub(super) fn index(&self, key: &str) -> Option<&FtsIndex<MemoryBackend>> {
+        self.indices.get(key)
     }
 }
 
@@ -554,10 +722,13 @@ pub(crate) fn test_governor() -> Arc<MemoryGovernor> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use nodedb_types::Surrogate;
     use nodedb_types::text_search::{QueryMode, TextSearchParams};
 
     use super::{FtsCollectionManager, test_governor};
+    use crate::nodedb::flush_gens::{FTS_SURROGATES_KEY, FlushArtifact, FlushGens};
 
     fn default_params() -> TextSearchParams {
         TextSearchParams {
@@ -608,6 +779,58 @@ mod tests {
                 .memtable()
                 .is_empty(),
             "cleared field must not keep its prior postings"
+        );
+    }
+
+    // ── Flush dirty tracking ──────────────────────────────────────────────────
+
+    #[test]
+    fn only_a_real_change_marks_an_index_or_the_surrogates_dirty() {
+        let gens = Arc::new(FlushGens::default());
+        let mut mgr = FtsCollectionManager::with_gens(test_governor(), Arc::clone(&gens));
+        mgr.index_document("col", "doc1", "the quick brown fox")
+            .expect("index update must succeed");
+        mgr.index_document("col", "doc2", "a lazy dog")
+            .expect("index update must succeed");
+        mgr.index_field("col", "title", "doc1", "quick")
+            .expect("index update must succeed");
+        let clean = |key: &str| gens.mark_clean(FlushArtifact::FtsIndex, key);
+        clean("col:_doc");
+        clean("col:title");
+        gens.mark_clean(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY);
+
+        mgr.remove_document("col", "never_indexed")
+            .expect("removal must succeed");
+        mgr.remove_field("col", "body", "doc1")
+            .expect("removal must succeed");
+        mgr.remove_field("col", "title", "doc2")
+            .expect("removal must succeed");
+        mgr.drop_collection("nothing_here");
+        for key in ["col:_doc", "col:title"] {
+            assert!(
+                !gens.is_dirty(FlushArtifact::FtsIndex, key),
+                "a call that changes nothing must not mark {key} dirty"
+            );
+        }
+
+        mgr.index_document("col", "doc1", "a slow turtle")
+            .expect("index update must succeed");
+        assert!(gens.is_dirty(FlushArtifact::FtsIndex, "col:_doc"));
+        assert!(!gens.is_dirty(FlushArtifact::FtsIndex, "col:title"));
+        assert!(
+            !gens.is_dirty(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY),
+            "re-indexing a known document allocates no surrogate"
+        );
+
+        mgr.index_document("col", "doc3", "brand new words")
+            .expect("index update must succeed");
+        assert!(gens.is_dirty(FlushArtifact::FtsSurrogates, FTS_SURROGATES_KEY));
+
+        clean("col:title");
+        mgr.drop_collection("col");
+        assert!(
+            gens.is_dirty(FlushArtifact::FtsIndex, "col:title"),
+            "a dropped index must be flushed so its stored form is deleted"
         );
     }
 
