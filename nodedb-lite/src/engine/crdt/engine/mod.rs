@@ -14,20 +14,18 @@
 //! delta that will eventually sync to Origin.
 
 mod checkpoint;
+mod deferred;
 mod index_hook;
 mod lifecycle;
 mod list_ops;
+mod live_ids;
+mod maintenance;
 mod mutate;
 mod pending;
 mod persist;
 mod read;
 mod rotate;
 pub mod types;
-
-#[cfg(test)]
-mod flush_ack_tests;
-#[cfg(test)]
-mod tests;
 
 pub use checkpoint::{CrdtPersisted, CrdtWrite, CrdtWriteKind};
 pub use lifecycle::TrackedImport;

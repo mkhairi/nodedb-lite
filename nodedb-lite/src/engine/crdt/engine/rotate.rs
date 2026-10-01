@@ -46,6 +46,8 @@ impl CrdtEngine {
 
         let mut rotated = std::collections::BTreeMap::new();
         let mut pending = Vec::new();
+        let mut live_ids = std::collections::BTreeMap::new();
+        let mut live_id_bytes = 0usize;
         let mut next_mutation_id = self.next_mutation_id.load(Ordering::Relaxed);
 
         for (collection, state) in &self.states {
@@ -82,12 +84,34 @@ impl CrdtEngine {
                 next_mutation_id += 1;
             }
 
+            let ids: std::collections::BTreeSet<String> = rekeyed
+                .rows
+                .into_iter()
+                .map(|row| row.row_id)
+                .filter(|id| rekeyed.state.row_exists(collection, id))
+                .collect();
+            if !ids.is_empty() {
+                let key = collection.clone();
+                live_id_bytes = ids.iter().fold(
+                    live_id_bytes
+                        .saturating_add(key.capacity())
+                        .saturating_add(super::live_ids::TREE_ENTRY_BYTES),
+                    |bytes, id| {
+                        bytes
+                            .saturating_add(id.capacity())
+                            .saturating_add(super::live_ids::TREE_ENTRY_BYTES)
+                    },
+                );
+                live_ids.insert(key, ids);
+            }
             rotated.insert(collection.clone(), rekeyed.state);
         }
 
         // Nothing above mutated `self`, so a failure returned before this point
         // leaves the engine exactly as it was.
         self.states = rotated;
+        self.live_ids = live_ids;
+        self.live_id_bytes = live_id_bytes;
         self.pending_deltas = pending;
         self.acked_versions.clear();
         self.next_mutation_id

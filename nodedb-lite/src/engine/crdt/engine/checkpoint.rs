@@ -209,3 +209,43 @@ impl CrdtEngine {
         accumulated >= (base / DELTA_CHECKPOINT_RATIO).max(DELTA_CHECKPOINT_MIN_BYTES)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CrdtEngine;
+    use loro::LoroValue;
+
+    /// Compaction replaces a document without moving its frontier, so a flush that
+    /// planned against the previous form cannot be recognised as stale by frontier
+    /// alone. A compaction landing while the batch commits must leave the
+    /// collection needing a fresh checkpoint.
+    #[test]
+    fn a_compaction_during_a_flush_is_not_undone_by_its_acknowledgement() {
+        let mut engine = CrdtEngine::new(1).unwrap();
+        engine
+            .upsert("users", "u1", &[("n", LoroValue::I64(1))])
+            .unwrap();
+
+        let plan = engine.plan_persistence().unwrap();
+        assert_eq!(plan.len(), 1);
+        let persisted: Vec<_> = plan.iter().map(|write| write.persisted()).collect();
+
+        // The batch is committing. Compaction discards the history underneath it.
+        engine.compact_history().unwrap();
+
+        engine.mark_persisted(persisted);
+
+        let replan = engine.plan_persistence().unwrap();
+        assert_eq!(
+            replan.len(),
+            1,
+            "the compacted document is not what the in-flight batch wrote, so it must still be \
+             planned for"
+        );
+        assert!(
+            matches!(replan[0].kind, super::CrdtWriteKind::Checkpoint { .. }),
+            "and as a fresh checkpoint — an update exported from the discarded history does not \
+             apply to the base on disk"
+        );
+    }
+}

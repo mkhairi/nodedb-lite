@@ -4,5 +4,6 @@
 
 mod crypto;
 mod engine;
+mod prefix_scan;
 
 pub use crypto::EncryptedStorage;

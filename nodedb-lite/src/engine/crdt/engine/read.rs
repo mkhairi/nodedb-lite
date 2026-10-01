@@ -81,3 +81,37 @@ impl CrdtEngine {
         &self.policies
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CrdtEngine;
+    use loro::LoroValue;
+
+    #[test]
+    fn read_after_upsert() {
+        let mut engine = CrdtEngine::new(1).unwrap();
+        engine
+            .upsert("users", "u1", &[("age", LoroValue::I64(30))])
+            .unwrap();
+
+        assert!(engine.exists("users", "u1"));
+        let val = engine.read("users", "u1").unwrap();
+        // The value should be a map containing "age": 30.
+        assert!(format!("{val:?}").contains("30"));
+    }
+
+    #[test]
+    fn list_ids() {
+        let mut engine = CrdtEngine::new(1).unwrap();
+        engine
+            .upsert("col", "a", &[("x", LoroValue::I64(1))])
+            .unwrap();
+        engine
+            .upsert("col", "b", &[("x", LoroValue::I64(2))])
+            .unwrap();
+
+        let mut ids = engine.list_ids("col");
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+}

@@ -79,6 +79,10 @@ pub struct CrdtEngine {
     /// `BTreeMap` so `collection_names()` and snapshot export are
     /// deterministic across runs.
     pub(in crate::engine::crdt) states: std::collections::BTreeMap<String, CrdtState>,
+    /// Ordered applied rows for bounded enumeration.
+    pub(super) live_ids: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Retained ID capacities and conservative tree-node overhead.
+    pub(super) live_id_bytes: usize,
     /// Monotonically increasing mutation ID. Used as delta ordering key.
     pub(super) next_mutation_id: AtomicU64,
     /// Unsent deltas accumulated since last sync ACK.

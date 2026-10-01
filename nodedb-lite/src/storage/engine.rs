@@ -32,6 +32,32 @@ pub struct PrefixScan {
     pub limit: Option<PrefixScanLimit>,
 }
 
+pub(crate) fn check_prefix_cursor(
+    prefix: &[u8],
+    after_key: Option<&[u8]>,
+) -> Result<(), LiteError> {
+    if after_key.is_some_and(|key| !key.starts_with(prefix)) {
+        return Err(LiteError::BadRequest {
+            detail: format!(
+                "scan cursor {after_key:?} excludes prefix {prefix:?}: use a matching cursor"
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn prefix_scan_budget_error(
+    prefix: &[u8],
+    after_key: Option<&[u8]>,
+    max_bytes: usize,
+) -> LiteError {
+    LiteError::Backpressure {
+        detail: format!(
+            "scan row after {after_key:?} under prefix {prefix:?} exceeds {max_bytes} key-plus-value bytes: increase the byte budget"
+        ),
+    }
+}
+
 /// Summary of what a [`StorageEngine::compact`] call reclaimed.
 ///
 /// Lite-owned (not a pagedb type) so the trait doesn't force pagedb types on
@@ -135,6 +161,30 @@ pub trait StorageEngine: Send + Sync + 'static {
         }
         Err(LiteError::Unsupported {
             detail: "budgeted prefix scans require backend support".into(),
+        })
+    }
+
+    /// Read prefix rows after an exclusive, namespace-free cursor within both budgets.
+    ///
+    /// The cursor must match `prefix`. Rows remain strictly increasing and prefix-confined.
+    /// Resume from the last retained key. Continuation never advances past an excluded row.
+    /// Empty byte-limited batches return an error when `max_records` is positive.
+    /// Zero records returns an empty batch and ignores the cursor.
+    /// Budgets count serialized keys plus values.
+    async fn scan_prefix_from_budgeted(
+        &self,
+        _ns: Namespace,
+        prefix: &[u8],
+        after_key: Option<&[u8]>,
+        max_records: usize,
+        _max_bytes: usize,
+    ) -> Result<PrefixScan, LiteError> {
+        if max_records == 0 {
+            return Ok(PrefixScan::default());
+        }
+        check_prefix_cursor(prefix, after_key)?;
+        Err(LiteError::Unsupported {
+            detail: "budgeted prefix continuation requires backend support".into(),
         })
     }
 

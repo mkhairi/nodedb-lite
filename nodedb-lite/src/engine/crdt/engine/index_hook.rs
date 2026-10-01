@@ -66,12 +66,16 @@ impl CrdtEngine {
 
     /// Bring the index entries of `doc_ids` in line with their current rows.
     pub(in crate::engine::crdt) fn sync_indexes<'a>(
-        &self,
+        &mut self,
         collection: &str,
         doc_ids: impl IntoIterator<Item = &'a str>,
     ) {
+        let ids: Vec<&str> = doc_ids.into_iter().collect();
+        for id in &ids {
+            self.reconcile_live_id(collection, id);
+        }
         if let Some(catalog) = &self.indexes {
-            catalog.resync(collection, doc_ids, |id| self.current_row(collection, id));
+            catalog.resync(collection, ids, |id| self.current_row(collection, id));
         }
     }
 

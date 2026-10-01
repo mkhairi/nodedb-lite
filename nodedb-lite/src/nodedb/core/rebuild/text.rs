@@ -21,6 +21,8 @@ use crate::nodedb::core::types::NodeDbLite;
 
 /// Meta key prefix for the document bitemporal flag (mirrors `history::ops`).
 const META_DOCUMENT_BITEMPORAL_PREFIX: &str = "document_bitemporal:";
+const CRDT_REBUILD_ID_COUNT: usize = 256;
+const CRDT_REBUILD_ID_BYTES: usize = 1024 * 1024;
 
 impl<S: StorageEngine> NodeDbLite<S> {
     /// Rebuild all text indices from CRDT state and, for bitemporal collections,
@@ -67,12 +69,26 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 if collection.starts_with("__") {
                     continue;
                 }
-                for id in &crdt.list_ids(collection) {
-                    if let Some(loro_val) = crdt.read(collection, id) {
-                        let doc = crate::nodedb::convert::loro_value_to_document(id, &loro_val);
-                        fts.index_document_fields(collection, id, &doc.fields)?;
-                        sparse.index_document_fields(collection, id, &doc.fields);
-                        indexed.insert((collection.clone(), id.clone()));
+                let mut after_id = None;
+                loop {
+                    let ids = crdt.live_ids_page(
+                        collection,
+                        after_id.as_deref(),
+                        CRDT_REBUILD_ID_COUNT,
+                        CRDT_REBUILD_ID_BYTES,
+                    )?;
+                    if ids.is_empty() {
+                        break;
+                    }
+                    after_id = ids.last().cloned();
+                    for id in ids {
+                        if let Some(loro_val) = crdt.read(collection, &id) {
+                            let doc =
+                                crate::nodedb::convert::loro_value_to_document(&id, &loro_val);
+                            fts.index_document_fields(collection, &id, &doc.fields)?;
+                            sparse.index_document_fields(collection, &id, &doc.fields);
+                            indexed.insert((collection.clone(), id));
+                        }
                     }
                 }
             }
@@ -259,5 +275,74 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }
 
         Ok(ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use loro::LoroValue;
+    use nodedb_types::text_search::TextSearchParams;
+
+    use super::{CRDT_REBUILD_ID_COUNT, NodeDbLite};
+    use crate::nodedb::lock_ext::LockExt;
+    use crate::{LiteConfig, PagedbStorageMem};
+
+    #[tokio::test]
+    async fn text_rebuild_indexes_every_crdt_id_page() {
+        let storage = PagedbStorageMem::open_in_memory().await.unwrap();
+        let config = LiteConfig {
+            auto_flush_ms: 0,
+            sync_enabled: false,
+            ..LiteConfig::default()
+        };
+        let db = NodeDbLite::open_with_config(storage, config).await.unwrap();
+        let count = CRDT_REBUILD_ID_COUNT + 17;
+        let mut expected = HashSet::new();
+        {
+            let mut crdt = db.crdt.lock_or_recover();
+            for position in 0..count {
+                let id = format!("doc{position:04}");
+                crdt.upsert(
+                    "articles",
+                    &id,
+                    &[("body", LoroValue::String("pagecoverage".into()))],
+                )
+                .unwrap();
+                expected.insert(id);
+            }
+        }
+        {
+            let fts = db.fts_state.manager.lock_or_recover();
+            assert!(
+                fts.search(
+                    "articles",
+                    "body",
+                    "pagecoverage",
+                    count,
+                    &TextSearchParams::default()
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+
+        db.rebuild_text_indices().await.unwrap();
+
+        let fts = db.fts_state.manager.lock_or_recover();
+        for field in ["body", ""] {
+            let results = fts
+                .search(
+                    "articles",
+                    field,
+                    "pagecoverage",
+                    count,
+                    &TextSearchParams::default(),
+                )
+                .unwrap();
+            let actual: HashSet<String> = results.into_iter().map(|result| result.doc_id).collect();
+            assert_eq!(actual, expected, "field '{field}' omits rebuilt documents");
+        }
     }
 }

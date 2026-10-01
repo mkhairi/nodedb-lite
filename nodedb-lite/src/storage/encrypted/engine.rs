@@ -9,7 +9,7 @@ use nodedb_types::Namespace;
 use super::crypto::SALT_SIZE;
 use super::crypto::{EncryptedStorage, SALT_KEY};
 use crate::error::LiteError;
-use crate::storage::engine::{PrefixScan, PrefixScanLimit, StorageEngine, WriteOp};
+use crate::storage::engine::{PrefixScan, StorageEngine, WriteOp};
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -50,12 +50,12 @@ impl<S: StorageEngine> StorageEngine for EncryptedStorage<S> {
     ) -> Result<Vec<crate::storage::engine::KvPair>, LiteError> {
         let encrypted_entries = self.inner.scan_prefix(ns, prefix).await?;
         let mut results = Vec::with_capacity(encrypted_entries.len());
-        for (key, ciphertext) in &encrypted_entries {
-            match self.decrypt(ns, key, ciphertext) {
-                Ok(plaintext) => results.push((key.clone(), plaintext)),
+        for (key, ciphertext) in encrypted_entries {
+            match self.decrypt(ns, &key, &ciphertext) {
+                Ok(plaintext) => results.push((key, plaintext)),
                 Err(e) => {
                     tracing::warn!(
-                        key = ?String::from_utf8_lossy(key),
+                        key = ?String::from_utf8_lossy(&key),
                         error = %e,
                         "skipping undecryptable entry in scan"
                     );
@@ -92,36 +92,20 @@ impl<S: StorageEngine> StorageEngine for EncryptedStorage<S> {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<PrefixScan, LiteError> {
-        if max_records == 0 {
-            return Ok(PrefixScan::default());
-        }
-        // AES-GCM adds a fixed 16-byte authentication tag to each value.
-        let encrypted_budget = max_bytes.saturating_add(max_records.saturating_mul(16));
-        let scan = self
-            .inner
-            .scan_prefix_budgeted(ns, prefix, max_records, encrypted_budget)
-            .await?;
-        let mut result = PrefixScan {
-            entries: Vec::with_capacity(scan.entries.len()),
-            limit: scan.limit,
-        };
-        let mut bytes = 0usize;
-        for (key, ciphertext) in scan.entries {
-            let plaintext = if ns == Namespace::Meta && key == SALT_KEY {
-                ciphertext
-            } else {
-                self.decrypt(ns, &key, &ciphertext)?
-            };
-            bytes = bytes
-                .saturating_add(key.len())
-                .saturating_add(plaintext.len());
-            if bytes > max_bytes {
-                result.limit = Some(PrefixScanLimit::Bytes);
-                continue;
-            }
-            result.entries.push((key, plaintext));
-        }
-        Ok(result)
+        self.scan_budgeted(ns, prefix, None, max_records, max_bytes, false)
+            .await
+    }
+
+    async fn scan_prefix_from_budgeted(
+        &self,
+        ns: Namespace,
+        prefix: &[u8],
+        after_key: Option<&[u8]>,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<PrefixScan, LiteError> {
+        self.scan_budgeted(ns, prefix, after_key, max_records, max_bytes, true)
+            .await
     }
 
     async fn batch_write(&self, ops: &[WriteOp]) -> Result<(), LiteError> {
@@ -165,12 +149,12 @@ impl<S: StorageEngine> StorageEngine for EncryptedStorage<S> {
     ) -> Result<Vec<crate::storage::engine::KvPair>, LiteError> {
         let encrypted_entries = self.inner.scan_range(ns, start, limit).await?;
         let mut results = Vec::with_capacity(encrypted_entries.len());
-        for (key, ciphertext) in &encrypted_entries {
-            match self.decrypt(ns, key, ciphertext) {
-                Ok(plaintext) => results.push((key.clone(), plaintext)),
+        for (key, ciphertext) in encrypted_entries {
+            match self.decrypt(ns, &key, &ciphertext) {
+                Ok(plaintext) => results.push((key, plaintext)),
                 Err(e) => {
                     tracing::warn!(
-                        key = ?String::from_utf8_lossy(key),
+                        key = ?String::from_utf8_lossy(&key),
                         error = %e,
                         "skipping undecryptable entry in scan_range"
                     );
@@ -189,12 +173,12 @@ impl<S: StorageEngine> StorageEngine for EncryptedStorage<S> {
     ) -> Result<Vec<crate::storage::engine::KvPair>, LiteError> {
         let encrypted_entries = self.inner.scan_range_bounded(ns, start, end, limit).await?;
         let mut results = Vec::with_capacity(encrypted_entries.len());
-        for (key, ciphertext) in &encrypted_entries {
-            match self.decrypt(ns, key, ciphertext) {
-                Ok(plaintext) => results.push((key.clone(), plaintext)),
+        for (key, ciphertext) in encrypted_entries {
+            match self.decrypt(ns, &key, &ciphertext) {
+                Ok(plaintext) => results.push((key, plaintext)),
                 Err(e) => {
                     tracing::warn!(
-                        key = ?String::from_utf8_lossy(key),
+                        key = ?String::from_utf8_lossy(&key),
                         error = %e,
                         "skipping undecryptable entry in scan_range_bounded"
                     );
@@ -209,6 +193,7 @@ impl<S: StorageEngine> StorageEngine for EncryptedStorage<S> {
 mod tests {
     use super::*;
     use crate::config::LiteConfig;
+    use crate::storage::engine::PrefixScanLimit;
     use crate::storage::pagedb_storage::PagedbStorageMem;
 
     async fn make_encrypted() -> EncryptedStorage<PagedbStorageMem> {

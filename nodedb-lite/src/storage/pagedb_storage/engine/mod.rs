@@ -2,10 +2,10 @@
 
 //! `StorageEngine` implementations, one per target family.
 
+mod rows;
+mod scans;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod native;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod wasm;
-
-#[cfg(test)]
-mod tests;

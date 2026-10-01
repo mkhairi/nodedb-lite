@@ -48,6 +48,8 @@ impl CrdtEngine {
         Ok(Self {
             peer_id,
             states: BTreeMap::new(),
+            live_ids: BTreeMap::new(),
+            live_id_bytes: 0,
             next_mutation_id: AtomicU64::new(1),
             pending_deltas: Vec::new(),
             acked_versions: HashMap::new(),
@@ -146,17 +148,27 @@ impl CrdtEngine {
         collection: &str,
         data: &[u8],
     ) -> Result<TrackedImport, LiteError> {
-        let state = self.state_mut(collection)?;
-        let before = state.state_frontiers();
-        let admission = state.import(data).map_err(|e| LiteError::Storage {
-            detail: format!("remote delta import for '{collection}' failed: {e}"),
-        })?;
-        let changed_rows =
-            state
-                .changed_rows_since(collection, &before)
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("rows changed by remote delta for '{collection}': {e}"),
-                })?;
+        let result = (|| {
+            let state = self.state_mut(collection)?;
+            let before = state.state_frontiers();
+            let admission = state.import(data).map_err(|e| LiteError::Storage {
+                detail: format!("remote delta import for '{collection}' failed: {e}"),
+            })?;
+            let changed_rows =
+                state
+                    .changed_rows_since(collection, &before)
+                    .map_err(|e| LiteError::Storage {
+                        detail: format!("rows changed by remote delta for '{collection}': {e}"),
+                    })?;
+            Ok((admission, changed_rows))
+        })();
+        let (admission, changed_rows) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.reconcile_live_collection(collection);
+                return Err(error);
+            }
+        };
         warn_if_fully_trimmed(collection, "remote delta", &admission);
         self.sync_indexes(collection, changed_rows.iter().map(String::as_str));
         Ok(TrackedImport {
@@ -189,12 +201,14 @@ impl CrdtEngine {
         collection: &str,
         snapshot: &[u8],
     ) -> Result<ImportAdmission, LiteError> {
-        let admission = self
+        let result = self
             .state_mut(collection)?
             .import_local(snapshot)
             .map_err(|e| LiteError::Storage {
                 detail: format!("snapshot import for '{collection}' failed: {e}"),
-            })?;
+            });
+        self.reconcile_live_collection(collection);
+        let admission = result?;
         warn_if_fully_trimmed(collection, "snapshot", &admission);
         Ok(admission)
     }
@@ -209,17 +223,27 @@ impl CrdtEngine {
         collection: &str,
         bytes: &[u8],
     ) -> Result<TrackedImport, LiteError> {
-        let state = self.state_mut(collection)?;
-        let before = state.state_frontiers();
-        let admission = state.import_local(bytes).map_err(|e| LiteError::Storage {
-            detail: format!("update import for '{collection}' failed: {e}"),
-        })?;
-        let changed_rows =
-            state
-                .changed_rows_since(collection, &before)
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("rows changed by update for '{collection}': {e}"),
-                })?;
+        let result = (|| {
+            let state = self.state_mut(collection)?;
+            let before = state.state_frontiers();
+            let admission = state.import_local(bytes).map_err(|e| LiteError::Storage {
+                detail: format!("update import for '{collection}' failed: {e}"),
+            })?;
+            let changed_rows =
+                state
+                    .changed_rows_since(collection, &before)
+                    .map_err(|e| LiteError::Storage {
+                        detail: format!("rows changed by update for '{collection}': {e}"),
+                    })?;
+            Ok((admission, changed_rows))
+        })();
+        let (admission, changed_rows) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.reconcile_live_collection(collection);
+                return Err(error);
+            }
+        };
         warn_if_fully_trimmed(collection, "update", &admission);
         self.sync_indexes(collection, changed_rows.iter().map(String::as_str));
         Ok(TrackedImport {
@@ -267,53 +291,8 @@ impl CrdtEngine {
         })
     }
 
-    /// Compact Loro history on every collection to prevent unbounded growth.
-    ///
-    /// Replaces each internal LoroDoc with a shallow snapshot. Historical
-    /// operations are discarded. Current state is fully preserved.
-    pub fn compact_history(&mut self) -> Result<(), LiteError> {
-        for (collection, state) in &mut self.states {
-            state.compact_history().map_err(|e| LiteError::Storage {
-                detail: format!("history compaction for '{collection}' failed: {e}"),
-            })?;
-        }
-        // Compaction rewrites the document without advancing its frontier, so
-        // neither the persisted base nor the updates on top of it describe the
-        // document any more, and the discarded history means an update export
-        // from the old frontier may not even be possible. Dropping both marks
-        // forces a fresh checkpoint, which also deletes the stale updates —
-        // `next_delta_seq` is deliberately kept, since it is the count of the
-        // entries that checkpoint has to delete.
-        //
-        // Advancing the epoch is what keeps a flush that is committing right
-        // now from putting the marks back: its writes were exported from the
-        // document this call just replaced.
-        self.flushed_versions.clear();
-        self.checkpoint_bytes.clear();
-        self.delta_bytes.clear();
-        let compacted: Vec<String> = self.states.keys().cloned().collect();
-        for collection in compacted {
-            self.advance_state_epoch(&collection);
-        }
-        Ok(())
-    }
-
-    /// Estimated memory usage in bytes across all collections.
-    pub fn estimated_memory_bytes(&self) -> usize {
-        let state_bytes: usize = self
-            .states
-            .values()
-            .map(|s| s.estimated_memory_bytes())
-            .sum();
-        let delta_bytes: usize = self
-            .pending_deltas
-            .iter()
-            .map(|d| d.delta_bytes.len())
-            .sum();
-        state_bytes + delta_bytes
-    }
-
     /// Access a collection's underlying `CrdtState` for advanced operations.
+    /// Raw mutations bypass derived indexes and ordered live-ID enumeration.
     pub fn state(&self, collection: &str) -> Option<&CrdtState> {
         self.states.get(collection)
     }
@@ -368,5 +347,63 @@ impl CrdtEngine {
         self.delta_bytes.remove(collection);
         self.advance_state_epoch(collection);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CrdtEngine;
+    use loro::LoroValue;
+
+    #[test]
+    fn create_engine() {
+        let engine = CrdtEngine::new(1).unwrap();
+        assert_eq!(engine.peer_id(), 1);
+        assert_eq!(engine.pending_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_and_restore() {
+        let mut engine1 = CrdtEngine::new(1).unwrap();
+        engine1
+            .upsert(
+                "docs",
+                "d1",
+                &[("title", LoroValue::String("Hello".into()))],
+            )
+            .unwrap();
+        engine1
+            .upsert(
+                "docs",
+                "d2",
+                &[("title", LoroValue::String("World".into()))],
+            )
+            .unwrap();
+
+        let snapshot = engine1.export_snapshot("docs").unwrap();
+        assert!(!snapshot.is_empty());
+
+        let engine2 = CrdtEngine::from_snapshot(2, "docs", &snapshot).unwrap();
+        assert!(engine2.exists("docs", "d1"));
+        assert!(engine2.exists("docs", "d2"));
+    }
+
+    #[test]
+    fn import_remote_deltas() {
+        let mut engine1 = CrdtEngine::new(1).unwrap();
+        engine1
+            .upsert("items", "i1", &[("val", LoroValue::I64(42))])
+            .unwrap();
+
+        // Export engine1's state as a snapshot and import into engine2.
+        let snapshot = engine1.export_snapshot("items").unwrap();
+        let mut engine2 = CrdtEngine::new(2).unwrap();
+        let imported = engine2.import_remote("items", &snapshot).unwrap();
+
+        assert!(engine2.exists("items", "i1"));
+        assert!(
+            imported.changed_rows.contains("i1"),
+            "the import must report the row it created"
+        );
     }
 }

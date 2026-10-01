@@ -7,53 +7,30 @@
 //! `Send + Sync` impl in the sibling module.
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use pagedb::vfs::Vfs;
 
 use nodedb_types::Namespace;
 
 use crate::error::LiteError;
-use crate::storage::engine::{
-    CompactionOutcome, KvPair, PrefixScan, PrefixScanLimit, StorageEngine, WriteOp,
-};
-use crate::storage::pagedb_storage::keys::{KeyBuf, ns_end, prefix_key, strip_prefix};
+use crate::storage::engine::{CompactionOutcome, KvPair, PrefixScan, StorageEngine, WriteOp};
 use crate::storage::pagedb_storage::types::PagedbStorage;
 
 #[async_trait(?Send)]
 impl<V: Vfs + Clone + 'static> StorageEngine for PagedbStorage<V> {
     async fn get(&self, ns: Namespace, key: &[u8]) -> Result<Option<Vec<u8>>, LiteError> {
-        let composite = KeyBuf::new(ns, key);
-        let txn = self.db.begin_read().await.map_err(LiteError::from)?;
-        // pagedb hands back a `Bytes` sharing the cached page; `StorageEngine`
-        // is defined in owned `Vec<u8>`, so the borrow ends at this boundary.
-        txn.get(composite.as_slice())
-            .await
-            .map(|opt| opt.map(|v| v.to_vec()))
-            .map_err(LiteError::from)
+        self.get_rows(ns, key).await
     }
 
     async fn put(&self, ns: Namespace, key: &[u8], value: &[u8]) -> Result<(), LiteError> {
-        let composite = prefix_key(ns, key);
-        let mut txn = self.db.begin_write().await.map_err(LiteError::from)?;
-        txn.put(&composite, value).await.map_err(LiteError::from)?;
-        txn.commit().await.map(|_| ()).map_err(LiteError::from)
+        self.put_rows(ns, key, value).await
     }
 
     async fn delete(&self, ns: Namespace, key: &[u8]) -> Result<(), LiteError> {
-        let composite = prefix_key(ns, key);
-        let mut txn = self.db.begin_write().await.map_err(LiteError::from)?;
-        txn.delete(&composite).await.map_err(LiteError::from)?;
-        txn.commit().await.map(|_| ()).map_err(LiteError::from)
+        self.delete_rows(ns, key).await
     }
 
     async fn scan_prefix(&self, ns: Namespace, prefix: &[u8]) -> Result<Vec<KvPair>, LiteError> {
-        let ns_prefix = prefix_key(ns, prefix);
-        let txn = self.db.begin_read().await.map_err(LiteError::from)?;
-        let raw = txn.scan_prefix(&ns_prefix).await.map_err(LiteError::from)?;
-        Ok(raw
-            .into_iter()
-            .map(|(k, v)| (strip_prefix(&k).to_vec(), v.to_vec()))
-            .collect())
+        self.scan_prefix_rows(ns, prefix).await
     }
 
     async fn scan_prefix_bounded(
@@ -62,19 +39,7 @@ impl<V: Vfs + Clone + 'static> StorageEngine for PagedbStorage<V> {
         prefix: &[u8],
         limit: usize,
     ) -> Result<Vec<KvPair>, LiteError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let ns_prefix = prefix_key(ns, prefix);
-        let txn = self.db.begin_read().await.map_err(LiteError::from)?;
-        let raw = txn
-            .scan_prefix_from(&ns_prefix, &ns_prefix, limit)
-            .await
-            .map_err(LiteError::from)?;
-        Ok(raw
-            .into_iter()
-            .map(|(k, v)| (strip_prefix(&k).to_vec(), v.to_vec()))
-            .collect())
+        self.scan_prefix_bounded_rows(ns, prefix, limit).await
     }
 
     async fn scan_prefix_budgeted(
@@ -84,114 +49,28 @@ impl<V: Vfs + Clone + 'static> StorageEngine for PagedbStorage<V> {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<PrefixScan, LiteError> {
-        if max_records == 0 {
-            return Ok(PrefixScan::default());
-        }
-        let ns_prefix = prefix_key(ns, prefix);
-        let txn = self.db.begin_read().await.map_err(LiteError::from)?;
-        // Physical keys add one namespace byte per retained record.
-        let raw = txn
-            .scan_prefix_from_bounded(
-                &ns_prefix,
-                &ns_prefix,
-                max_records,
-                max_bytes.saturating_add(max_records),
-            )
+        self.scan_budgeted(ns, prefix, None, max_records, max_bytes, false)
             .await
-            .map_err(LiteError::from)?;
-        let mut result = PrefixScan {
-            entries: Vec::with_capacity(raw.entries.len()),
-            limit: raw.limit.map(|limit| match limit {
-                pagedb::ScanLimit::Records => PrefixScanLimit::Records,
-                pagedb::ScanLimit::Bytes => PrefixScanLimit::Bytes,
-            }),
-        };
-        let mut bytes = 0usize;
-        for (key, value) in raw.entries {
-            let key = strip_prefix(&key);
-            bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
-            if bytes > max_bytes {
-                result.limit = Some(PrefixScanLimit::Bytes);
-                break;
-            }
-            result.entries.push((key.to_vec(), value.to_vec()));
-        }
-        Ok(result)
+    }
+
+    async fn scan_prefix_from_budgeted(
+        &self,
+        ns: Namespace,
+        prefix: &[u8],
+        after_key: Option<&[u8]>,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<PrefixScan, LiteError> {
+        self.scan_budgeted(ns, prefix, after_key, max_records, max_bytes, true)
+            .await
     }
 
     async fn batch_write(&self, ops: &[WriteOp]) -> Result<(), LiteError> {
-        if ops.is_empty() {
-            return Ok(());
-        }
-
-        let mut txn = self.db.begin_write().await.map_err(LiteError::from)?;
-
-        let all_keys: Vec<Vec<u8>> = ops
-            .iter()
-            .map(|op| match op {
-                WriteOp::Put { ns, key, .. } => prefix_key(*ns, key),
-                WriteOp::Delete { ns, key } => prefix_key(*ns, key),
-            })
-            .collect();
-        let unique_count = {
-            let mut dedup = all_keys.clone();
-            dedup.sort_unstable();
-            dedup.dedup();
-            dedup.len()
-        };
-
-        if unique_count < all_keys.len() {
-            for op in ops {
-                match op {
-                    WriteOp::Put { ns, key, value } => {
-                        let composite = prefix_key(*ns, key);
-                        txn.put(&composite, value).await.map_err(LiteError::from)?;
-                    }
-                    WriteOp::Delete { ns, key } => {
-                        let composite = prefix_key(*ns, key);
-                        txn.delete(&composite).await.map_err(LiteError::from)?;
-                    }
-                }
-            }
-        } else {
-            // `put_batch` takes `Bytes` so the tree can store the buffer without
-            // re-copying it; `delete_batch` still takes owned key vectors.
-            let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
-            let mut deletes: Vec<Vec<u8>> = Vec::new();
-
-            for op in ops {
-                match op {
-                    WriteOp::Put { ns, key, value } => {
-                        puts.push((
-                            Bytes::from(prefix_key(*ns, key)),
-                            Bytes::from(value.clone()),
-                        ));
-                    }
-                    WriteOp::Delete { ns, key } => {
-                        deletes.push(prefix_key(*ns, key));
-                    }
-                }
-            }
-
-            puts.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-            deletes.sort_unstable();
-
-            if !puts.is_empty() {
-                txn.put_batch(puts).await.map_err(LiteError::from)?;
-            }
-            if !deletes.is_empty() {
-                txn.delete_batch(deletes).await.map_err(LiteError::from)?;
-            }
-        }
-
-        txn.commit().await.map(|_| ()).map_err(LiteError::from)
+        self.batch_write_rows(ops).await
     }
 
     async fn count(&self, ns: Namespace) -> Result<u64, LiteError> {
-        let ns_prefix = vec![ns as u8];
-        let txn = self.db.begin_read().await.map_err(LiteError::from)?;
-        let raw = txn.scan_prefix(&ns_prefix).await.map_err(LiteError::from)?;
-        Ok(raw.len() as u64)
+        self.count_rows(ns).await
     }
 
     async fn scan_range(
@@ -200,18 +79,7 @@ impl<V: Vfs + Clone + 'static> StorageEngine for PagedbStorage<V> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<KvPair>, LiteError> {
-        let start_key = prefix_key(ns, start);
-        let end_key = ns_end(ns);
-        let txn = self.db.begin_read().await.map_err(LiteError::from)?;
-        let raw = txn
-            .scan(&start_key, &end_key)
-            .await
-            .map_err(LiteError::from)?;
-        Ok(raw
-            .into_iter()
-            .take(limit)
-            .map(|(k, v)| (strip_prefix(&k).to_vec(), v.to_vec()))
-            .collect())
+        self.scan_range_rows(ns, start, limit).await
     }
 
     async fn scan_range_bounded(
@@ -221,39 +89,10 @@ impl<V: Vfs + Clone + 'static> StorageEngine for PagedbStorage<V> {
         end: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Result<Vec<KvPair>, LiteError> {
-        let start_key = match start {
-            Some(s) => prefix_key(ns, s),
-            None => vec![ns as u8],
-        };
-        let end_key = match end {
-            Some(e) => prefix_key(ns, e),
-            None => ns_end(ns),
-        };
-        let txn = self.db.begin_read().await.map_err(LiteError::from)?;
-        let raw = txn
-            .scan(&start_key, &end_key)
-            .await
-            .map_err(LiteError::from)?;
-        let effective_limit = limit.unwrap_or(usize::MAX);
-        Ok(raw
-            .into_iter()
-            .take(effective_limit)
-            .map(|(k, v)| (strip_prefix(&k).to_vec(), v.to_vec()))
-            .collect())
+        self.scan_range_bounded_rows(ns, start, end, limit).await
     }
 
     async fn compact(&self) -> Result<CompactionOutcome, LiteError> {
-        let stats = self.db.compact_now().await.map_err(LiteError::from)?;
-        // `compact_now` repacks and truncates; it does not touch retired segment
-        // files. Reclaiming those is `gc_now`, which picks up the retirements
-        // that a reader pin deferred past their commit.
-        let gc = self.db.gc_now().await.map_err(LiteError::from)?;
-        Ok(CompactionOutcome {
-            reclaimed_pages: stats.main_db_pages_reclaimed,
-            segments_repacked: stats.segments_repacked,
-            file_bytes_freed: stats.bytes_truncated,
-            reclaimed_segments: gc.reclaimed_segments,
-            segment_bytes_freed: gc.reclaimed_bytes,
-        })
+        self.compact_rows().await
     }
 }

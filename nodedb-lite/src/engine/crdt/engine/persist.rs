@@ -167,3 +167,32 @@ impl CrdtEngine {
         VCLOCK_KEY
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CrdtEngine;
+    use loro::LoroValue;
+
+    #[test]
+    fn pending_deltas_persistence() {
+        let mut engine = CrdtEngine::new(1).unwrap();
+        engine
+            .upsert("a", "1", &[("x", LoroValue::I64(1))])
+            .unwrap();
+        engine
+            .upsert("b", "2", &[("y", LoroValue::I64(2))])
+            .unwrap();
+
+        let bytes = engine.serialize_pending_deltas().unwrap();
+        assert!(!bytes.is_empty());
+
+        let mut engine2 = CrdtEngine::new(1).unwrap();
+        engine2.restore_pending_deltas(&bytes);
+        assert_eq!(engine2.pending_count(), 2);
+        // Mutation ID counter should be advanced past restored deltas.
+        let mid = engine2
+            .upsert("c", "3", &[("z", LoroValue::I64(3))])
+            .unwrap();
+        assert!(mid > 2);
+    }
+}

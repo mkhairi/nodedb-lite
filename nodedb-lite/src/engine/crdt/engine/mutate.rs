@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Write paths: upsert, set-fields, delete, batching, deferred
-//! accumulation, and the shared delta-capture envelope.
+//! Immediate row mutations and the shared delta-capture envelope.
 
 use std::sync::atomic::Ordering;
 
@@ -10,7 +9,8 @@ use nodedb_crdt::CrdtState;
 
 use crate::error::LiteError;
 
-use super::types::{CrdtBatchOp, CrdtEngine, CrdtRowOp, CrdtRowWrite, DeferredOp, PendingDelta};
+use super::live_ids::AffectedRows;
+use super::types::{CrdtBatchOp, CrdtEngine, CrdtRowOp, CrdtRowWrite, PendingDelta};
 
 impl CrdtEngine {
     // ─── Mutations ───────────────────────────────────────────────────
@@ -150,132 +150,25 @@ impl CrdtEngine {
         Ok(mutation_ids)
     }
 
-    /// Upsert without generating a delta. Use `flush_deltas()` later
-    /// to export the accumulated mutations.
-    ///
-    /// This is the fast path for local-only writes (KV put, bulk insert)
-    /// where per-operation delta export is prohibitively expensive.
-    pub fn upsert_deferred(
-        &mut self,
-        collection: &str,
-        doc_id: &str,
-        fields: &[(&str, LoroValue)],
-    ) -> Result<(), LiteError> {
-        self.check_unique_writes(&[(CrdtRowWrite::Upsert, collection, doc_id, fields)])?;
-        self.defer(collection, doc_id, |state| {
-            state
-                .upsert(collection, doc_id, fields)
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("CRDT upsert failed: {e}"),
-                })
-        })
-    }
-
-    /// Field merge without generating a delta, as `set_fields` merges. Use
-    /// `flush_deltas()` later.
-    pub fn set_fields_deferred(
-        &mut self,
-        collection: &str,
-        doc_id: &str,
-        fields: &[(&str, LoroValue)],
-    ) -> Result<(), LiteError> {
-        self.check_unique_writes(&[(CrdtRowWrite::SetFields, collection, doc_id, fields)])?;
-        self.defer(collection, doc_id, |state| {
-            state
-                .set_fields(collection, doc_id, fields)
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("CRDT set_fields failed: {e}"),
-                })
-        })
-    }
-
-    /// Delete without generating a delta. Use `flush_deltas()` later.
-    pub fn delete_deferred(&mut self, collection: &str, doc_id: &str) -> Result<(), LiteError> {
-        self.defer(collection, doc_id, |state| {
-            state
-                .delete(collection, doc_id)
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("CRDT delete failed: {e}"),
-                })
-        })
-    }
-
-    /// Apply `body` to the collection's document and record the counter range
-    /// its operations occupy, so `flush_deltas` can export exactly that row
-    /// later.
-    fn defer<F>(&mut self, collection: &str, document_id: &str, body: F) -> Result<(), LiteError>
-    where
-        F: FnOnce(&CrdtState) -> Result<(), LiteError>,
-    {
-        let (from_counter, to_counter) = {
-            let state = self.state_mut(collection)?;
-            let from_counter = state.local_op_counter();
-            body(state)?;
-            (from_counter, state.local_op_counter())
-        };
-        self.sync_indexes(collection, [document_id]);
-        self.deferred.push(DeferredOp {
-            collection: collection.to_string(),
-            document_id: document_id.to_string(),
-            from_counter,
-            to_counter,
-        });
-        Ok(())
-    }
-
-    /// Export one delta per deferred mutation since the last flush. Returns
-    /// the number of deferred operations processed, or 0 if none.
-    ///
-    /// Call this after a batch of `upsert_deferred` / `delete_deferred`
-    /// calls to produce the sync deltas. Each deferred write is exported over
-    /// its own recorded counter range so the resulting delta is applicable on
-    /// its own — a single coalesced delta spanning rows and collections is not.
-    pub fn flush_deltas(&mut self) -> Result<usize, LiteError> {
-        let deferred = std::mem::take(&mut self.deferred);
-        let count = deferred.len();
-
-        for op in deferred {
-            let Some(state) = self.states.get(&op.collection) else {
-                continue;
-            };
-            let delta_bytes = state
-                .export_local_range(op.from_counter, op.to_counter)
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("flush delta export for '{}': {e}", op.collection),
-                })?;
-            // An empty range exports no bytes, and an empty blob is not
-            // importable — never enqueue one.
-            if delta_bytes.is_empty() {
-                continue;
-            }
-
-            let mutation_id = self.next_mutation_id.fetch_add(1, Ordering::Relaxed);
-            self.pending_deltas.push(PendingDelta {
-                mutation_id,
-                collection: op.collection,
-                document_id: op.document_id,
-                delta_bytes,
-                seq: 0,
-            });
-            self.mark_delta_unpersisted(mutation_id);
-        }
-
-        Ok(count)
-    }
-
     /// Delete all documents in a collection in a single batch.
     /// Returns the number of documents deleted. Generates one delta.
     pub fn clear_collection(&mut self, collection: &str) -> Result<usize, LiteError> {
         if !self.states.contains_key(collection) {
             return Ok(0);
         }
-        let (count, _) = self.with_delta_capture(collection, "*", "clear collection", |state| {
-            state
-                .clear_collection(collection)
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("clear collection: {e}"),
-                })
-        })?;
+        let (count, _) = self.capture_affected(
+            collection,
+            "*",
+            AffectedRows::Collection,
+            "clear collection",
+            |state| {
+                state
+                    .clear_collection(collection)
+                    .map_err(|e| LiteError::Storage {
+                        detail: format!("clear collection: {e}"),
+                    })
+            },
+        )?;
         self.clear_index_entries(collection);
         Ok(count)
     }
@@ -299,7 +192,27 @@ impl CrdtEngine {
     where
         F: FnOnce(&CrdtState) -> Result<T, LiteError>,
     {
-        let (value, delta_bytes) = {
+        self.capture_affected(
+            collection,
+            document_id,
+            AffectedRows::One(document_id),
+            op_name,
+            body,
+        )
+    }
+
+    fn capture_affected<F, T>(
+        &mut self,
+        collection: &str,
+        document_id: &str,
+        affected: AffectedRows<'_>,
+        op_name: &str,
+        body: F,
+    ) -> Result<(T, u64), LiteError>
+    where
+        F: FnOnce(&CrdtState) -> Result<T, LiteError>,
+    {
+        let result: Result<_, LiteError> = (|| {
             let state = self.state_mut(collection)?;
             let version_before = state.oplog_version_vector();
             let counter_before = state.local_op_counter();
@@ -308,7 +221,7 @@ impl CrdtEngine {
             // empty collection) still exports a non-empty Loro header. Enqueuing
             // that would send the receiver a delta carrying no operations.
             if state.local_op_counter() == counter_before {
-                return Ok((value, 0));
+                return Ok((value, Vec::new()));
             }
             let delta_bytes =
                 state
@@ -316,10 +229,10 @@ impl CrdtEngine {
                     .map_err(|e| LiteError::Storage {
                         detail: format!("{op_name} delta export: {e}"),
                     })?;
-            (value, delta_bytes)
-        };
-        // The row changed: its index entries follow under the same borrow.
-        self.sync_indexes(collection, [document_id]);
+            Ok((value, delta_bytes))
+        })();
+        self.reconcile_affected(collection, affected);
+        let (value, delta_bytes) = result?;
 
         if delta_bytes.is_empty() {
             return Ok((value, 0));
@@ -335,5 +248,111 @@ impl CrdtEngine {
         });
         self.mark_delta_unpersisted(mutation_id);
         Ok((value, mutation_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AffectedRows, CrdtEngine};
+    use crate::error::LiteError;
+    use loro::LoroValue;
+
+    #[test]
+    fn collection_operation_error_reconciles_remaining_rows() {
+        let mut engine = CrdtEngine::new(1).unwrap();
+        for id in ["*", "b"] {
+            engine
+                .upsert("docs", id, &[("value", LoroValue::I64(1))])
+                .unwrap();
+        }
+        let result: Result<((), u64), LiteError> = engine.capture_affected(
+            "docs",
+            "*",
+            AffectedRows::Collection,
+            "clear collection",
+            |state| {
+                state.delete("docs", "b").unwrap();
+                Err(LiteError::Storage {
+                    detail: "injected collection error".into(),
+                })
+            },
+        );
+        assert!(
+            matches!(result, Err(LiteError::Storage { detail }) if detail == "injected collection error")
+        );
+        assert_eq!(engine.live_ids_page("docs", None, 10, 10).unwrap(), ["*"]);
+    }
+
+    #[test]
+    fn upsert_generates_delta() {
+        let mut engine = CrdtEngine::new(1).unwrap();
+        let mid = engine
+            .upsert(
+                "users",
+                "u1",
+                &[("name", LoroValue::String("Alice".into()))],
+            )
+            .unwrap();
+
+        assert_eq!(mid, 1);
+        assert_eq!(engine.pending_count(), 1);
+        assert!(!engine.pending_deltas()[0].delta_bytes.is_empty());
+    }
+
+    #[test]
+    fn delete_generates_delta() {
+        let mut engine = CrdtEngine::new(1).unwrap();
+        engine
+            .upsert("users", "u1", &[("name", LoroValue::String("X".into()))])
+            .unwrap();
+        let mid = engine.delete("users", "u1").unwrap();
+
+        assert_eq!(mid, 2); // Second mutation.
+        assert_eq!(engine.pending_count(), 2);
+        assert!(!engine.exists("users", "u1"));
+    }
+
+    /// A delta must be applicable on its own. The receiver stores documents per
+    /// collection, so a delta for `probe` whose causal predecessors were written
+    /// to `signals` can never be applied there — those predecessors never arrive
+    /// and the row is silently lost. Writing the collections interleaved and
+    /// replaying only `probe`'s deltas into a fresh document reproduces exactly
+    /// that: under a single shared oplog the second delta is causally incomplete
+    /// and row "b" never materializes.
+    #[test]
+    fn interleaved_collection_writes_export_self_contained_deltas() {
+        const PEER: u64 = 7;
+
+        let mut engine = CrdtEngine::new(PEER).unwrap();
+        engine
+            .upsert("probe", "a", &[("v", LoroValue::I64(1))])
+            .unwrap();
+        engine
+            .upsert("signals", "s1", &[("v", LoroValue::I64(2))])
+            .unwrap();
+        engine
+            .upsert("probe", "b", &[("v", LoroValue::I64(3))])
+            .unwrap();
+
+        let probe_deltas: Vec<Vec<u8>> = engine
+            .pending_deltas()
+            .iter()
+            .filter(|d| d.collection == "probe")
+            .map(|d| d.delta_bytes.clone())
+            .collect();
+        assert_eq!(probe_deltas.len(), 2, "one delta per probe row");
+
+        // The receiver only ever sees this collection's deltas.
+        let receiver =
+            nodedb_crdt::CrdtState::new(CrdtEngine::collection_peer_id(PEER, "probe")).unwrap();
+        for bytes in &probe_deltas {
+            receiver.import(bytes).unwrap();
+        }
+
+        assert!(receiver.row_exists("probe", "a"));
+        assert!(
+            receiver.row_exists("probe", "b"),
+            "second probe delta was causally incomplete; row 'b' was lost"
+        );
     }
 }
