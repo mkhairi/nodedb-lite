@@ -124,19 +124,18 @@ pub struct LiteConfig {
     #[serde(default = "default_outbound_queue_cap")]
     pub outbound_queue_cap: usize,
 
-    /// Interval between automatic background flushes, in milliseconds.
-    /// Default: 1000 (1 second).
+    /// Scheduled interval between background flushes, in milliseconds. Default: 1000 (one second).
     ///
-    /// Opening a database spawns a background task that calls the global
-    /// `flush()` every `auto_flush_ms` milliseconds, bounding the data-loss
-    /// window uniformly across all engines (KV buffer, vector id-map, CRDT
-    /// deltas, CSR graph, spatial, FTS). The task lives as long as the
-    /// returned `Arc<NodeDbLite>` and stops when the last handle is dropped.
+    /// Opening a database starts a task that applies buffered document, CRDT, and KV state and persists derived checkpoints.
+    /// Scheduling delays and storage errors prevent a hard wall-clock durability bound.
+    /// The task stops when the last database handle disappears.
     ///
-    /// **Durability contract**: `await`-ing a write operation (e.g. `kv_put`,
-    /// `vector_insert`) returning `Ok` does NOT guarantee on-disk durability.
-    /// Durability is bounded by `auto_flush_ms`. Set to 0 to disable the
-    /// background task; call `flush()` explicitly to guarantee durability.
+    /// Strict row writes commit before success. Native filesystem pagedb commits survive reopening without an explicit flush.
+    /// Generic storage backends provide their own commit durability guarantees.
+    /// Unindexed KV puts and all KV deletes remain buffered. Indexed KV puts and SQL KV writes commit directly.
+    /// Derived checkpoint maintenance remains separate from strict commits. Later maintenance errors do not roll back committed rows.
+    ///
+    /// Set to 0 to disable background flushing. Call `flush()` before dropping buffered state.
     #[serde(default = "default_auto_flush_ms")]
     pub auto_flush_ms: u64,
 

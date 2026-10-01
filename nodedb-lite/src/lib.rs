@@ -22,16 +22,20 @@
 //!
 //! ## Durability
 //!
-//! Writes are buffered for batching; `await` returning `Ok` does **not** by
-//! itself guarantee on-disk durability. Durability is bounded by the
-//! [`config::LiteConfig::auto_flush_ms`] background flush interval — one second
-//! by default — or forced by an explicit [`NodeDbLite::flush`].
+//! Strict row writes commit before returning success. Native filesystem pagedb commits survive reopening without an explicit flush.
+//! Generic storage backends provide their own commit durability guarantees.
 //!
-//! The `open*` constructors return `Arc<NodeDbLite>` and start that flush task
-//! themselves, so the bound holds identically for a direct Rust embedder, the
-//! FFI bindings, and the WASM bindings. The task holds a `Weak` handle and
-//! stops when the last `Arc` is dropped. Set `auto_flush_ms` to 0 to take full
-//! manual control of when data reaches disk.
+//! Ordinary document and CRDT writes remain buffered. Unindexed `kv_put` and all `kv_delete` calls also remain buffered.
+//! Indexed KV puts and SQL KV writes commit directly. Vector rows persist during insertion.
+//! [`NodeDbLite::flush`] applies buffered document, CRDT, and KV state and persists derived engine checkpoints.
+//!
+//! Derived full-text, vector, and spatial checkpoints remain separate from strict row commits.
+//! Later maintenance errors do not roll back committed strict rows.
+//!
+//! The `open*` constructors return `Arc<NodeDbLite>` and schedule automatic flushes through [`config::LiteConfig::auto_flush_ms`].
+//! The default interval is one second. Scheduling delays and storage errors prevent a hard wall-clock durability bound.
+//! The task holds a `Weak` handle and stops when the last `Arc` disappears.
+//! Set `auto_flush_ms` to 0 for manual flushing. Call [`NodeDbLite::flush`] before dropping buffered state.
 //!
 //! For at-rest encryption see [`Encryption`]. [`NodeDb`]: nodedb_client::NodeDb
 

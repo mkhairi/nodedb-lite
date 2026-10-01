@@ -1,15 +1,48 @@
-//! Crash recovery tests for strict and columnar storage engines.
+//! Strict and columnar storage persistence coverage.
 //!
-//! Simulates crashes by dropping the NodeDbLite instance and reopening
-//! from the same storage. Verifies that data is consistent after recovery.
+//! Native reopen tests drop database handles without terminating a process.
 
 use nodedb_client::NodeDb;
+#[cfg(not(target_arch = "wasm32"))]
+use nodedb_lite::{Encryption, LiteConfig};
 use nodedb_lite::{NodeDbLite, PagedbStorageMem};
 use nodedb_types::value::Value;
 
 async fn open_db() -> std::sync::Arc<NodeDbLite<PagedbStorageMem>> {
     let storage = PagedbStorageMem::open_in_memory().await.unwrap();
     NodeDbLite::open(storage).await.unwrap()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn strict_insert_is_durable_without_explicit_flush() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("strict_rows.db");
+    let config = LiteConfig {
+        auto_flush_ms: 0,
+        sync_enabled: false,
+        ..LiteConfig::default()
+    };
+    let db = NodeDbLite::open_at_path_with_config(&path, Encryption::Plaintext, config.clone())
+        .await
+        .unwrap();
+    db.execute_sql(
+        "CREATE COLLECTION customers (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL) WITH storage = 'strict'",
+        &[],
+    ).await.unwrap();
+    let row = vec![Value::Integer(1), Value::String("Alice".into())];
+    db.strict_insert("customers", &row).await.unwrap();
+    drop(db);
+
+    let reopened = NodeDbLite::open_at_path_with_config(&path, Encryption::Plaintext, config)
+        .await
+        .unwrap();
+    let stored = reopened
+        .strict_engine()
+        .get("customers", &Value::Integer(1))
+        .await
+        .unwrap();
+    assert_eq!(stored, Some(row));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
