@@ -16,7 +16,7 @@ use nodedb_types::document::Document;
 use nodedb_types::dropped_collection::DroppedCollection;
 use nodedb_types::error::NodeDbResult;
 use nodedb_types::filter::{EdgeFilter, MetadataFilter};
-use nodedb_types::graph::GraphStats;
+use nodedb_types::graph::{Direction, GraphStats};
 use nodedb_types::id::{EdgeId, NodeId};
 use nodedb_types::result::{QueryResult, SearchResult, SubGraph};
 use nodedb_types::text_search::TextSearchParams;
@@ -111,9 +111,10 @@ impl<S: StorageEngine> NodeDb for NodeDbLite<S> {
         collection: &str,
         start: &NodeId,
         depth: u8,
+        direction: Direction,
         edge_filter: Option<&EdgeFilter>,
     ) -> NodeDbResult<SubGraph> {
-        self.graph_traverse_impl(collection, start, depth, edge_filter)
+        self.graph_traverse_impl(collection, start, depth, direction, edge_filter)
             .await
     }
 

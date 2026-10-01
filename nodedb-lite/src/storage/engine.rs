@@ -18,6 +18,20 @@ use nodedb_types::Namespace;
 /// `StorageEngine` trait's scan interface.
 pub type KvPair = (Vec<u8>, Vec<u8>);
 
+/// The budget that excludes the next matching record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixScanLimit {
+    Records,
+    Bytes,
+}
+
+/// Prefix records and the budget that excludes the next record.
+#[derive(Debug, Default)]
+pub struct PrefixScan {
+    pub entries: Vec<KvPair>,
+    pub limit: Option<PrefixScanLimit>,
+}
+
 /// Summary of what a [`StorageEngine::compact`] call reclaimed.
 ///
 /// Lite-owned (not a pagedb type) so the trait doesn't force pagedb types on
@@ -86,6 +100,43 @@ pub trait StorageEngine: Send + Sync + 'static {
     ///
     /// If `prefix` is empty, returns all entries in the namespace.
     async fn scan_prefix(&self, ns: Namespace, prefix: &[u8]) -> Result<Vec<KvPair>, LiteError>;
+
+    /// Read at most `limit` prefix records, ordered by key.
+    ///
+    /// Implementations stop inside storage before materializing additional records.
+    /// Zero returns no records. Positive limits require backend support.
+    async fn scan_prefix_bounded(
+        &self,
+        _ns: Namespace,
+        _prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<KvPair>, LiteError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        Err(LiteError::Unsupported {
+            detail: "bounded prefix scans require backend support".into(),
+        })
+    }
+
+    /// Read prefix records within count and serialized key-plus-value budgets.
+    ///
+    /// Limits report remaining records without returning oversized values.
+    /// Budgets exclude allocation overhead and cached pages.
+    async fn scan_prefix_budgeted(
+        &self,
+        _ns: Namespace,
+        _prefix: &[u8],
+        max_records: usize,
+        _max_bytes: usize,
+    ) -> Result<PrefixScan, LiteError> {
+        if max_records == 0 {
+            return Ok(PrefixScan::default());
+        }
+        Err(LiteError::Unsupported {
+            detail: "budgeted prefix scans require backend support".into(),
+        })
+    }
 
     /// Atomically apply a batch of writes.
     ///

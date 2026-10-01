@@ -134,9 +134,9 @@ db.vector_insert("articles", "a1", &embedding, None).await?;
 let results = db.vector_search("articles", &embedding, 10, None, None).await?;
 
 // Graph traversal
-use nodedb_types::id::NodeId;
+use nodedb_types::{graph::Direction, id::NodeId};
 let start = NodeId::try_new("alice")?;
-let subgraph = db.graph_traverse("social", &start, 3, None).await?;
+let subgraph = db.graph_traverse("social", &start, 3, Direction::Out, None).await?;
 ```
 
 ## Same API, Any Runtime

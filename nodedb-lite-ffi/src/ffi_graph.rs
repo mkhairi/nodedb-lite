@@ -166,10 +166,13 @@ pub unsafe extern "C" fn nodedb_graph_traverse(
             }
         };
 
-        match h
-            .rt
-            .block_on(h.db.graph_traverse(collection, &start_id, depth, None))
-        {
+        match h.rt.block_on(h.db.graph_traverse(
+            collection,
+            &start_id,
+            depth,
+            nodedb_types::graph::Direction::Out,
+            None,
+        )) {
             Ok(subgraph) => {
                 let json = serde_json::json!({
                     "nodes": subgraph.nodes.iter().map(|n| serde_json::json!({

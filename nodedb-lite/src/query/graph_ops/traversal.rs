@@ -112,7 +112,6 @@ pub fn neighbors_multi(
         return Ok(QueryResult::empty());
     };
 
-    let label_slice: Vec<&str> = edge_label.into_iter().collect();
     let columns = vec![
         "src".to_string(),
         "label".to_string(),
@@ -129,7 +128,7 @@ pub fn neighbors_multi(
         if rows.len() >= cap {
             break;
         }
-        let nbrs = csr.neighbors_multi(node, &label_slice, direction);
+        let nbrs = csr.neighbors_multi(node, edge_label.as_slice(), direction);
         for (lbl, nb) in nbrs {
             if rows.len() >= cap {
                 break;
@@ -172,7 +171,7 @@ pub fn path(
         nodedb_graph::ShortestPathParams {
             src,
             dst,
-            label_filter: edge_label,
+            label_filter: edge_label.as_slice(),
             max_depth,
             max_visited: mv,
             frontier_bitmap,

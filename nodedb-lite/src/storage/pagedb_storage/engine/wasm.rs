@@ -13,7 +13,9 @@ use pagedb::vfs::Vfs;
 use nodedb_types::Namespace;
 
 use crate::error::LiteError;
-use crate::storage::engine::{CompactionOutcome, KvPair, StorageEngine, WriteOp};
+use crate::storage::engine::{
+    CompactionOutcome, KvPair, PrefixScan, PrefixScanLimit, StorageEngine, WriteOp,
+};
 use crate::storage::pagedb_storage::keys::{KeyBuf, ns_end, prefix_key, strip_prefix};
 use crate::storage::pagedb_storage::types::PagedbStorage;
 
@@ -52,6 +54,69 @@ impl<V: Vfs + Clone + 'static> StorageEngine for PagedbStorage<V> {
             .into_iter()
             .map(|(k, v)| (strip_prefix(&k).to_vec(), v.to_vec()))
             .collect())
+    }
+
+    async fn scan_prefix_bounded(
+        &self,
+        ns: Namespace,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<KvPair>, LiteError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let ns_prefix = prefix_key(ns, prefix);
+        let txn = self.db.begin_read().await.map_err(LiteError::from)?;
+        let raw = txn
+            .scan_prefix_from(&ns_prefix, &ns_prefix, limit)
+            .await
+            .map_err(LiteError::from)?;
+        Ok(raw
+            .into_iter()
+            .map(|(k, v)| (strip_prefix(&k).to_vec(), v.to_vec()))
+            .collect())
+    }
+
+    async fn scan_prefix_budgeted(
+        &self,
+        ns: Namespace,
+        prefix: &[u8],
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<PrefixScan, LiteError> {
+        if max_records == 0 {
+            return Ok(PrefixScan::default());
+        }
+        let ns_prefix = prefix_key(ns, prefix);
+        let txn = self.db.begin_read().await.map_err(LiteError::from)?;
+        // Physical keys add one namespace byte per retained record.
+        let raw = txn
+            .scan_prefix_from_bounded(
+                &ns_prefix,
+                &ns_prefix,
+                max_records,
+                max_bytes.saturating_add(max_records),
+            )
+            .await
+            .map_err(LiteError::from)?;
+        let mut result = PrefixScan {
+            entries: Vec::with_capacity(raw.entries.len()),
+            limit: raw.limit.map(|limit| match limit {
+                pagedb::ScanLimit::Records => PrefixScanLimit::Records,
+                pagedb::ScanLimit::Bytes => PrefixScanLimit::Bytes,
+            }),
+        };
+        let mut bytes = 0usize;
+        for (key, value) in raw.entries {
+            let key = strip_prefix(&key);
+            bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+            if bytes > max_bytes {
+                result.limit = Some(PrefixScanLimit::Bytes);
+                break;
+            }
+            result.entries.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(result)
     }
 
     async fn batch_write(&self, ops: &[WriteOp]) -> Result<(), LiteError> {

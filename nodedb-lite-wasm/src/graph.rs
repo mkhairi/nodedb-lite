@@ -43,9 +43,15 @@ impl NodeDbLiteWasm {
     ) -> Result<JsValue, JsError> {
         let start_id = NodeId::try_new(start).map_err(|e| JsError::new(&e.to_string()))?;
         let subgraph = dispatch!(self, db, {
-            db.graph_traverse(collection, &start_id, depth, None)
-                .await
-                .map_err(|e| JsError::new(&e.to_string()))
+            db.graph_traverse(
+                collection,
+                &start_id,
+                depth,
+                nodedb_types::graph::Direction::Out,
+                None,
+            )
+            .await
+            .map_err(|e| JsError::new(&e.to_string()))
         })?;
 
         let json = serde_json::json!({

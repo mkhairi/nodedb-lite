@@ -43,7 +43,7 @@ async fn collection_isolation() {
 
     // Traverse coll_a from x (depth 1): must see the LINK_A edge only.
     let sg_a = db
-        .graph_traverse("coll_a", &x, 1, None)
+        .graph_traverse("coll_a", &x, 1, nodedb_types::graph::Direction::Out, None)
         .await
         .expect("traverse coll_a");
 
@@ -61,7 +61,7 @@ async fn collection_isolation() {
 
     // Traverse coll_b from x (depth 1): must see the LINK_B edge only.
     let sg_b = db
-        .graph_traverse("coll_b", &x, 1, None)
+        .graph_traverse("coll_b", &x, 1, nodedb_types::graph::Direction::Out, None)
         .await
         .expect("traverse coll_b");
 
@@ -130,7 +130,7 @@ async fn traversal_and_shortest_path() {
 
     // Traversal from A with depth 3 must include D.
     let sg = db
-        .graph_traverse("chain", &na, 3, None)
+        .graph_traverse("chain", &na, 3, nodedb_types::graph::Direction::Out, None)
         .await
         .expect("traverse chain depth=3");
 

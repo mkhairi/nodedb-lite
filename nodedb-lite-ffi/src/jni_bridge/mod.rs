@@ -3,3 +3,4 @@
 pub mod array;
 pub mod core;
 pub mod document;
+pub mod graph;

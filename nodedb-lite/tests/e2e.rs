@@ -188,7 +188,13 @@ async fn e2e_native_full_suite_passes() {
     .await
     .unwrap();
     let sg = db
-        .graph_traverse("test", &NodeId::from_validated("a".to_string()), 1, None)
+        .graph_traverse(
+            "test",
+            &NodeId::from_validated("a".to_string()),
+            1,
+            nodedb_types::graph::Direction::Out,
+            None,
+        )
         .await
         .unwrap();
     assert!(sg.node_count() >= 2);

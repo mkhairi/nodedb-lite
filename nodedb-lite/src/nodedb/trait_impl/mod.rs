@@ -11,6 +11,8 @@ mod dispatch;
 mod document;
 mod document_batch;
 mod graph;
+mod graph_traversal;
+mod graph_walk;
 mod sql_lifecycle;
 mod vector;
 #[cfg(test)]

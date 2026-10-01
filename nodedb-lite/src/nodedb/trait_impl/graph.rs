@@ -6,10 +6,8 @@ use std::collections::{HashMap, HashSet};
 
 use nodedb_types::document::Document;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
-use nodedb_types::filter::EdgeFilter;
 use nodedb_types::graph::GraphStats;
 use nodedb_types::id::{EdgeId, NodeId};
-use nodedb_types::result::{SubGraph, SubGraphEdge, SubGraphNode};
 use nodedb_types::value::Value;
 
 use nodedb_graph::params::{AlgoParams, GraphAlgorithm};
@@ -18,8 +16,7 @@ use crate::engine::graph::edge::{
     edge_crdt_collection, edge_crdt_fields, edge_history_value, edge_id_for,
 };
 use crate::engine::graph::history;
-use crate::engine::graph::index::{CsrIndex, Direction};
-use crate::engine::graph::traversal::DEFAULT_MAX_VISITED;
+use crate::engine::graph::index::CsrIndex;
 use crate::nodedb::LockExt;
 use crate::nodedb::NodeDbLite;
 use crate::nodedb::convert::loro_value_to_document;
@@ -28,107 +25,6 @@ use crate::runtime::now_millis_i64;
 use crate::storage::engine::StorageEngine;
 
 impl<S: StorageEngine> NodeDbLite<S> {
-    /// Breadth-first traversal from `start` up to `depth` hops, returning a
-    /// `SubGraph` with node properties and edges materialised from CRDT storage.
-    ///
-    /// Only edges belonging to `collection` are considered. Edges inserted into
-    /// a different collection are invisible to this traversal.
-    pub(super) async fn graph_traverse_impl(
-        &self,
-        collection: &str,
-        start: &NodeId,
-        depth: u8,
-        edge_filter: Option<&EdgeFilter>,
-    ) -> NodeDbResult<SubGraph> {
-        let label_strs: Vec<&str> = edge_filter
-            .map(|f| f.labels.iter().map(|s| s.as_str()).collect())
-            .unwrap_or_default();
-
-        // Collect BFS result and neighbors in a single lock scope.
-        type BfsResult = (Vec<(String, u8)>, HashMap<String, Vec<(String, String)>>);
-        let (result, neighbors_map): BfsResult = {
-            let csr_map = self.csr.lock_or_recover();
-            match csr_map.get(collection) {
-                None => {
-                    return Ok(SubGraph {
-                        nodes: vec![],
-                        edges: vec![],
-                    });
-                }
-                Some(csr) => {
-                    let bfs = csr.traverse_bfs_with_depth_multi(
-                        &[start.as_str()],
-                        &label_strs,
-                        Direction::Out,
-                        depth as usize,
-                        DEFAULT_MAX_VISITED,
-                    );
-                    let mut nbrs: HashMap<String, Vec<(String, String)>> = HashMap::new();
-                    for (node_name, _) in &bfs {
-                        let n = csr.neighbors_multi(node_name, &label_strs, Direction::Out);
-                        nbrs.insert(node_name.clone(), n);
-                    }
-                    (bfs, nbrs)
-                }
-            }
-        };
-
-        let edge_coll = edge_crdt_collection(collection);
-        let crdt = self.crdt.lock_or_recover();
-        let mut nodes = Vec::with_capacity(result.len());
-        let mut edges = Vec::new();
-
-        for (node_name, d) in &result {
-            let properties = if let Some(loro_val) = crdt.read("__nodes", node_name) {
-                let doc = loro_value_to_document(node_name, &loro_val);
-                doc.fields
-            } else {
-                HashMap::new()
-            };
-
-            nodes.push(SubGraphNode {
-                id: NodeId::from_validated(node_name.clone()),
-                depth: *d,
-                properties,
-            });
-
-            let empty = vec![];
-            let neighbors = neighbors_map.get(node_name).unwrap_or(&empty);
-            for (label, dst) in neighbors {
-                if result.iter().any(|(n, _)| n == dst) {
-                    let src_id = NodeId::from_validated(node_name.clone());
-                    let dst_id = NodeId::from_validated(dst.clone());
-                    let edge_id = EdgeId::try_first(src_id.clone(), dst_id.clone(), label.clone())
-                        .map_err(|e| {
-                            NodeDbError::storage(format!(
-                                "edge_store: invalid edge label '{label}': {e}"
-                            ))
-                        })?;
-                    let edge_key = format!("{edge_id}");
-                    let edge_props = if let Some(loro_val) = crdt.read(&edge_coll, &edge_key) {
-                        let doc = loro_value_to_document(&edge_key, &loro_val);
-                        doc.fields
-                            .into_iter()
-                            .filter(|(k, _)| k != "src" && k != "dst" && k != "label")
-                            .collect()
-                    } else {
-                        HashMap::new()
-                    };
-
-                    edges.push(SubGraphEdge {
-                        id: edge_id,
-                        from: src_id,
-                        to: dst_id,
-                        label: label.clone(),
-                        properties: edge_props,
-                    });
-                }
-            }
-        }
-
-        Ok(SubGraph { nodes, edges })
-    }
-
     /// Insert an edge into the collection-scoped CSR adjacency index and persist
     /// a corresponding CRDT document holding `src`, `dst`, `label`, and any
     /// user-supplied properties. Edges are stored under a per-collection CRDT
@@ -355,38 +251,5 @@ impl<S: StorageEngine> NodeDbLite<S> {
             b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
         });
         Ok(pairs)
-    }
-
-    /// Unweighted BFS shortest path from `from` to `to` within `collection`,
-    /// bounded by `max_depth`. Returns `Ok(None)` when no path exists.
-    pub(super) async fn graph_shortest_path_impl(
-        &self,
-        collection: &str,
-        from: &NodeId,
-        to: &NodeId,
-        max_depth: u8,
-        edge_filter: Option<&EdgeFilter>,
-    ) -> NodeDbResult<Option<Vec<NodeId>>> {
-        let label_filter = edge_filter
-            .and_then(|f| f.labels.first())
-            .map(|s| s.as_str());
-
-        let csr_map = self.csr.lock_or_recover();
-        let path = match csr_map.get(collection) {
-            Some(csr) => csr.shortest_path(
-                nodedb_graph::ShortestPathParams {
-                    src: from.as_str(),
-                    dst: to.as_str(),
-                    label_filter,
-                    max_depth: max_depth as usize,
-                    max_visited: DEFAULT_MAX_VISITED,
-                    frontier_bitmap: None,
-                },
-                None,
-            ),
-            None => None,
-        };
-
-        Ok(path.map(|p| p.into_iter().map(NodeId::from_validated).collect()))
     }
 }
