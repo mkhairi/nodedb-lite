@@ -299,6 +299,33 @@ int32_t nodedb_graph_shortest_path(struct NodeDbNodeDbHandle *handle,
                                    char **out_json);
 
 /**
+ * Fuse vector and text retrieval using JSON matching `HybridSearchParams`.
+ * `allowed_ids: null` permits every ID. `allowed_ids: []` permits none.
+ * `*out_json` changes only on success. Free it with `nodedb_free_string`.
+ *
+ * # Safety
+ * `handle` must reference a live handle. `params_json` must reference a terminated UTF-8 string.
+ * `out_json` must reference writable pointer storage throughout this call.
+ */
+int32_t nodedb_hybrid_search(struct NodeDbNodeDbHandle *handle,
+                             const char *params_json,
+                             char **out_json);
+
+/**
+ * Fuse vector and graph retrieval using JSON matching `GraphRagParams`.
+ * `seed_nodes` contains validated node ID strings. Null allows no caller seeds.
+ * `allowed_ids: null` permits every ID. `allowed_ids: []` permits none.
+ * `*out_json` changes only on success. Free it with `nodedb_free_string`.
+ *
+ * # Safety
+ * `handle` must reference a live handle. `params_json` must reference a terminated UTF-8 string.
+ * `out_json` must reference writable pointer storage throughout this call.
+ */
+int32_t nodedb_graph_rag_search(struct NodeDbNodeDbHandle *handle,
+                                const char *params_json,
+                                char **out_json);
+
+/**
  * Insert a vector into a collection.
  *
  * # Safety

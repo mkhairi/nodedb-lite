@@ -52,7 +52,7 @@ pub mod tasks;
 
 pub use config::LiteConfig;
 pub use error::LiteError;
-pub use nodedb::{BatchItem, NodeDbLite, SyncGate};
+pub use nodedb::{BatchItem, GraphRagParams, HybridSearchParams, NodeDbLite, SyncGate};
 pub use nodedb_mem::{EngineId, MemoryGovernor, PressureLevel};
 pub use nodedb_query;
 pub use nodedb_types::id_gen;

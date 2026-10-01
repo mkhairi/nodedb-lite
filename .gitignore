@@ -111,3 +111,4 @@ nodedb-lite-wasm/pkg/
 /.ci-sources/
 
 .claude
+.agents/prep/

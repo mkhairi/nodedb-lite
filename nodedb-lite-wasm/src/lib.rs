@@ -74,6 +74,7 @@ pub mod graph;
 pub mod maintenance;
 pub mod open;
 pub mod query;
+pub mod search;
 pub mod types;
 pub mod udf;
 pub mod vector;

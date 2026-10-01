@@ -63,30 +63,52 @@ impl FtsCollectionManager {
         fuzzy: bool,
         mode: FtsQueryMode,
     ) -> Result<Vec<TextSearchResult>, LiteError> {
+        Self::bm25_query(
+            collection,
+            index,
+            FtsSearchParams {
+                query,
+                top_k,
+                fuzzy_enabled: fuzzy,
+                mode,
+                prefilter: None,
+            },
+        )
+    }
+
+    fn bm25_query(
+        collection: &str,
+        index: &Resolved<'_>,
+        params: FtsSearchParams<'_>,
+    ) -> Result<Vec<TextSearchResult>, LiteError> {
         index
             .idx
-            .search(
-                0,
-                0,
-                &index.key,
-                FtsSearchParams {
-                    query,
-                    top_k,
-                    fuzzy_enabled: fuzzy,
-                    mode,
-                    prefilter: None,
-                },
-            )
+            .search(0, 0, &index.key, params)
             .map_err(|e| search_err(collection, e))
     }
 
-    /// Search the `field` index of a collection; an empty `field` searches
-    /// the whole-document index. A collection nothing was text-indexed in
-    /// returns an empty list.
+    fn materialize_results(
+        &self,
+        collection: &str,
+        results: Vec<TextSearchResult>,
+    ) -> Result<Vec<FtsResult>, LiteError> {
+        results
+            .into_iter()
+            .map(|r| {
+                Ok(FtsResult {
+                    doc_id: self.doc_id_of(collection, r.doc_id)?.to_owned(),
+                    score: r.score,
+                    fuzzy: r.fuzzy,
+                })
+            })
+            .collect()
+    }
+
+    /// Search the collection's `field` index. An empty `field` searches the whole-document index.
+    /// Collections without indexed text return an empty list.
     ///
-    /// All query knobs are passed via [`TextSearchParams`]: boolean mode (OR/AND),
-    /// fuzzy matching, and BM25 scoring parameters (k1, b). A query no document
-    /// matches returns an empty list. A failed read is an error.
+    /// [`TextSearchParams`] controls boolean mode and fuzzy matching.
+    /// Queries without matching documents return an empty list. Read errors propagate.
     pub fn search(
         &self,
         collection: &str,
@@ -106,20 +128,10 @@ impl FtsCollectionManager {
             params.fuzzy,
             fts_mode(params.mode),
         )?;
-        raw.into_iter()
-            .map(|r| -> Result<FtsResult, LiteError> {
-                Ok(FtsResult {
-                    doc_id: self.doc_id_of(collection, r.doc_id)?.to_owned(),
-                    score: r.score,
-                    fuzzy: r.fuzzy,
-                })
-            })
-            .collect()
+        self.materialize_results(collection, raw)
     }
 
-    /// Like [`Self::search`] but restricts results to documents whose string
-    /// doc_id is in `allowed`. Fetches `top_k * 8` candidates from BM25 to
-    /// account for haystack documents that rank below non-haystack documents.
+    /// Search only allowed surrogate IDs before ranking candidates.
     pub(crate) fn search_with_allowed(
         &self,
         collection: &str,
@@ -129,13 +141,31 @@ impl FtsCollectionManager {
         params: &TextSearchParams,
         allowed: &HashSet<String>,
     ) -> Result<Vec<FtsResult>, LiteError> {
-        let fetch_k = top_k.saturating_mul(8).max(top_k);
-        Ok(self
-            .search(collection, field, query, fetch_k, params)?
-            .into_iter()
-            .filter(|r| allowed.contains(&r.doc_id))
-            .take(top_k)
-            .collect())
+        let Some(index) = self.resolve(collection, field)? else {
+            return Ok(Vec::new());
+        };
+        if top_k == 0 || allowed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefilter: nodedb_types::SurrogateBitmap = allowed
+            .iter()
+            .filter_map(|id| self.lookup_surrogate(id))
+            .collect();
+        if prefilter.is_empty() {
+            return Ok(Vec::new());
+        }
+        let raw = Self::bm25_query(
+            collection,
+            &index,
+            FtsSearchParams {
+                query,
+                top_k,
+                fuzzy_enabled: params.fuzzy,
+                mode: fts_mode(params.mode),
+                prefilter: Some(&prefilter),
+            },
+        )?;
+        self.materialize_results(collection, raw)
     }
 
     // ── BM25ScoreScan: all docs with injected score (0.0 for non-matches) ────
@@ -267,6 +297,19 @@ mod tests {
             matches!(&err, LiteError::TextIndexMissing { field, .. } if field == "body"),
             "{err:?}"
         );
+        for (top_k, allowed) in [
+            (10, HashSet::new()),
+            (0, HashSet::from(["doc1".to_owned()])),
+        ] {
+            let err = mgr
+                .search_with_allowed("col", "body", "hello", top_k, &default_params(), &allowed)
+                .err()
+                .expect("an unindexed field must be refused regardless of result limits");
+            assert!(
+                matches!(&err, LiteError::TextIndexMissing { field, .. } if field == "body"),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
@@ -335,6 +378,26 @@ mod tests {
             .expect("search must succeed");
         let ids: Vec<&str> = results.iter().map(|r| r.doc_id.as_str()).collect();
         assert_eq!(ids, vec!["doc-a"], "only allowed members may appear");
+    }
+
+    #[test]
+    fn allowed_search_preserves_unknown_ids_and_zero_limits() {
+        let mut mgr = FtsCollectionManager::new(test_governor());
+        mgr.index_document("col", "known", "rust")
+            .expect("index update must succeed");
+        let unknown = HashSet::from(["unknown".to_owned()]);
+        assert!(
+            mgr.search_with_allowed("col", "", "rust", 1, &default_params(), &unknown)
+                .expect("search must succeed")
+                .is_empty()
+        );
+        assert!(mgr.lookup_surrogate("unknown").is_none());
+        let known = HashSet::from(["known".to_owned()]);
+        assert!(
+            mgr.search_with_allowed("col", "", "rust", 0, &default_params(), &known)
+                .expect("search must succeed")
+                .is_empty()
+        );
     }
 
     #[test]
