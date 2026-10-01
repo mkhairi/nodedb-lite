@@ -12,7 +12,9 @@ use pagedb::vfs::Vfs;
 use nodedb_types::Namespace;
 
 use crate::error::LiteError;
-use crate::storage::engine::{CompactionOutcome, KvPair, PrefixScan, StorageEngine, WriteOp};
+use crate::storage::engine::{
+    CompactionOutcome, KvPair, PrefixScan, ReaderStats, StorageEngine, WriteOp,
+};
 use crate::storage::pagedb_storage::types::PagedbStorage;
 
 #[async_trait(?Send)]
@@ -94,5 +96,15 @@ impl<V: Vfs + Clone + 'static> StorageEngine for PagedbStorage<V> {
 
     async fn compact(&self) -> Result<CompactionOutcome, LiteError> {
         self.compact_rows().await
+    }
+
+    async fn reader_stats(&self) -> Result<ReaderStats, LiteError> {
+        let stats = self.db.stats().await.map_err(LiteError::from)?;
+        Ok(ReaderStats {
+            tracked_readers: stats.tracked_readers,
+            oldest_reader_commit_id: stats.oldest_reader_commit_id,
+            oldest_reader_age_ms: stats.oldest_reader_age_ms,
+            reader_count_non_abortable: stats.reader_count_non_abortable,
+        })
     }
 }
