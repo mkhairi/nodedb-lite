@@ -66,6 +66,7 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         // fails writes nothing.
         let mut planned: Vec<(String, Vec<(&str, loro::LoroValue)>)> =
             Vec::with_capacity(rows.len());
+        let mut planned_ids = std::collections::HashSet::with_capacity(rows.len());
         for row in rows {
             let id = row
                 .iter()
@@ -75,7 +76,7 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 })
                 .map(|(_, v)| sql_value_to_string(v))
                 .unwrap_or_default();
-            if crdt.exists(collection, &id) || planned.iter().any(|(p, _)| *p == id) {
+            if crdt.exists(collection, &id) || planned_ids.contains(&id) {
                 if if_absent {
                     continue;
                 }
@@ -88,6 +89,7 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 .iter()
                 .map(|(k, v)| (k.as_str(), sql_value_to_loro(v)))
                 .collect();
+            planned_ids.insert(id.clone());
             planned.push((id, fields));
         }
         let checks: Vec<CrdtRowOp<'_>> = planned

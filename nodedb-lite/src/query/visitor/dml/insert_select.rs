@@ -105,7 +105,7 @@ pub(in crate::query::visitor) fn lower_insert_select<'a, S: StorageEngine + 'a>(
             // Schemaless CRDT path.
             for row_map in maps {
                 let doc_id = extract_id(&row_map);
-                let value_bytes = row_to_msgpack(&row_map)?;
+                let value_bytes = row_to_msgpack(row_map)?;
                 point_insert_admitted(engine, permit, &target, &doc_id, &value_bytes, false)
                     .await?;
                 affected += 1;

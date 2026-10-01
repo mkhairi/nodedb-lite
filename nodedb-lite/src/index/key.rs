@@ -170,8 +170,9 @@ fn push_component(key: &mut Vec<u8>, component: &str) {
 fn read_component(bytes: &[u8]) -> Option<(&str, &[u8])> {
     let len_bytes: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
     let len = u32::from_be_bytes(len_bytes) as usize;
-    let component = std::str::from_utf8(bytes.get(4..4 + len)?).ok()?;
-    Some((component, bytes.get(4 + len..)?))
+    let end = 4usize.checked_add(len)?;
+    let component = std::str::from_utf8(bytes.get(4..end)?).ok()?;
+    Some((component, bytes.get(end..)?))
 }
 
 // ── Value encoding ──────────────────────────────────────────────────────────

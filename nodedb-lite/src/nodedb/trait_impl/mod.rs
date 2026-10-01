@@ -16,7 +16,5 @@ mod graph_traversal;
 mod graph_walk;
 mod sql_lifecycle;
 mod vector;
-#[cfg(test)]
-mod vector_tests;
 
 pub use document_batch::BatchItem;

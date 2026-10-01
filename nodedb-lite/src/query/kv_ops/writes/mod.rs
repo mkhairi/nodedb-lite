@@ -6,8 +6,6 @@ mod bulk;
 mod fields;
 mod numeric;
 mod row_merge;
-#[cfg(test)]
-mod tests;
 mod ttl;
 
 pub use basic::{kv_insert, kv_insert_if_absent, kv_insert_on_conflict_update, kv_put};

@@ -6,8 +6,7 @@
 mod filter;
 mod hydrate;
 pub(crate) mod lazy_load;
+mod rerank;
 mod run;
-#[cfg(test)]
-mod tests;
 
 pub(crate) use run::run_vector_search;

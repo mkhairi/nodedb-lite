@@ -75,7 +75,6 @@ impl<S: StorageEngine> NodeDbLite<S> {
     ///
     /// First line is the header (column names). Each subsequent line is a row.
     /// An "id" column is used as document ID; if missing, UUIDs are generated.
-    /// Import documents from CSV text.
     ///
     /// Two-pass: first pass infers column types (int/float/bool/string) from
     /// ALL rows. Second pass coerces every value to the column's dominant type.
@@ -89,9 +88,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         let id_col = columns.iter().position(|c| *c == "id");
 
         // Collect all data rows.
-        let rows: Vec<Vec<String>> = lines_iter
+        let rows: Vec<Vec<&str>> = lines_iter
             .filter(|l| !l.trim().is_empty())
-            .map(|l| l.split(',').map(|s| s.trim().to_string()).collect())
+            .map(|l| l.split(',').map(str::trim).collect())
             .collect();
 
         // Pass 1: infer column types. A column is "int" only if ALL values parse
@@ -113,7 +112,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 }
                 let all_bool = rows.iter().all(|r| {
                     r.get(ci)
-                        .map(|v| v == "true" || v == "false")
+                        .map(|v| *v == "true" || *v == "false")
                         .unwrap_or(true)
                 });
                 if all_bool {
@@ -140,8 +139,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
                             .and_then(serde_json::Number::from_f64)
                             .map(serde_json::Value::Number)
                             .unwrap_or(serde_json::Value::Null),
-                        "bool" => serde_json::Value::Bool(val == "true"),
-                        _ => serde_json::Value::String(val.clone()),
+                        "bool" => serde_json::Value::Bool(*val == "true"),
+                        _ => serde_json::Value::String((*val).to_owned()),
                     };
                     obj.insert(col.to_string(), json_val);
                 }

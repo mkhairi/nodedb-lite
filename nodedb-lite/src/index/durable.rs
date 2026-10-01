@@ -31,6 +31,8 @@ pub(crate) struct RowImage {
 /// Entry changes planned for one row.
 type RowEntryOps = (String, String, Vec<IndexWriteOp>);
 
+type CollectionRowImages<'a> = (&'a str, Vec<(&'a str, Option<Value>)>);
+
 impl IndexCatalog {
     /// The entry changes `images` imply, after refusing any a unique index
     /// forbids. Call with `durable_rows` held.
@@ -46,20 +48,23 @@ impl IndexCatalog {
     {
         let (changes, candidates) = {
             let state = self.lock();
-            let mut collections: Vec<&str> = Vec::new();
+            let mut collection_slots: HashMap<&str, usize> = HashMap::new();
+            let mut collections: Vec<CollectionRowImages<'_>> = Vec::new();
             for image in images {
-                if !collections.contains(&image.collection.as_str()) {
-                    collections.push(&image.collection);
-                }
+                let next_slot = collections.len();
+                let slot = *collection_slots
+                    .entry(image.collection.as_str())
+                    .or_insert_with(|| {
+                        collections.push((&image.collection, Vec::new()));
+                        next_slot
+                    });
+                collections[slot]
+                    .1
+                    .push((image.doc_id.as_str(), image.row.clone()));
             }
             let mut candidates = Vec::new();
-            for collection in &collections {
-                let rows: Vec<(&str, Option<Value>)> = images
-                    .iter()
-                    .filter(|i| i.collection == *collection)
-                    .map(|i| (i.doc_id.as_str(), i.row.clone()))
-                    .collect();
-                candidates.extend(unique_candidates(&state, collection, engine, &rows)?);
+            for (collection, rows) in &collections {
+                candidates.extend(unique_candidates(&state, collection, engine, rows)?);
             }
 
             // A row can appear twice in one write (a key moved, then written),

@@ -56,13 +56,14 @@ impl<S: StorageEngine> StrictEngine<S> {
                 value: tuple,
             });
         }
-        self.commit(collection, ops.clone()).await?;
+        let history_ops = state.schema.bitemporal.then(|| ops.clone());
+        self.commit(collection, ops).await?;
 
         // For bitemporal collections, write each row's birth history entry.
         // The current row's system_from_ms is stored at slot 0 of the tuple;
         // we read it back from `values[0]` (the `__system_from_ms` column).
-        if state.schema.bitemporal {
-            for (values, op) in rows.iter().zip(&ops) {
+        if let Some(history_ops) = history_ops {
+            for (values, op) in rows.iter().zip(&history_ops) {
                 let WriteOp::Put { key, value, .. } = op else {
                     continue;
                 };

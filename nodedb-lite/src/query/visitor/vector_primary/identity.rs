@@ -24,31 +24,30 @@ pub(super) fn key_column(primary_key: Option<&str>) -> &str {
 }
 
 /// Encode payload fields (non-vector columns) as MessagePack bytes.
-fn encode_payload(payload_fields: &HashMap<String, SqlValue>) -> Result<Vec<u8>, LiteError> {
+fn encode_payload(payload_fields: &HashMap<String, Value>) -> Result<Vec<u8>, LiteError> {
     if payload_fields.is_empty() {
         return Ok(Vec::new());
     }
-    let value_map: HashMap<String, Value> = payload_fields
-        .iter()
-        .map(|(k, sv)| Ok((k.clone(), sql_value_to_value(sv)?)))
-        .collect::<Result<_, LiteError>>()?;
-    zerompk::to_msgpack_vec(&value_map).map_err(|e| LiteError::Serialization {
+    zerompk::to_msgpack_vec(payload_fields).map_err(|e| LiteError::Serialization {
         detail: format!("encode vector primary payload: {e}"),
     })
 }
 
-/// The `(pk_bytes, payload)` of one insert. A row with no key value mints
-/// one and carries it under the key column so a later point read finds it.
+/// Encode the key and payload, minting an absent or null key.
 pub(super) fn row_identity(
     row: &VectorPrimaryRow,
     key_column: &str,
 ) -> Result<(Vec<u8>, Vec<u8>), LiteError> {
-    let mut fields = row.payload_fields.clone();
-    let doc_id = match fields.get(key_column) {
+    let mut fields: HashMap<String, Value> = row
+        .payload_fields
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), sql_value_to_value(value)?)))
+        .collect::<Result<_, LiteError>>()?;
+    let doc_id = match row.payload_fields.get(key_column) {
         Some(v) if !matches!(v, SqlValue::Null) => sql_value_to_string(v),
         _ => {
             let minted = nodedb_types::id_gen::uuid_v7();
-            fields.insert(key_column.to_string(), SqlValue::String(minted.clone()));
+            fields.insert(key_column.to_string(), Value::String(minted.clone()));
             minted
         }
     };

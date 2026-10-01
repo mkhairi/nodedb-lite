@@ -52,7 +52,12 @@ pub async fn materialize_scan<S: StorageEngine>(
         let mut out = Vec::new();
         let mut past_cursor = cursor_str.is_none();
         for row in all_rows {
-            let pk = value_to_string(&row[pk_idx]);
+            let pk = row.get(pk_idx).ok_or_else(|| LiteError::Storage {
+                detail: format!(
+                    "strict collection '{collection}' row omits primary key at column {pk_idx}"
+                ),
+            })?;
+            let pk = value_to_string(pk);
             if !past_cursor {
                 if let Some(ref c) = cursor_str
                     && &pk == c
@@ -67,13 +72,7 @@ pub async fn materialize_scan<S: StorageEngine>(
             let map: HashMap<String, Value> = columns
                 .iter()
                 .enumerate()
-                .filter_map(|(i, col)| {
-                    if i < row.len() {
-                        Some((col.name.clone(), row[i].clone()))
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|(i, col)| row.get(i).map(|value| (col.name.clone(), value.clone())))
                 .collect();
             let bytes = zerompk::to_msgpack_vec(&Value::Object(map)).map_err(|e| {
                 LiteError::Serialization {

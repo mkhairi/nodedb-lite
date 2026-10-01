@@ -1,4 +1,4 @@
-//! Collection DDL: create, rop, list collections with metadata.
+//! Collection DDL: create, drop, and list collections with metadata.
 
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 

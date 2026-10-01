@@ -3,7 +3,7 @@
 //! FTS outbound ownership and durable transport wiring.
 
 #[cfg(test)]
-mod injected;
+use state::injected;
 mod spill;
 mod staging;
 mod state;

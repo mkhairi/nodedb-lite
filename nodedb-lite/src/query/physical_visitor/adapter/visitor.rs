@@ -106,10 +106,9 @@ impl<'a, S: StorageEngine + 'a> PhysicalTaskVisitor for LiteDataPlaneVisitor<'a,
         &mut self,
         _op: &nodedb_physical::physical_plan::ClusterArrayOp,
     ) -> Result<LitePhysicalFut<'a>, LiteError> {
-        unreachable!(
-            "ClusterArray plans are coordinator-only; Lite never sets \
-             cluster_enabled so its SQL planner cannot produce this variant"
-        )
+        Err(LiteError::Unsupported {
+            detail: "ClusterArray requires a coordinator and cluster-enabled planner".into(),
+        })
     }
 
     fn cluster_event(

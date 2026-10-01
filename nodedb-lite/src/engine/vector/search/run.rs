@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use nodedb_types::error::NodeDbResult;
 use nodedb_types::filter::MetadataFilter;
 use nodedb_types::result::SearchResult;
-use nodedb_vector::rerank::{Candidate, IndexShape, recall_scale, rerank, validate_options};
+use nodedb_vector::rerank::{Candidate, IndexShape, recall_scale, validate_options};
 
 use crate::engine::crdt::CrdtEngine;
 use crate::engine::vector::sidecar::install_sidecar_for_index;
@@ -190,34 +190,8 @@ where
         .map_err(|_| LiteError::LockPoisoned)?;
     let sidecar = sidecars.get(index_key);
 
-    // On native targets, use `get_vector_or_backing`: it serves graph-checkpoint-
-    // only restored indexes (empty per-node local storage) from the pagedb segment
-    // backing attached by `with_backing`, and decodes F16/BF16 node storage to f32.
-    // On WASM the backing path is absent; `get_vector` is correct there because
-    // WASM uses the full-checkpoint blob path where F32 vectors are inline.
-    #[cfg(not(target_arch = "wasm32"))]
-    let ranked = rerank(
-        candidates,
-        query,
-        metric.unwrap_or_else(|| index.metric()),
-        k,
-        opts,
-        sidecar,
-        |id| index.get_vector_or_backing(id),
-    )
-    .map_err(|e| LiteError::Query(e.to_string()))?;
-
-    #[cfg(target_arch = "wasm32")]
-    let ranked = rerank(
-        candidates,
-        query,
-        metric.unwrap_or_else(|| index.metric()),
-        k,
-        opts,
-        sidecar,
-        |id| index.get_vector(id).map(std::borrow::Cow::Borrowed),
-    )
-    .map_err(|e| LiteError::Query(e.to_string()))?;
+    let ranked =
+        super::rerank::rank_candidates(index, candidates, query, metric, k, opts, sidecar)?;
 
     // ── Hydrate metadata and apply post-filter ────────────────────────────────
 
@@ -230,4 +204,87 @@ where
         skip_payload_fetch,
     };
     Ok(hydration.results(ranked))
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::VectorAnnOptions;
+    use nodedb_vector::rerank::{IndexShape, recall_scale, validate_options};
+
+    // ── oversample math ──────────────────────────────────────────────────────
+
+    #[test]
+    fn oversample_4_no_filter_fetch_k_is_k_times_4() {
+        let k = 10_usize;
+        let oversample: usize = 4;
+        let fetch_k = k.saturating_mul(oversample);
+        assert_eq!(fetch_k, 40);
+    }
+
+    #[test]
+    fn oversample_4_with_filter_fetch_k_is_k_times_12() {
+        let k = 10_usize;
+        let oversample: usize = 4;
+        let fetch_k = k.saturating_mul(oversample).saturating_mul(3);
+        assert_eq!(fetch_k, 120);
+    }
+
+    // ── target_recall scaling ────────────────────────────────────────────────
+
+    #[test]
+    fn target_recall_095_scales_ef_and_oversample() {
+        let base_ef = 50_usize;
+        let base_oversample: u8 = 1;
+        let (scaled_ef, scaled_oversample) =
+            recall_scale(Some(0.95), base_ef, base_oversample).unwrap();
+        assert_eq!(scaled_ef, 200);
+        assert_eq!(scaled_oversample, 2);
+    }
+
+    #[test]
+    fn target_recall_none_returns_base_unchanged() {
+        let (ef, os) = recall_scale(None, 100, 1).unwrap();
+        assert_eq!(ef, 100);
+        assert_eq!(os, 1);
+    }
+
+    #[test]
+    fn target_recall_invalid_returns_bad_input() {
+        let result = recall_scale(Some(1.5), 100, 1);
+        assert!(result.is_err());
+    }
+
+    // ── codec guard ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn sq8_quantization_returns_bad_request_via_validate() {
+        use nodedb_types::vector_ann::VectorQuantization;
+        let opts = VectorAnnOptions {
+            quantization: Some(VectorQuantization::Sq8),
+            ..Default::default()
+        };
+        let rerank_codec =
+            validate_options(&opts, IndexShape::SingleVector, VectorQuantization::Sq8).unwrap();
+        assert!(
+            rerank_codec.is_some(),
+            "Sq8 should produce a Some(CodecName)"
+        );
+    }
+
+    #[test]
+    fn meta_token_budget_returns_bad_input_from_validate() {
+        let opts = VectorAnnOptions {
+            meta_token_budget: Some(8),
+            ..Default::default()
+        };
+        let result = validate_options(
+            &opts,
+            IndexShape::SingleVector,
+            nodedb_types::VectorQuantization::None,
+        );
+        assert!(
+            result.is_err(),
+            "meta_token_budget on single-vector should be a BadInput error"
+        );
+    }
 }

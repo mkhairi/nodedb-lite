@@ -86,17 +86,14 @@ pub(crate) async fn insert_select_admitted<S: StorageEngine>(
         let all_rows = engine.strict.list_rows(source_collection).await?;
         let mut docs = Vec::with_capacity(all_rows.len().min(source_limit));
         for row in all_rows.into_iter().take(source_limit) {
-            let pk = value_to_string(&row[pk_idx]);
+            let pk = row.get(pk_idx).ok_or_else(|| LiteError::Storage {
+                detail: format!("strict collection '{source_collection}' row omits primary key at column {pk_idx}"),
+            })?;
+            let pk = value_to_string(pk);
             let map: HashMap<String, Value> = columns
                 .iter()
                 .enumerate()
-                .filter_map(|(i, col)| {
-                    if i < row.len() {
-                        Some((col.name.clone(), row[i].clone()))
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|(i, col)| row.get(i).map(|value| (col.name.clone(), value.clone())))
                 .collect();
             let bytes = zerompk::to_msgpack_vec(&Value::Object(map)).map_err(|e| {
                 LiteError::Serialization {

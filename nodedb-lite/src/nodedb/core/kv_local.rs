@@ -35,7 +35,7 @@ pub(crate) struct KvWriteBuffer {
 /// The write buffer and read cache of the public KV API.
 pub struct KvLocalState {
     /// Buffered KV writes awaiting batch commit to storage.
-    /// Flushed on `kv_flush()`, threshold (1000 ops), or `flush()`.
+    /// `kv_flush()`, the 1024-operation threshold, and `flush()` drain this buffer.
     /// The HashMap overlay lets reads see uncommitted writes.
     pub(crate) write_buf: Mutex<KvWriteBuffer>,
     /// In-memory LRU cache for the KV get hot path.

@@ -46,15 +46,7 @@ fn map_spatial_predicate(p: &SqlSpatialPredicate) -> PhysSpatialPredicate {
 
 /// Lower `SqlPlan::MultiVectorSearch` to `VectorOp::MultiSearch`.
 ///
-/// Lite has no multi-field HNSW RRF fusion path: all named fields on Lite
-/// share a single in-memory HNSW index keyed by `collection` (or
-/// `collection:field`). Multi-vector search would require per-field indexes
-/// and a merge step that is absent from the Lite vector state. This is an
-/// Origin-only feature. The closure rule requires `unreachable!` where the
-/// deployment shape makes execution structurally impossible; Lite's single
-/// shared HNSW index is exactly that mismatch — callers targeting a
-/// vector-primary collection with multiple embedding fields must route to
-/// Origin.
+/// Lite rejects multi-field vector fusion because its executor lacks the merge path.
 pub(super) fn lower_multi_vector_search<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     collection: &str,

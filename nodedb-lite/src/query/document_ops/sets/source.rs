@@ -51,10 +51,14 @@ pub(super) async fn collect_ids<S: StorageEngine>(
                 detail: format!("strict collection '{collection}' has no primary key"),
             })?;
         let all_rows = engine.strict.list_rows(collection).await?;
-        Ok(all_rows
+        all_rows
             .iter()
-            .map(|row| value_to_string(&row[pk_idx]))
-            .collect())
+            .map(|row| {
+                row.get(pk_idx).map(value_to_string).ok_or_else(|| LiteError::Storage {
+                    detail: format!("strict collection '{collection}' row omits primary key at column {pk_idx}"),
+                })
+            })
+            .collect()
     } else {
         let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
         Ok(crdt.list_ids(collection))

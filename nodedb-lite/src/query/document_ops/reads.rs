@@ -118,7 +118,12 @@ pub async fn range_scan<S: StorageEngine>(
         let all_rows = engine.strict.list_rows(collection).await?;
         let mut rows = Vec::new();
         for row in all_rows {
-            let pk_str = value_to_string(&row[pk_idx]);
+            let pk = row.get(pk_idx).ok_or_else(|| LiteError::Storage {
+                detail: format!(
+                    "strict collection '{collection}' row omits primary key at column {pk_idx}"
+                ),
+            })?;
+            let pk_str = value_to_string(pk);
             let pk_bytes = pk_str.as_bytes();
             if let Some(lo) = lower
                 && pk_bytes < lo

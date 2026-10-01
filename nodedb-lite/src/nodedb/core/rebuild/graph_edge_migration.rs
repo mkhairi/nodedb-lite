@@ -120,9 +120,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
                     }
 
                     let mut props = Document::new(new_key.clone());
-                    for (k, v) in &doc.fields {
+                    for (k, v) in doc.fields {
                         if k != "src" && k != "dst" && k != "label" {
-                            props.fields.insert(k.clone(), v.clone());
+                            props.fields.insert(k, v);
                         }
                     }
                     let properties = if props.fields.is_empty() {

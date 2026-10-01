@@ -58,9 +58,9 @@ pub(in crate::query::visitor) fn lower_merge<'a, S: StorageEngine + 'a>(
         let source_maps = result_to_maps(source_result);
 
         let mut source_index: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        for row in &source_maps {
+        for row in source_maps {
             if let Some(key_val) = row.get(&s_join) {
-                source_index.insert(value_to_string(key_val), row.clone());
+                source_index.insert(value_to_string(key_val), row);
             }
         }
 
@@ -76,7 +76,7 @@ pub(in crate::query::visitor) fn lower_merge<'a, S: StorageEngine + 'a>(
             };
 
             if let Some(source_row) = source_index.get(&join_key) {
-                matched_source_keys.insert(join_key.clone());
+                matched_source_keys.insert(join_key);
                 let arm = phys_clauses
                     .iter()
                     .find(|c| c.kind == MergeClauseKind::Matched);
@@ -151,7 +151,7 @@ pub(super) async fn apply_merge_action<S: StorageEngine>(
             // against the bare-keyed source fields. Result keyed by target column.
             let row_map = build_insert_map(columns, values, source_row)?;
             let id = extract_id(&row_map);
-            let bytes = row_to_msgpack(&row_map)?;
+            let bytes = row_to_msgpack(row_map)?;
             point_insert_admitted(engine, permit, target, &id, &bytes, true).await?;
         }
         MergeActionOp::DoNothing => {}
@@ -200,5 +200,48 @@ pub(super) fn convert_merge_action(action: &MergePlanAction) -> Result<MergeActi
             })
         }
         MergePlanAction::DoNothing => Ok(MergeActionOp::DoNothing),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::document_ops::writes::point_put;
+    use crate::query::engine::test_engine;
+
+    #[tokio::test]
+    async fn merge_inserts_unmatched_schemaless_source_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let engine = test_engine().await;
+        engine.execute_sql("CREATE COLLECTION merge_target").await?;
+        let fields = HashMap::from([
+            ("id".into(), Value::String("source-1".into())),
+            ("label".into(), Value::String("copied source".into())),
+            ("quantity".into(), Value::Integer(7)),
+        ]);
+        let bytes = zerompk::to_msgpack_vec(&Value::Object(fields.clone()))?;
+        point_put(&engine, "merge_source", "source-1", &bytes).await?;
+
+        let result = engine
+            .execute_sql(
+                "MERGE INTO merge_target AS t \
+             USING (SELECT id, label, quantity FROM merge_source) AS s \
+             ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id, label, quantity) \
+             VALUES (s.id, s.label, s.quantity)",
+            )
+            .await?;
+
+        assert_eq!(result.rows_affected, 1);
+        assert_eq!(result.command.as_deref(), Some("MERGE"));
+        assert_eq!(
+            collect_ids_pub(&engine, "merge_target").await?,
+            vec!["source-1"]
+        );
+        let inserted = fetch_document_value_pub(&engine, "merge_target", "source-1").await?;
+        assert_eq!(inserted.get("id"), fields.get("id"));
+        assert_eq!(inserted.get("label"), fields.get("label"));
+        assert_eq!(inserted.get("quantity"), fields.get("quantity"));
+        Ok(())
     }
 }

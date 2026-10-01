@@ -146,7 +146,7 @@ pub async fn insert<S: StorageEngine>(
                                 &col_names,
                             )?
                         }
-                        None => row_values.clone(),
+                        None => row_values,
                     };
                     if let Some(pk) = merged.get(pk_idx) {
                         let _ = engine.columnar.delete(collection, pk);
@@ -223,7 +223,7 @@ pub async fn update<S: StorageEngine>(
         let pk = row.get(pk_idx).cloned().unwrap_or(Value::Null);
 
         // Build new_values: copy current row then apply updates.
-        let mut new_values = row.clone();
+        let mut new_values = row;
         for (field, new_val) in &parsed_updates {
             if let Some(col_idx) = col_names.iter().position(|n| n == field)
                 && col_idx < new_values.len()

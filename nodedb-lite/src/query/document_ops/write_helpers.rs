@@ -13,6 +13,11 @@ use crate::storage::engine::StorageEngine;
 
 use super::writes::UpdateValue;
 
+/// Check whether the strict engine has a schema for this collection.
+pub(crate) fn is_strict<S: StorageEngine>(engine: &LiteQueryEngine<S>, collection: &str) -> bool {
+    engine.strict.schema(collection).is_some()
+}
+
 pub(super) fn affected(n: u64, command: &'static str) -> QueryResult {
     QueryResult {
         columns: Vec::new(),

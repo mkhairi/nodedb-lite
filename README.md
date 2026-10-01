@@ -112,12 +112,11 @@ The Rust crate API in `0.1.0`:
 use nodedb_lite::{NodeDbLite, PagedbStorageMem};
 use nodedb_client::NodeDb;
 
-// Open an in-memory database (peer_id uniquely identifies this device/replica).
-// `open` hands back an `Arc` and starts the background flush task, so writes
-// are durable within `auto_flush_ms` (one second by default) without any
-// further setup. `flush()` forces it immediately when you need a hard point.
+// Open an in-memory database. The constructor returns an Arc.
+// Background flushing uses auto_flush_ms as an interval, without a deadline guarantee.
+// In-memory storage remains volatile after flush().
 let storage = PagedbStorageMem::open_in_memory().await?;
-let db = NodeDbLite::open(storage, 1u64).await?;
+let db = NodeDbLite::open(storage).await?;
 
 // Insert a document
 db.execute_sql("CREATE COLLECTION notes", &[]).await?;
@@ -129,6 +128,7 @@ doc.set("title", "Hello".into());
 db.document_put("notes", doc).await?;
 
 // Vector search
+let embedding = vec![1.0_f32, 0.0, 0.0];
 db.vector_insert("articles", "a1", &embedding, None).await?;
 // vector_search(collection, query, k, filter, allowed_ids)
 let results = db.vector_search("articles", &embedding, 10, None, None).await?;
@@ -145,7 +145,10 @@ The `NodeDb` trait is identical across Lite and Origin. Application code doesn't
 
 ```rust
 // Works with both NodeDbLite (in-process) and NodeDbRemote (over network)
-async fn search(db: &dyn NodeDb, query: &[f32]) -> Result<Vec<Article>> {
+async fn search(
+    db: &dyn NodeDb,
+    query: &[f32],
+) -> nodedb_types::error::NodeDbResult<Vec<nodedb_types::result::SearchResult>> {
     db.vector_search("articles", query, 10, None, None).await
 }
 ```
@@ -178,11 +181,7 @@ Converged:  Device and cloud share identical Loro state hash
 
 ## SQL support
 
-NodeDB Lite parses SQL via `nodedb-sql` and executes plans directly against local engines.
-8 of 44 `SqlPlan` variants are executed in `0.1.0`: `ConstantResult`, `Scan` (partial),
-`PointGet`, `Insert`, `Upsert`, `Update`, `Delete`, and `Truncate`. JOIN, aggregates, CTE,
-window functions, vector/FTS/spatial SQL, and all Array DDL/DML variants return
-`LiteError::Unsupported`. The regression gate is `tests/sql_matrix.rs`.
+NodeDB Lite parses SQL via `nodedb-sql` and executes supported plans against local engines. SQL coverage includes document mutations, joins, aggregates, CTEs, and search index declarations. Unsupported plans return `LiteError::Unsupported`. The regression gates include `tests/sql_matrix.rs` and `tests/sql_parity.rs`.
 
 See [docs/lite-support-matrix.md](docs/lite-support-matrix.md) for the full engine, SQL, and sync support matrix.
 

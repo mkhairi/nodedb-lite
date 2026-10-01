@@ -2,7 +2,6 @@
 use super::super::writes::point_update_admitted;
 use super::DocumentJoin;
 use super::UpdateValue;
-use super::actions::qualify_updates_with_source;
 use super::source::{build_join_map, collect_ids, extract_field_str, fetch_document_value};
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
@@ -64,7 +63,7 @@ pub(crate) async fn update_from_join_admitted<S: StorageEngine>(
     let DocumentJoin {
         target_collection,
         source_collection,
-        source_alias,
+        source_alias: _,
         target_join_col,
         source_join_col,
     } = join;
@@ -83,22 +82,11 @@ pub(crate) async fn update_from_join_admitted<S: StorageEngine>(
             None => continue,
         };
 
-        let source_val = match source_map.get(&join_key) {
-            Some(v) => v,
-            None => continue,
-        };
+        if !source_map.contains_key(&join_key) {
+            continue;
+        }
 
-        // Build merged document: target fields + source fields qualified by alias.
-        let effective_updates = qualify_updates_with_source(updates, source_val, source_alias)?;
-
-        point_update_admitted(
-            engine,
-            permit,
-            target_collection,
-            doc_id,
-            &effective_updates,
-        )
-        .await?;
+        point_update_admitted(engine, permit, target_collection, doc_id, updates).await?;
         affected_n += 1;
     }
 

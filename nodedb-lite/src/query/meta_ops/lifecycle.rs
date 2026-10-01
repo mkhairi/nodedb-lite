@@ -11,34 +11,22 @@ use crate::query::ddl::default_convert_schema;
 use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
-/// `CreateSnapshot` dispatch target.
-///
-/// `MetaOp::CreateSnapshot` is a maintenance op issued by Origin's WAL manager
-/// or administrative CLI. Lite's `PlanVisitor` has no `create_snapshot` trait
-/// method and exposes no SQL syntax that produces this variant. The `StorageEngine`
-/// trait has no snapshot API. No valid Lite deployment-shape code path reaches here.
+/// Reject snapshots because the Lite storage interface has no snapshot API.
 pub async fn handle_create_snapshot<S: StorageEngine>(
     _engine: &LiteQueryEngine<S>,
 ) -> Result<QueryResult, LiteError> {
-    unreachable!(
-        "MetaOp::CreateSnapshot is an Origin WAL-manager op; Lite's PlanVisitor \
-         exposes no SQL that produces this variant and StorageEngine has no snapshot API"
-    )
+    Err(LiteError::Unsupported {
+        detail: "MetaOp::CreateSnapshot requires an Origin WAL manager and snapshot API".into(),
+    })
 }
 
-/// `Compact` dispatch target.
-///
-/// `MetaOp::Compact` is a maintenance op issued by Origin's compaction manager.
-/// Lite's `PlanVisitor` has no `compact` trait method and exposes no SQL syntax
-/// that produces this variant. The `StorageEngine` trait has no compact entry
-/// point. No valid Lite deployment-shape code path reaches here.
+/// Reject compaction because the Lite storage interface has no compact API.
 pub async fn handle_compact<S: StorageEngine>(
     _engine: &LiteQueryEngine<S>,
 ) -> Result<QueryResult, LiteError> {
-    unreachable!(
-        "MetaOp::Compact is an Origin compaction-manager op; Lite's PlanVisitor \
-         exposes no SQL that produces this variant and StorageEngine has no compact API"
-    )
+    Err(LiteError::Unsupported {
+        detail: "MetaOp::Compact requires an Origin compaction manager and compact API".into(),
+    })
 }
 
 /// `Checkpoint` — report a logical LSN of 0 (Lite is single-node, no WAL LSN).
@@ -214,14 +202,11 @@ pub(crate) async fn handle_rename_collection_admitted<S: StorageEngine>(
         .storage
         .scan_prefix(Namespace::Meta, old_prefix.as_bytes())
         .await?;
+    let new_prefix = format!("collection/{new_collection}");
     let mut renamed: u64 = 0;
     for (old_key, value) in &pairs {
         let old_key_str = String::from_utf8_lossy(old_key);
-        let new_key_str = old_key_str.replacen(
-            &format!("collection/{old_collection}"),
-            &format!("collection/{new_collection}"),
-            1,
-        );
+        let new_key_str = old_key_str.replacen(&old_prefix, &new_prefix, 1);
         engine
             .storage
             .put(Namespace::Meta, new_key_str.as_bytes(), value)

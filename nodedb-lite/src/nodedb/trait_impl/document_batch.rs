@@ -179,9 +179,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             // Post-lock work: bitemporal history + FTS + HNSW (matches single-item ordering).
             let now_ms = now_millis_i64();
 
-            for (i, item) in items.iter().enumerate() {
-                let (ref doc_id, _, _) = resolved[i];
-
+            for (item, (doc_id, _, _)) in items.iter().zip(&resolved) {
                 if is_bitemporal(&*self.storage, item.doc_collection)
                     .await
                     .map_err(NodeDbError::storage)?

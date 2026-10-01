@@ -140,7 +140,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         let delta_entries = storage
             .scan_prefix(Namespace::LoroState, CrdtEngine::state_delta_key_prefix())
             .await?;
-        let mut orphaned_keys: Vec<Vec<u8>> = Vec::new();
+        let mut orphaned_keys: Vec<&[u8]> = Vec::new();
         let mut replayed = ReplayedRows::new();
         for (key, envelope) in &delta_entries {
             let Some((collection, seq)) = CrdtEngine::state_delta_from_key(key) else {
@@ -167,7 +167,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                      predecessors and cannot be replayed. A full re-sync from Origin is \
                      needed for this collection."
                 );
-                orphaned_keys.push(key.clone());
+                orphaned_keys.push(key);
                 continue;
             }
             let Some(update) = crate::storage::checksum::unwrap(envelope) else {
@@ -197,7 +197,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         for key in orphaned_keys {
             // A failed delete is recoverable — the entry is skipped by the same
             // base-absent check on the next open — but never silent.
-            if let Err(e) = storage.delete(Namespace::LoroState, &key).await {
+            if let Err(e) = storage.delete(Namespace::LoroState, key).await {
                 tracing::error!(
                     error = %e,
                     "failed to delete an orphaned CRDT update; it will be skipped and \

@@ -14,10 +14,10 @@ NodeDB-Lite is a fully capable embedded database for edge devices — phones, ta
 
 | Platform                                  | Backend                   | Binary Size                                                        |
 | ----------------------------------------- | ------------------------- | ------------------------------------------------------------------ |
-| Linux, macOS, Windows                     | redb (file-backed)        | Native                                                             |
-| iOS _(in progress — not in 0.1.0)_ | redb + C FFI (cbindgen)   | Native _(requires macOS build environment — not yet built/tested)_ |
-| Android                                   | redb + C FFI + Kotlin/JNI | Native                                                             |
-| Browser (WASM)                            | redb (in-memory + OPFS)   | ~4.5 MB                                                            |
+| Linux, macOS, Windows                     | pagedb (file-backed)        | Native                                                             |
+| iOS _(in progress — not in 0.1.0)_ | pagedb + C FFI (cbindgen)   | Native _(requires macOS build environment — not yet built/tested)_ |
+| Android                                   | pagedb + C FFI + Kotlin/JNI | Native                                                             |
+| Browser (WASM)                            | pagedb (in-memory + OPFS)   | ~4.5 MB                                                            |
 
 For the full release posture of each surface and engine, see [lite-support-matrix.md](./lite-support-matrix.md).
 
@@ -25,12 +25,12 @@ For the full release posture of each surface and engine, see [lite-support-matri
 
 - **All engines locally** — Vector search, graph traversal, document CRUD, full-text search, timeseries, spatial, KV — all in-process, no network
 - **Sub-millisecond reads** — Hot data lives in memory indexes (HNSW, CSR, Loro)
-- **CRDT sync** — Every write produces a delta. Deltas sync to Origin over WebSocket when online. Multiple devices converge regardless of operation order.
+- **CRDT sync** — CRDT document writes produce deltas. Deltas sync to Origin over WebSocket when online. Multiple devices converge regardless of operation order.
 - **Shape subscriptions** — Control what data each device holds: `WHERE user_id = $me`, not the entire database
 - **Conflict resolution** — Declarative per-collection policies. SQL constraints (UNIQUE, FK) enforced on Origin at sync time with typed compensation hints back to the device.
 - **Encryption at rest** — AES-256-GCM + Argon2id key derivation
 - **Memory governance** — Per-engine budgets, pressure levels, LRU eviction
-- **SQL** — Supports a documented subset of NodeDB's SQL surface. See the SQL compatibility matrix for the full list of supported plan types; complex queries (JOIN, CTE, window functions, aggregates) run against Origin via the remote `NodeDb` client.
+- **SQL** — Executes supported plans locally. See the SQL compatibility matrix for supported operations and limits.
 
 ## Same API, Any Runtime
 
@@ -38,8 +38,11 @@ The `NodeDb` trait is identical across Lite and Origin. Application code doesn't
 
 ```rust
 // Works with both NodeDbLite (in-process) and NodeDbRemote (over network)
-async fn search(db: &dyn NodeDb, query: &[f32]) -> Result<Vec<Article>> {
-    db.vector_search("articles", query, 10).await
+async fn search(
+    db: &dyn NodeDb,
+    query: &[f32],
+) -> nodedb_types::error::NodeDbResult<Vec<nodedb_types::result::SearchResult>> {
+    db.vector_search("articles", query, 10, None, None).await
 }
 ```
 
@@ -48,7 +51,7 @@ Moving from embedded to server is a connection string change, not a rewrite.
 ## Sync Architecture
 
 ```
-Offline:    App writes locally -> Loro generates delta -> delta persisted to redb
+Offline:    App writes locally -> Loro generates delta -> delta persisted to pagedb
 Reconnect:  Device opens WebSocket -> sends vector clock + accumulated deltas
 Cloud:      Origin validates (RLS, UNIQUE, FK) -> merges -> pushes back missed changes
 Conflict:   Rejected deltas -> dead-letter queue + CompensationHint -> device handles
@@ -97,13 +100,13 @@ Declarations persist across reopen, including collections without rows. Duplicat
 
 Searches continue against the previous index during rebuilding. Coordinated source writes wait for declaration publication. Synchronous mutation APIs return a busy error before mutation.
 
-Cancellation before admission leaves the declaration unchanged. After admission, the owned declaration task completes storage and publication even when its caller cancels. Runtime termination interrupts tasks, and reopening recovers from persisted declarations.
+Cancellation before admission leaves the declaration unchanged. After admission, the owned declaration task continues even when its caller cancels. Runtime termination interrupts tasks, and reopening recovers from persisted declarations.
 
 ## FFI and WASM
 
-**C FFI** (`nodedb-lite-ffi`) — 12 extern functions with cbindgen-generated header. Kotlin/JNI bridge for Android.
+**C FFI** (`nodedb-lite-ffi`) — C entry points use a cbindgen-generated header. Kotlin/JNI supports Android.
 
-**WASM** (`nodedb-lite-wasm`) — JavaScript/TypeScript API via wasm-bindgen. redb runs in-memory with optional OPFS persistence in browsers.
+**WASM** (`nodedb-lite-wasm`) — JavaScript/TypeScript API via wasm-bindgen. pagedb runs in-memory with optional OPFS persistence in browsers.
 
 ## Related
 

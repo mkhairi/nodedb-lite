@@ -88,8 +88,8 @@ pub async fn kv_truncate<S: StorageEngine>(
         })?;
 
     let mut ops: Vec<WriteOp> = Vec::with_capacity(entries.len());
-    for (composite_key, _) in &entries {
-        let Some((coll, _)) = split_kv_key(composite_key) else {
+    for (composite_key, _) in entries {
+        let Some((coll, _)) = split_kv_key(&composite_key) else {
             continue;
         };
         if coll != collection {
@@ -97,7 +97,7 @@ pub async fn kv_truncate<S: StorageEngine>(
         }
         ops.push(WriteOp::Delete {
             ns: Namespace::Kv,
-            key: composite_key.clone(),
+            key: composite_key,
         });
     }
 

@@ -88,7 +88,6 @@ pub(in crate::query::visitor) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
     for (key_val, value_cols) in entries {
         let key = kv_key_bytes(key_val);
         let value = encode_kv_value(value_cols)?;
-        let updates = updates.clone();
 
         let op = match intent {
             KvInsertIntent::Insert => KvOp::Insert {
@@ -114,7 +113,7 @@ pub(in crate::query::visitor) fn lower_kv_insert<'a, S: StorageEngine + 'a>(
                 key,
                 value,
                 ttl_ms,
-                updates,
+                updates: updates.clone(),
                 surrogate: Surrogate::ZERO,
                 // Lite has no RLS policy engine: no write policy applies.
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,

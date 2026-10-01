@@ -36,16 +36,16 @@ impl<S: StorageEngine> NodeDbLite<S> {
             let ids = crdt.list_ids(collection);
 
             let mut matching_ids = Vec::new();
-            for id in &ids {
-                if let Some(loro_val) = crdt.read(collection, id) {
-                    let doc = crate::nodedb::convert::loro_value_to_document(id, &loro_val);
+            for id in ids {
+                if let Some(loro_val) = crdt.read(collection, &id) {
+                    let doc = crate::nodedb::convert::loro_value_to_document(&id, &loro_val);
                     let json = serde_json::to_value(&doc.fields).unwrap_or_default();
                     let msgpack = nodedb_types::json_msgpack::json_to_msgpack_or_empty(&json);
                     if filters.is_empty()
                         || nodedb_query::ScanFilter::all_match_binary(filters, &msgpack)
                             .map_err(|_| NodeDbError::division_by_zero())?
                     {
-                        matching_ids.push(id.clone());
+                        matching_ids.push(id);
                     }
                 }
             }
@@ -98,16 +98,16 @@ impl<S: StorageEngine> NodeDbLite<S> {
             let ids = crdt.list_ids(collection);
 
             let mut matching_ids = Vec::new();
-            for id in &ids {
-                if let Some(loro_val) = crdt.read(collection, id) {
-                    let doc = crate::nodedb::convert::loro_value_to_document(id, &loro_val);
+            for id in ids {
+                if let Some(loro_val) = crdt.read(collection, &id) {
+                    let doc = crate::nodedb::convert::loro_value_to_document(&id, &loro_val);
                     let json = serde_json::to_value(&doc.fields).unwrap_or_default();
                     let msgpack = nodedb_types::json_msgpack::json_to_msgpack_or_empty(&json);
                     if filters.is_empty()
                         || nodedb_query::ScanFilter::all_match_binary(filters, &msgpack)
                             .map_err(|_| NodeDbError::division_by_zero())?
                     {
-                        matching_ids.push(id.clone());
+                        matching_ids.push(id);
                     }
                 }
             }

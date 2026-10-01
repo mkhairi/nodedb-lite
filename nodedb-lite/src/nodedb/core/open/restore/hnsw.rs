@@ -57,11 +57,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
         {
             match crate::engine::vector::durable::list_collections(storage.as_ref()).await {
                 Ok(durable_names) => {
-                    for n in durable_names {
-                        if !names.contains(&n) {
-                            names.push(n);
-                        }
-                    }
+                    let checkpointed: std::collections::HashSet<&str> =
+                        names.iter().map(String::as_str).collect();
+                    let additional: Vec<String> = durable_names
+                        .into_iter()
+                        .filter(|name| !checkpointed.contains(name.as_str()))
+                        .collect();
+                    names.extend(additional);
                 }
                 Err(e) => {
                     tracing::warn!(

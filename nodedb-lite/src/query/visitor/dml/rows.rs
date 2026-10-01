@@ -45,9 +45,9 @@ pub(in crate::query::visitor) fn convert_assignments(
         .collect()
 }
 
-/// Serialize a row map to msgpack bytes for `point_insert`.
-pub(super) fn row_to_msgpack(row: &HashMap<String, Value>) -> Result<Vec<u8>, LiteError> {
-    zerompk::to_msgpack_vec(row).map_err(|e| LiteError::Serialization {
+/// Encode the typed document object that `point_insert` decodes.
+pub(super) fn row_to_msgpack(row: HashMap<String, Value>) -> Result<Vec<u8>, LiteError> {
+    zerompk::to_msgpack_vec(&Value::Object(row)).map_err(|e| LiteError::Serialization {
         detail: format!("encode row msgpack: {e}"),
     })
 }
@@ -139,5 +139,40 @@ pub(super) fn value_to_sql_value(v: Value) -> nodedb_sql::types::SqlValue {
         Value::Bool(b) => SqlValue::Bool(b),
         Value::Null => SqlValue::Null,
         _ => SqlValue::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_encoding_round_trips_as_document_value() {
+        let fields = HashMap::from([
+            ("id".into(), Value::String("source".into())),
+            ("count".into(), Value::Integer(42)),
+            ("score".into(), Value::Float(1.5)),
+            ("absent".into(), Value::Null),
+            ("enabled".into(), Value::Bool(true)),
+            ("bytes".into(), Value::Bytes(vec![0, 130, 255])),
+            (
+                "items".into(),
+                Value::Array(vec![Value::String("item".into()), Value::Null]),
+            ),
+            (
+                "nested".into(),
+                Value::Object(HashMap::from([
+                    ("name".into(), Value::String("nested".into())),
+                    ("count".into(), Value::Integer(7)),
+                    ("empty".into(), Value::Null),
+                    ("values".into(), Value::Array(vec![Value::Integer(3)])),
+                    ("object".into(), Value::Object(HashMap::new())),
+                ])),
+            ),
+        ]);
+        let expected = Value::Object(fields.clone());
+        let bytes = row_to_msgpack(fields).expect("encode document row");
+        let decoded: Value = zerompk::from_msgpack(&bytes).expect("decode document value");
+        assert_eq!(decoded, expected);
     }
 }
