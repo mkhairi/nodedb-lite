@@ -134,12 +134,16 @@ impl CrdtEngine {
     where
         F: FnOnce(&CrdtState) -> Result<(), LiteError>,
     {
-        let (from_counter, to_counter) = {
-            let state = self.state_mut(collection)?;
+        // See `with_delta_capture` for why the field indexes follow the
+        // document whether or not `body` succeeds.
+        let indexed = self.indexed_keys(collection, document_id);
+        let applied = self.state_mut(collection).and_then(|state| {
             let from_counter = state.local_op_counter();
             body(state)?;
-            (from_counter, state.local_op_counter())
-        };
+            Ok((from_counter, state.local_op_counter()))
+        });
+        self.reindex_doc(collection, document_id, indexed);
+        let (from_counter, to_counter) = applied?;
         self.deferred.push(DeferredOp {
             collection: collection.to_string(),
             document_id: document_id.to_string(),
@@ -199,17 +203,42 @@ impl CrdtEngine {
         if !self.states.contains_key(collection) {
             return Ok(0);
         }
-        let (count, _) = self.with_delta_capture(collection, "*", "clear collection", |state| {
+        let cleared = self.with_delta_capture(collection, "*", "clear collection", |state| {
             state
                 .clear_collection(collection)
                 .map_err(|e| LiteError::Storage {
                     detail: format!("clear collection: {e}"),
                 })
-        })?;
+        });
+        // Every document of the collection changed, not the one named "*".
+        self.rebuild_field_indexes(collection);
+        let (count, _) = cleared?;
         Ok(count)
     }
 
     // ─── Shared Delta-Capture Envelope ───────────────────────────────
+
+    /// [`Self::capture_delta`], with the collection's field indexes moved from
+    /// the document's old values to its new ones.
+    ///
+    /// The old values are read before `body` runs. The postings follow the
+    /// document even when `body` fails, because a failed body can still have
+    /// applied part of its operations.
+    pub(super) fn with_delta_capture<F, T>(
+        &mut self,
+        collection: &str,
+        document_id: &str,
+        op_name: &str,
+        body: F,
+    ) -> Result<(T, u64), LiteError>
+    where
+        F: FnOnce(&CrdtState) -> Result<T, LiteError>,
+    {
+        let indexed = self.indexed_keys(collection, document_id);
+        let captured = self.capture_delta(collection, document_id, op_name, body);
+        self.reindex_doc(collection, document_id, indexed);
+        captured
+    }
 
     /// Run `body` against the collection's document, capture the resulting
     /// Loro delta against the pre-mutation version vector, and push it onto
@@ -218,7 +247,7 @@ impl CrdtEngine {
     /// Returns `body`'s value alongside the assigned mutation ID; the ID is 0
     /// when the mutation produced no operations and nothing was enqueued (an
     /// empty delta blob is not importable by the receiver).
-    pub(super) fn with_delta_capture<F, T>(
+    fn capture_delta<F, T>(
         &mut self,
         collection: &str,
         document_id: &str,

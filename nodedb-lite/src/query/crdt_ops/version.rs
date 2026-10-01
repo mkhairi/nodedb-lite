@@ -141,10 +141,11 @@ pub async fn handle_restore_to_version<S: StorageEngine>(
 ) -> Result<QueryResult, LiteError> {
     let vv = parse_version_vector(target_version_json)?;
 
-    let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
+    let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
+    if crdt.state(collection).is_none() {
+        return Err(missing_collection("RestoreToVersion", collection));
+    }
     let delta_bytes = crdt
-        .state(collection)
-        .ok_or_else(|| missing_collection("RestoreToVersion", collection))?
         .restore_to_version(collection, document_id, &vv)
         .map_err(|e| LiteError::Storage {
             detail: format!("RestoreToVersion: {e}"),

@@ -159,6 +159,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
         }];
         ops.extend(index_spec_drop_all_ops(self.storage.as_ref(), name).await?);
         self.storage.batch_write(&ops).await?;
+        // The specs are gone, so their in-memory postings go too.
+        self.crdt.lock_or_recover().drop_field_indexes(name);
         Ok(())
     }
 

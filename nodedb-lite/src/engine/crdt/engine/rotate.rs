@@ -98,6 +98,9 @@ impl CrdtEngine {
         self.next_mutation_id
             .store(next_mutation_id, Ordering::Relaxed);
         self.peer_id = new_peer_id;
+        // The documents are rebuilt under the new identity, so the postings are
+        // derived from them afresh.
+        self.rebuild_all_field_indexes();
 
         Ok(())
     }

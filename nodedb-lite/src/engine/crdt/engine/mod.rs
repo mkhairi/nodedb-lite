@@ -14,6 +14,7 @@
 //! delta that will eventually sync to Origin.
 
 mod checkpoint;
+mod field_index;
 mod lifecycle;
 mod list_ops;
 mod mutate;
@@ -24,6 +25,8 @@ mod rotate;
 mod spill;
 pub mod types;
 
+#[cfg(test)]
+mod field_index_tests;
 #[cfg(test)]
 mod flush_ack_tests;
 #[cfg(test)]

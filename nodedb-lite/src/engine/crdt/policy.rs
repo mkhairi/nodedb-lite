@@ -111,6 +111,9 @@ impl CrdtEngine {
         let delta = &self.pending_deltas[pos];
         let collection = delta.collection.clone();
         let doc_id = delta.document_id.clone();
+        // A resolution can rewrite or delete the row; its field-index postings
+        // move with it.
+        let indexed = self.indexed_keys(&collection, &doc_id);
 
         let policy = self.policies.get_owned(&collection);
 
@@ -187,6 +190,7 @@ impl CrdtEngine {
             },
             CompensationHint::IntegrityViolation => {
                 self.delete_local_row(&collection, &doc_id);
+                self.reindex_doc(&collection, &doc_id, indexed);
                 self.pending_deltas.remove(pos);
                 self.blocked_deltas.remove(&mutation_id);
                 self.dropped_writes = self.dropped_writes.saturating_add(1);
@@ -211,6 +215,7 @@ impl CrdtEngine {
             }
             PolicyResolution::Deferred { .. } | PolicyResolution::WebhookRequired { .. } => {}
         }
+        self.reindex_doc(&collection, &doc_id, indexed);
 
         Some(resolution)
     }

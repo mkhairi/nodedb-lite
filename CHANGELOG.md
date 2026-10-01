@@ -42,6 +42,21 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on the same field errors unless `IF NOT EXISTS` is given. The spec stays `Building`, so queries still plan as
   full scans. Stores written before this change hold no specs and open
   unchanged.
+- A schemaless index spec now has in-memory postings: value to the ids of
+  the documents holding it. They are built from the documents at open and on
+  `CREATE INDEX`, and are never persisted. Every CRDT write moves its
+  document between postings. Imports, history compaction and peer-id
+  rotation rebuild the affected collection's postings. `DROP INDEX` and
+  `DROP COLLECTION` remove them. The index lookup reads them when they cover
+  the collection and field, and falls back to the Meta sparse-index entries
+  otherwise. Null, binary and container values are not indexed. Specs stay
+  `Building`, so query plans are unchanged. No on-disk format changes.
+- `CrdtEngine::register_field_index`, `drop_field_index`,
+  `drop_field_indexes` and `field_index_lookup` manage and read the
+  postings. `CrdtEngine::restore_to_version` restores a row through the
+  engine, so the postings follow it.
+- Opening a store now fails when the index-spec scan in Meta returns a
+  storage error.
 
 ### Fixed
 

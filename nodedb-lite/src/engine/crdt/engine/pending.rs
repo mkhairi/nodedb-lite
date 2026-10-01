@@ -394,9 +394,11 @@ impl CrdtEngine {
             // Best-effort rollback: delete the affected document from its own
             // collection's document. The application should handle the
             // CompensationHint and re-create with corrected values.
+            let indexed = self.indexed_keys(&delta.collection, &delta.document_id);
             if let Some(state) = self.states.get(&delta.collection) {
                 let _ = state.delete(&delta.collection, &delta.document_id);
             }
+            self.reindex_doc(&delta.collection, &delta.document_id, indexed);
             Some(delta)
         } else {
             None

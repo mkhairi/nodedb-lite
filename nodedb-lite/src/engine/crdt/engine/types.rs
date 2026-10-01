@@ -216,6 +216,9 @@ pub struct CrdtEngine {
     /// not be inferred from a drained queue, because a queue drains identically
     /// whether its entries applied or were thrown away.
     pub(in crate::engine::crdt) dropped_writes: u64,
+    /// In-memory field indexes over schemaless document collections, derived
+    /// from the documents above and never persisted. See `field_index`.
+    pub(in crate::engine::crdt) field_indexes: super::field_index::FieldIndexes,
 }
 
 /// One deferred write awaiting `flush_deltas`, with the exact counter range

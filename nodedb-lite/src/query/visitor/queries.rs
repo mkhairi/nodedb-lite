@@ -26,6 +26,7 @@ use crate::query::filter_convert::{sql_filters_to_metadata, sql_value_to_value};
 use crate::query::physical_visitor::LiteDataPlaneVisitor;
 use crate::query::query_ops::aggregate::execute_aggregate;
 use crate::query::query_ops::joins::inline_hash::execute_inline_hash_join;
+use crate::query::value_utils::sql_value_to_index_key;
 use crate::storage::engine::StorageEngine;
 
 use super::adapter::LiteFut;
@@ -125,17 +126,6 @@ fn encode_result_msgpack(result: &QueryResult) -> Result<Vec<u8>, LiteError> {
     zerompk::to_msgpack_vec(&maps).map_err(|e| LiteError::Serialization {
         detail: format!("encode join side msgpack: {e}"),
     })
-}
-
-/// Convert `SqlValue` to its string representation for index lookups.
-fn sql_value_to_index_str(v: &SqlValue) -> String {
-    match v {
-        SqlValue::String(s) => s.clone(),
-        SqlValue::Int(i) => i.to_string(),
-        SqlValue::Float(f) => f.to_string(),
-        SqlValue::Bool(b) => b.to_string(),
-        _ => String::new(),
-    }
 }
 
 // ── Aggregate ────────────────────────────────────────────────────────────────
@@ -264,7 +254,7 @@ pub(super) fn lower_document_index_lookup<'a, S: StorageEngine + 'a>(
     // Lite holds a bare collection name; DatabaseId::DEFAULT keeps it unqualified.
     let col = nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, collection);
     let path = field.to_string();
-    let mut val_str = sql_value_to_index_str(value);
+    let mut val_str = sql_value_to_index_key(value);
     if case_insensitive {
         val_str = val_str.to_lowercase();
     }

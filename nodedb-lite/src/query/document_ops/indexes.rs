@@ -70,7 +70,8 @@ pub async fn drop_index<S: StorageEngine>(
     let count = ops.len() as u64;
     // The spec records go in the same batch, so the entries and the spec
     // that lists them are removed together.
-    ops.extend(index_spec_drop_ops(engine, collection, field).await?);
+    let spec_drop = index_spec_drop_ops(engine, collection, field).await?;
+    ops.extend(spec_drop.ops);
     if !ops.is_empty() {
         engine
             .storage
@@ -79,6 +80,12 @@ pub async fn drop_index<S: StorageEngine>(
             .map_err(|e| LiteError::Storage {
                 detail: e.to_string(),
             })?;
+    }
+    if !spec_drop.indexes.is_empty() {
+        let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
+        for (index_collection, index_field) in &spec_drop.indexes {
+            crdt.drop_field_index(index_collection, index_field);
+        }
     }
     Ok(QueryResult {
         columns: Vec::new(),
@@ -159,6 +166,6 @@ pub async fn backfill_index<S: StorageEngine>(
 }
 
 /// Strip `$.` prefix from a JSON path expression to get the bare field name.
-fn bare_path(path: &str) -> &str {
+pub(crate) fn bare_path(path: &str) -> &str {
     path.trim_start_matches("$.").trim_start_matches('$')
 }

@@ -97,13 +97,24 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
         // ── Restore Lite identity + CRDT state (snapshots, bitemporal
         // backfill, pending deltas, partial-flush safety, legacy CSR cleanup) ──
-        let (crdt, lite_identity) = Self::restore_identity_and_crdt(
+        let (mut crdt, lite_identity) = Self::restore_identity_and_crdt(
             &storage,
             config.corruption_policy,
             config.crdt_pending_delta_window,
             sync_enabled,
         )
         .await?;
+
+        // ── Build the in-memory field indexes from the restored documents ──
+        // Only the index specs are persisted; the postings are derived here.
+        let index_specs =
+            crate::query::document_ops::index_spec::load_index_specs(storage.as_ref()).await?;
+        for (collection, specs) in &index_specs {
+            for spec in specs {
+                crdt.add_field_index(collection, &spec.field, spec.case_insensitive);
+            }
+            crdt.rebuild_field_indexes(collection);
+        }
 
         // Artifacts restored from a valid stored form start clean; everything
         // else starts dirty, so the first flush writes what open rebuilt.

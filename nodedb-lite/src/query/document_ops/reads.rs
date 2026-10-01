@@ -12,6 +12,7 @@ use crate::query::engine::LiteQueryEngine;
 use crate::query::value_utils::value_to_string;
 use crate::storage::engine::StorageEngine;
 
+use super::index_spec::canonical_index_field;
 use super::is_strict;
 
 /// PointGet: fetch a single document by ID.
@@ -283,13 +284,29 @@ fn strict_columns<S: StorageEngine>(engine: &LiteQueryEngine<S>, collection: &st
         .unwrap_or_default()
 }
 
-/// Sparse-index lookup: return all doc IDs where `path == value`.
+/// Index lookup: return all doc IDs where `path == value`.
+///
+/// A schemaless collection's in-memory field index answers when one covers
+/// `(collection, path)`. Otherwise the sparse-index entries in the Meta
+/// namespace answer, as for a strict collection. A collection converted to
+/// strict keeps its schemaless spec and an empty in-memory index, so a strict
+/// collection always reads the entries.
 pub(super) async fn index_lookup_ids<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
     path: &str,
     value: &str,
 ) -> Result<Vec<String>, LiteError> {
+    if !is_strict(engine, collection) {
+        let resident = engine
+            .crdt
+            .lock()
+            .map_err(|_| LiteError::LockPoisoned)?
+            .field_index_lookup(collection, &canonical_index_field(path), value);
+        if let Some(ids) = resident {
+            return Ok(ids);
+        }
+    }
     let index_key = format!("{collection}:{path}:{value}");
     let stored = engine
         .storage

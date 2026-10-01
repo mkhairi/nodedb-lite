@@ -65,7 +65,7 @@ impl PersistedIndexSpec {
 /// in `nodedb-sql` (`engine_rules/index_lookup.rs`): a path that starts with
 /// `$` is kept, a bare name `f` becomes `$.f`. The planner compares an index
 /// spec's field against that form, so a drift here disables index lookups.
-fn canonical_index_field(field: &str) -> String {
+pub(crate) fn canonical_index_field(field: &str) -> String {
     if field.starts_with('$') {
         field.to_string()
     } else {
@@ -81,6 +81,10 @@ fn spec_key(collection: &str, canonical_field: &str) -> String {
 pub(crate) struct PendingIndexSpec {
     key: String,
     bytes: Vec<u8>,
+    collection: String,
+    /// Canonical JSON-path form.
+    field: String,
+    case_insensitive: bool,
 }
 
 /// Build the spec record for a `CREATE INDEX` when the target is a schemaless
@@ -135,10 +139,17 @@ pub(crate) async fn prepare_index_spec<S: StorageEngine>(
     let bytes = sonic_rs::to_vec(&spec).map_err(|e| LiteError::Serialization {
         detail: format!("encode index spec: {e}"),
     })?;
-    Ok(Some(PendingIndexSpec { key, bytes }))
+    Ok(Some(PendingIndexSpec {
+        key,
+        bytes,
+        collection: collection.to_string(),
+        field: canonical,
+        case_insensitive,
+    }))
 }
 
-/// Write a spec record built by [`prepare_index_spec`].
+/// Write a spec record built by [`prepare_index_spec`], then build the
+/// index's in-memory postings from the collection's current documents.
 pub(crate) async fn write_index_spec<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     pending: PendingIndexSpec,
@@ -146,7 +157,17 @@ pub(crate) async fn write_index_spec<S: StorageEngine>(
     engine
         .storage
         .put(Namespace::Meta, pending.key.as_bytes(), &pending.bytes)
-        .await
+        .await?;
+    engine
+        .crdt
+        .lock()
+        .map_err(|_| LiteError::LockPoisoned)?
+        .register_field_index(
+            &pending.collection,
+            &pending.field,
+            pending.case_insensitive,
+        );
+    Ok(())
 }
 
 /// Resolve `collection` through the SQL catalog. A collection no engine knows
@@ -174,6 +195,15 @@ async fn is_schemaless_document<S: StorageEngine>(
     Ok(info.is_none_or(|i| i.engine == EngineType::DocumentSchemaless))
 }
 
+/// The spec records a `DROP INDEX` names, from [`index_spec_drop_ops`].
+pub(crate) struct IndexSpecDrop {
+    /// Delete ops for the spec records.
+    pub(crate) ops: Vec<WriteOp>,
+    /// `(collection, canonical field)` of each spec, for removing its
+    /// in-memory index once the delete is durable.
+    pub(crate) indexes: Vec<(String, String)>,
+}
+
 /// Delete ops for the spec records a `DROP INDEX` names.
 ///
 /// With a collection, a spec matches by index name or by field. Without one,
@@ -182,7 +212,7 @@ pub(crate) async fn index_spec_drop_ops<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
     name_or_field: &str,
-) -> Result<Vec<WriteOp>, LiteError> {
+) -> Result<IndexSpecDrop, LiteError> {
     let prefix = if collection.is_empty() {
         META_INDEX_SPEC_PREFIX.to_string()
     } else {
@@ -194,6 +224,7 @@ pub(crate) async fn index_spec_drop_ops<S: StorageEngine>(
         .await?;
     let canonical = canonical_index_field(name_or_field);
     let mut ops = Vec::new();
+    let mut indexes = Vec::new();
     for (key, value) in pairs {
         // The Meta namespace holds other key families under the same prefix
         // bytes. A record that does not decode as a spec is not one.
@@ -210,9 +241,10 @@ pub(crate) async fn index_spec_drop_ops<S: StorageEngine>(
                 ns: Namespace::Meta,
                 key,
             });
+            indexes.push((spec.collection, spec.field));
         }
     }
-    Ok(ops)
+    Ok(IndexSpecDrop { ops, indexes })
 }
 
 /// Delete ops for every spec record of `collection`, for `DROP COLLECTION`.

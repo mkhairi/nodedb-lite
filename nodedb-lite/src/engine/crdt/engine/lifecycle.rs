@@ -90,6 +90,7 @@ impl CrdtEngine {
             snapshot_exports: AtomicU64::new(0),
             blocked_deltas: std::collections::HashSet::new(),
             dropped_writes: 0,
+            field_indexes: super::field_index::FieldIndexes::default(),
         })
     }
 
@@ -169,12 +170,11 @@ impl CrdtEngine {
         collection: &str,
         data: &[u8],
     ) -> Result<ImportAdmission, LiteError> {
-        let admission =
-            self.state_mut(collection)?
-                .import(data)
-                .map_err(|e| LiteError::Storage {
-                    detail: format!("remote delta import for '{collection}' failed: {e}"),
-                })?;
+        let imported = self.state_mut(collection)?.import(data);
+        self.rebuild_field_indexes_after_import(collection, imported.as_ref().ok());
+        let admission = imported.map_err(|e| LiteError::Storage {
+            detail: format!("remote delta import for '{collection}' failed: {e}"),
+        })?;
         warn_if_fully_trimmed(collection, "remote delta", &admission);
         Ok(admission)
     }
@@ -203,14 +203,27 @@ impl CrdtEngine {
         collection: &str,
         snapshot: &[u8],
     ) -> Result<ImportAdmission, LiteError> {
-        let admission = self
-            .state_mut(collection)?
-            .import_local(snapshot)
-            .map_err(|e| LiteError::Storage {
-                detail: format!("snapshot import for '{collection}' failed: {e}"),
-            })?;
+        let imported = self.state_mut(collection)?.import_local(snapshot);
+        self.rebuild_field_indexes_after_import(collection, imported.as_ref().ok());
+        let admission = imported.map_err(|e| LiteError::Storage {
+            detail: format!("snapshot import for '{collection}' failed: {e}"),
+        })?;
         warn_if_fully_trimmed(collection, "snapshot", &admission);
         Ok(admission)
+    }
+
+    /// Rebuild `collection`'s field indexes after an import, which can rewrite
+    /// any of its documents. An import that contributed no operations changed
+    /// nothing. A failed import (`None`) rebuilds, since it is not known to
+    /// have left the document untouched.
+    fn rebuild_field_indexes_after_import(
+        &mut self,
+        collection: &str,
+        admission: Option<&ImportAdmission>,
+    ) {
+        if admission.is_none_or(|a| a.new_operations > 0) {
+            self.rebuild_field_indexes(collection);
+        }
     }
 
     /// Export a full Loro state snapshot for one collection.
@@ -287,6 +300,10 @@ impl CrdtEngine {
             })?;
             let frontier = state.oplog_version_vector();
             self.compacted_versions.insert(collection.clone(), frontier);
+            // Compaction replaces the document. Its current state is meant to
+            // survive unchanged, but the postings are derived from the new
+            // document rather than trusted to match it.
+            self.rebuild_field_indexes(collection);
         }
 
         // Compaction rewrites the document without advancing its frontier, so
@@ -374,6 +391,9 @@ impl CrdtEngine {
             .map_err(|e| LiteError::Storage {
                 detail: format!("compact_at_version '{collection}': {e}"),
             })?;
+        // The postings are rebuilt from the compacted document, as in
+        // `compact_history`.
+        self.rebuild_field_indexes(collection);
         // See `compact_history`: the frontier is unchanged but the exported
         // bytes are not, so the collection must be re-persisted — as a fresh
         // checkpoint, since the updates on top of the old base no longer
@@ -383,5 +403,28 @@ impl CrdtEngine {
         self.delta_bytes.remove(collection);
         self.advance_state_epoch(collection);
         Ok(())
+    }
+
+    /// Restore one row to its state at `version` through a forward mutation,
+    /// moving the row in the collection's field indexes.
+    ///
+    /// Returns the restore's delta bytes, or an empty vector when the row
+    /// already matches or the collection has no document. Used by
+    /// `RestoreToVersion`.
+    pub fn restore_to_version(
+        &mut self,
+        collection: &str,
+        doc_id: &str,
+        version: &loro::VersionVector,
+    ) -> Result<Vec<u8>, LiteError> {
+        let indexed = self.indexed_keys(collection, doc_id);
+        let Some(state) = self.states.get(collection) else {
+            return Ok(Vec::new());
+        };
+        let restored = state.restore_to_version(collection, doc_id, version);
+        self.reindex_doc(collection, doc_id, indexed);
+        restored.map_err(|e| LiteError::Storage {
+            detail: format!("restore_to_version '{collection}': {e}"),
+        })
     }
 }

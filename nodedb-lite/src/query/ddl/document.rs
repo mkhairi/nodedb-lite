@@ -93,6 +93,11 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             .batch_write(&ops)
             .await
             .map_err(|e| LiteError::Query(format!("storage: {e}")))?;
+        // The specs are gone, so their in-memory postings go too.
+        self.crdt
+            .lock()
+            .map_err(|_| LiteError::LockPoisoned)?
+            .drop_field_indexes(name);
 
         Ok(QueryResult {
             columns: vec!["result".into()],
