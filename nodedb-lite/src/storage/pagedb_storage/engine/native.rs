@@ -9,7 +9,9 @@ use pagedb::vfs::Vfs;
 use nodedb_types::Namespace;
 
 use crate::error::LiteError;
-use crate::storage::engine::{CompactionOutcome, KvPair, SCAN_PAGE, StorageEngine, WriteOp};
+use crate::storage::engine::{
+    CompactionOutcome, KvPair, ReaderStats, SCAN_PAGE, StorageEngine, WriteOp,
+};
 use crate::storage::pagedb_storage::keys::{KeyBuf, ns_end, prefix_key, strip_prefix};
 use crate::storage::pagedb_storage::types::PagedbStorage;
 
@@ -242,6 +244,16 @@ where
             reclaimed_segments: gc.reclaimed_segments,
             segment_bytes_freed: gc.reclaimed_bytes,
             declined_readers_pinned: stats.declined_readers_pinned,
+        })
+    }
+
+    async fn reader_stats(&self) -> Result<ReaderStats, LiteError> {
+        let stats = self.db.stats().await.map_err(LiteError::from)?;
+        Ok(ReaderStats {
+            tracked_readers: stats.tracked_readers,
+            oldest_reader_commit_id: stats.oldest_reader_commit_id,
+            oldest_reader_age_ms: stats.oldest_reader_age_ms,
+            reader_count_non_abortable: stats.reader_count_non_abortable,
         })
     }
 

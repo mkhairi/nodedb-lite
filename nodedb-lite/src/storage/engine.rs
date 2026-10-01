@@ -57,6 +57,25 @@ pub struct CompactionOutcome {
     pub declined_readers_pinned: bool,
 }
 
+/// Snapshot of the read transactions the storage engine currently tracks.
+///
+/// Lite-owned (not a pagedb type) for the same reason as [`CompactionOutcome`].
+/// A long-lived reader pins the free-page reuse floor, so these fields show
+/// whether one is holding space back. Engines without readers return the
+/// `Default` (all-zero) value from the trait's default `reader_stats`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReaderStats {
+    /// Number of read transactions currently tracked.
+    pub tracked_readers: u32,
+    /// Commit id of the oldest tracked reader, if any.
+    pub oldest_reader_commit_id: Option<u64>,
+    /// Age in milliseconds of the oldest tracked reader, if any.
+    pub oldest_reader_age_ms: Option<u64>,
+    /// Number of tracked readers that cannot be aborted.
+    pub reader_count_non_abortable: u32,
+}
+
 /// A write operation for batch writes.
 #[derive(Debug, Clone)]
 pub enum WriteOp {
@@ -171,6 +190,15 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// predecessor and nothing else ever deletes it.
     async fn compact(&self) -> Result<CompactionOutcome, LiteError> {
         Ok(CompactionOutcome::default())
+    }
+
+    /// Report the read transactions the engine currently tracks.
+    ///
+    /// The default implementation returns a zero [`ReaderStats`], so engines
+    /// without reader tracking (in-memory stores, test doubles) need not
+    /// override it. The pagedb-backed engine reports pagedb's reader stats.
+    async fn reader_stats(&self) -> Result<ReaderStats, LiteError> {
+        Ok(ReaderStats::default())
     }
 
     /// Range scan: return up to `limit` entries where key >= `start`.

@@ -13,7 +13,7 @@
 
 use serde::Serialize;
 
-use crate::storage::engine::StorageEngine;
+use crate::storage::engine::{ReaderStats, StorageEngine};
 
 use super::core::NodeDbLite;
 use super::health::HealthStatus;
@@ -30,6 +30,9 @@ pub struct DiagnosticDump {
     pub pending_summary: PendingSummary,
     /// Storage namespace entry counts.
     pub storage_counts: StorageCounts,
+    /// Read transactions the storage engine tracks. A long-lived reader pins
+    /// the free-page reuse floor.
+    pub storage_readers: ReaderStats,
     /// Engine version and build info.
     pub build_info: BuildInfo,
 }
@@ -98,6 +101,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
             }
         };
 
+        // Taken before `count()` below, which opens its own read txn.
+        let storage_readers = match self.storage.reader_stats().await {
+            Ok(stats) => stats,
+            Err(e) => {
+                tracing::warn!(error = %e, "diagnostic_dump: reader_stats failed");
+                ReaderStats::default()
+            }
+        };
+
         let storage_counts = StorageCounts {
             meta: self
                 .storage
@@ -141,6 +153,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             health,
             pending_summary,
             storage_counts,
+            storage_readers,
             build_info,
         }
     }
@@ -165,11 +178,18 @@ mod tests {
         assert!(!dump.build_info.version.is_empty());
         assert!(dump.timestamp_ms > 0);
 
+        // `PagedbStorageMem` uses the pagedb-backed `reader_stats`, and the
+        // dump takes the snapshot before `count()` opens its own read txn.
+        assert_eq!(dump.storage_readers.tracked_readers, 0);
+        assert_eq!(dump.storage_readers.oldest_reader_commit_id, None);
+
         // Should serialize to JSON cleanly.
         let json = sonic_rs::to_string_pretty(&dump).unwrap();
         assert!(json.contains("\"health\""));
         assert!(json.contains("\"pending_summary\""));
         assert!(json.contains("\"storage_counts\""));
+        assert!(json.contains("\"storage_readers\""));
+        assert!(json.contains("\"trackedReaders\""));
     }
 
     #[tokio::test]
