@@ -15,6 +15,8 @@
 
 mod checkpoint;
 mod deferred;
+#[cfg(test)]
+mod field_index_tests;
 mod index_hook;
 mod lifecycle;
 mod list_ops;
