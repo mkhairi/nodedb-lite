@@ -155,17 +155,38 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             return result;
         }
 
+        let plans = self.plan_sql_with_params(sql, params).await?;
+
+        // One statement can plan to several units: `TRUNCATE a, b` yields one
+        // plan per collection. Every unit runs; the last result is the answer.
+        let mut result = QueryResult::empty();
+        for plan in &plans {
+            result = self.execute_plan(plan).await?;
+        }
+        Ok(result)
+    }
+
+    /// Plan `sql` with `params` bound, against a catalog that lists every
+    /// index spec in the state the lookup can serve.
+    pub(in crate::query) async fn plan_sql_with_params(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlPlan>, LiteError> {
         let metas =
             crate::nodedb::collection::ddl::load_persisted_collection_metas(self.storage.as_ref())
                 .await
                 .unwrap_or_default();
         // A failed load lists no indexes, so queries plan as full scans.
-        let index_specs = super::document_ops::index_spec::load_index_specs(self.storage.as_ref())
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "index spec load failed; planning without indexes");
-                Default::default()
-            });
+        let index_specs = super::document_ops::index_spec::load_planner_index_specs(
+            self.storage.as_ref(),
+            &self.crdt,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "index spec load failed; planning without indexes");
+            Default::default()
+        });
         let array_names: Vec<String> = self
             .array_state
             .lock()
@@ -185,20 +206,12 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
 
         let sql_params: Vec<nodedb_sql::ParamValue> = params.iter().map(value_to_param).collect();
 
-        let plans = if sql_params.is_empty() {
+        if sql_params.is_empty() {
             nodedb_sql::plan_sql(sql, &catalog)
         } else {
             nodedb_sql::plan_sql_with_params(sql, &sql_params, &catalog)
         }
-        .map_err(|e| LiteError::Query(format!("SQL plan: {e}")))?;
-
-        // One statement can plan to several units: `TRUNCATE a, b` yields one
-        // plan per collection. Every unit runs; the last result is the answer.
-        let mut result = QueryResult::empty();
-        for plan in &plans {
-            result = self.execute_plan(plan).await?;
-        }
-        Ok(result)
+        .map_err(|e| LiteError::Query(format!("SQL plan: {e}")))
     }
 
     pub(in crate::query) async fn execute_plan(
@@ -298,12 +311,10 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
                 let ids = crdt.list_ids(collection);
                 for id in &ids {
-                    if let Some(val) = crdt.read(collection, id) {
-                        let json = loro_value_to_json(&val);
-                        let doc_str = sonic_rs::to_string(&json).unwrap_or_default();
-                        if !sink.push(vec![Value::String(id.clone()), Value::String(doc_str)])? {
-                            break;
-                        }
+                    if let Some(val) = crdt.read(collection, id)
+                        && !sink.push(schemaless_scan_row(id, &val))?
+                    {
+                        break;
                     }
                 }
                 Ok(())
@@ -340,6 +351,36 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Push the scan row of each document the postings list under
+    /// `field = key` into `sink`, in the shape [`Self::execute_scan_into`]
+    /// gives a non-bitemporal schemaless collection. An id with no document
+    /// is skipped.
+    ///
+    /// The postings lookup and the row reads share one CRDT guard, so they
+    /// see one snapshot. Returns `false`, pushing nothing, when no postings
+    /// cover `(collection, field)`: the caller scans instead.
+    pub(super) fn push_schemaless_rows(
+        &self,
+        collection: &str,
+        field: &str,
+        key: &str,
+        sink: &mut RowSink,
+    ) -> Result<bool, LiteError> {
+        let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
+        let Some(ids) = crdt.field_index_lookup(collection, field, key) else {
+            return Ok(false);
+        };
+        sink.set_columns(vec!["id".into(), "document".into()]);
+        for id in &ids {
+            if let Some(val) = crdt.read(collection, id)
+                && !sink.push(schemaless_scan_row(id, &val))?
+            {
+                break;
+            }
+        }
+        Ok(true)
     }
 
     pub(super) async fn execute_point_get(
@@ -403,6 +444,12 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             _ => Ok(QueryResult::empty()),
         }
     }
+}
+
+/// One schemaless scan row: the id and the document as a JSON string.
+fn schemaless_scan_row(id: &str, val: &loro::LoroValue) -> Vec<Value> {
+    let doc_str = sonic_rs::to_string(&loro_value_to_json(val)).unwrap_or_default();
+    vec![Value::String(id.to_string()), Value::String(doc_str)]
 }
 
 pub(super) fn sql_value_to_string(v: &SqlValue) -> String {

@@ -3,9 +3,10 @@
 //! Collection admin: truncate/create_index/drop_index.
 
 use nodedb_sql::types::query::EngineType;
+use nodedb_types::result::QueryResult;
 
 use crate::error::LiteError;
-use crate::query::document_ops::index_spec::{prepare_index_spec, write_index_spec};
+use crate::query::document_ops::index_spec::{IndexSpecPlan, prepare_index_spec, write_index_spec};
 use crate::query::engine::LiteQueryEngine;
 use crate::query::visitor::adapter::basic::{lower_create_index, lower_drop_index};
 use crate::storage::engine::StorageEngine;
@@ -29,9 +30,11 @@ pub(super) fn truncate<'a, S: StorageEngine + 'a>(
     }))
 }
 
-/// `SqlPlan::CreateIndex`: refuse a duplicate, backfill the index entries,
-/// then persist the spec
-/// so the SQL catalog lists the index on the collection.
+/// `SqlPlan::CreateIndex`: refuse a duplicate, then index the collection.
+///
+/// A schemaless collection persists the spec and builds in-memory postings,
+/// which index lookups read. It writes no Meta index entries. Any other
+/// collection backfills the Meta index entries as before.
 pub(super) fn create_index<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     index_name: Option<&str>,
@@ -41,14 +44,13 @@ pub(super) fn create_index<'a, S: StorageEngine + 'a>(
     if_not_exists: bool,
     case_insensitive: bool,
 ) -> Result<LiteFut<'a>, LiteError> {
-    let backfill = lower_create_index(engine, collection, field, unique, case_insensitive)?;
     let index_name = index_name.map(str::to_string);
     let collection = collection.to_string();
     let field = field.to_string();
     Ok(Box::pin(async move {
-        // Refuse a duplicate before the backfill, so a refused statement has
+        // Refuse a duplicate before any write, so a refused statement has
         // no side effect.
-        let pending = prepare_index_spec(
+        let plan = prepare_index_spec(
             engine,
             index_name.as_deref(),
             &collection,
@@ -58,11 +60,16 @@ pub(super) fn create_index<'a, S: StorageEngine + 'a>(
             if_not_exists,
         )
         .await?;
-        let result = backfill.await?;
-        if let Some(pending) = pending {
-            write_index_spec(engine, pending).await?;
+        match plan {
+            IndexSpecPlan::NotSchemaless => {
+                lower_create_index(engine, &collection, &field, unique, case_insensitive)?.await
+            }
+            IndexSpecPlan::Exists => Ok(QueryResult::empty()),
+            IndexSpecPlan::New(pending) => {
+                write_index_spec(engine, pending).await?;
+                Ok(QueryResult::empty())
+            }
         }
-        Ok(result)
     }))
 }
 

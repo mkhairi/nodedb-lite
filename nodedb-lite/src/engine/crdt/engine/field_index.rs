@@ -197,6 +197,14 @@ impl CrdtEngine {
         self.field_indexes.by_collection.remove(collection);
     }
 
+    /// Whether a field index with built postings covers `(collection, field)`.
+    pub fn has_field_index(&self, collection: &str, field: &str) -> bool {
+        self.field_indexes
+            .by_collection
+            .get(collection)
+            .is_some_and(|fields| fields.contains_key(field))
+    }
+
     /// Ids of the documents whose `field` holds `key`, ascending.
     ///
     /// `None` when no field index covers `(collection, field)`. `key` is the

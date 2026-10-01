@@ -12,14 +12,15 @@ use nodedb_query::expr::GroupKeySpec;
 use nodedb_sql::SubqueryVisitArgs;
 use nodedb_sql::temporal::TemporalScope;
 use nodedb_sql::types::SqlPlan;
-use nodedb_sql::types::filter::Filter;
+use nodedb_sql::types::filter::{Filter, FilterExpr};
 use nodedb_sql::types::query::EngineType;
 use nodedb_sql::types::query::{AggregateExpr, JoinType, Projection, SortKey, WindowSpec};
-use nodedb_sql::types_expr::{SqlExpr, SqlValue};
+use nodedb_sql::types_expr::{BinaryOp, SqlExpr, SqlValue};
 use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
 use crate::error::LiteError;
+use crate::query::document_ops::indexes::bare_path;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::expr_convert::convert_sql_expr;
 use crate::query::filter_convert::{sql_filters_to_metadata, sql_value_to_value};
@@ -33,8 +34,8 @@ use super::adapter::LiteFut;
 use super::having_eval::{apply_having_result, make_agg_alias_map};
 use super::projection::join_projections;
 use super::scan_post::{
-    ScanPostArgs, apply_scan_post_processing, apply_window_functions, distinct_rows, filter_rows,
-    project_rows, sort_rows,
+    RowSink, ScanPostArgs, apply_scan_post_processing, apply_window_functions, distinct_rows,
+    filter_rows, project_rows, sort_rows,
 };
 
 /// Convert a `nodedb_sql` `AggregateExpr` to a physical `AggregateSpec`.
@@ -233,12 +234,20 @@ pub(super) fn lower_join<'a, S: StorageEngine + 'a>(
 
 // ── DocumentIndexLookup ──────────────────────────────────────────────────────
 
+/// Lower an equality on an indexed field.
+///
+/// The rows are the ones a full scan with the same WHERE returns, in the same
+/// shape. The planner removes the indexed equality from `filters`. It is put
+/// back, so the fetched rows are filtered with the scan's own equality, and
+/// a key two distinct values share (`'1'` and `1`) cannot leak a row. The
+/// index narrows the rows only when [`index_candidate_ids`] can name every
+/// row the scan matches. Otherwise the collection is scanned.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_document_index_lookup<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
     collection: &str,
     _alias: Option<&str>,
-    _engine_type: EngineType,
+    engine_type: EngineType,
     field: &str,
     value: &SqlValue,
     filters: &[Filter],
@@ -251,44 +260,64 @@ pub(super) fn lower_document_index_lookup<'a, S: StorageEngine + 'a>(
     case_insensitive: bool,
     _temporal: &TemporalScope,
 ) -> Result<LiteFut<'a>, LiteError> {
-    // Lite holds a bare collection name; DatabaseId::DEFAULT keeps it unqualified.
-    let col = nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, collection);
-    let path = field.to_string();
-    let mut val_str = sql_value_to_index_key(value);
     if case_insensitive {
-        val_str = val_str.to_lowercase();
+        // Lite lists no case-insensitive index as Ready, so the planner never
+        // emits this. The literal arrives lowercased, and the scan equality
+        // cannot be rebuilt from it.
+        return Err(LiteError::BadRequest {
+            detail: format!(
+                "case-insensitive index lookup on {collection}({field}) is not supported"
+            ),
+        });
     }
-
-    // Encode remaining filters.
-    let filter_bytes = encode_filters(filters)?;
-
-    let filters = filters.to_vec();
+    let collection = collection.to_string();
+    let field = field.to_string();
+    let value = value.clone();
+    let mut all_filters = Vec::with_capacity(filters.len() + 1);
+    all_filters.push(Filter {
+        expr: FilterExpr::Expr(SqlExpr::BinaryOp {
+            // The evaluator ignores table qualifiers, so `table: None` is safe.
+            left: Box::new(SqlExpr::Column {
+                table: None,
+                name: bare_path(&field).to_string(),
+            }),
+            op: BinaryOp::Eq,
+            right: Box::new(SqlExpr::Literal(value.clone())),
+        }),
+    });
+    all_filters.extend_from_slice(filters);
     let sort_keys = sort_keys.to_vec();
     let window_functions = window_functions.to_vec();
     let projection = projection.to_vec();
 
-    // The fetch returns every indexed match in full: residual filters,
-    // ORDER BY, projection, OFFSET and LIMIT all run in post-processing,
-    // so the op carries no window of its own.
-    let op = DocumentOp::IndexedFetch {
-        collection: col,
-        path,
-        value: val_str,
-        filters: filter_bytes,
-        projection: Vec::new(),
-        limit: usize::MAX,
-        offset: 0,
-    };
-
-    let mut phys = LiteDataPlaneVisitor { engine };
-    let fut = phys.document(&op)?;
-
     Ok(Box::pin(async move {
-        let raw = fut.await?;
+        // The same row budget the scan lowering applies.
+        let budget = if sort_keys.is_empty() && !distinct && window_functions.is_empty() {
+            limit.map(|n| n.saturating_add(offset))
+        } else {
+            None
+        };
+        let mut sink = RowSink::new(&all_filters, budget)?;
+        let key = if engine_type == EngineType::DocumentSchemaless {
+            index_lookup_key(engine, &collection, &value).await
+        } else {
+            None
+        };
+        // Postings and rows come from one CRDT guard, so one snapshot.
+        let from_postings = match &key {
+            Some(key) => engine.push_schemaless_rows(&collection, &field, key, &mut sink)?,
+            None => false,
+        };
+        if !from_postings {
+            engine
+                .execute_scan_into(&collection, &engine_type, &mut sink)
+                .await?;
+        }
+        // WHERE was applied per row, so the post stages see no filters.
         apply_scan_post_processing(
-            raw,
+            sink.into_result(),
             ScanPostArgs {
-                filters: &filters,
+                filters: &[],
                 sort_keys: &sort_keys,
                 window_specs: &window_functions,
                 projection: &projection,
@@ -299,6 +328,34 @@ pub(super) fn lower_document_index_lookup<'a, S: StorageEngine + 'a>(
             },
         )
     }))
+}
+
+/// Posting key for `field = value` on a schemaless collection, or `None`
+/// when the caller scans instead:
+/// - `value` is not a string, or parses as a number. The scan equality
+///   coerces numbers, so `1` matches `'01'`, `'1.0'` and `true`, which hold
+///   other keys. A null never matches a posting.
+/// - The collection is bitemporal. Its scan reads the history table, which
+///   the CRDT documents behind the postings can lag.
+///
+/// Runs before the CRDT lock is taken: the bitemporal check awaits.
+async fn index_lookup_key<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    collection: &str,
+    value: &SqlValue,
+) -> Option<String> {
+    let SqlValue::String(literal) = value else {
+        return None;
+    };
+    if literal.parse::<f64>().is_ok() {
+        return None;
+    }
+    let key = sql_value_to_index_key(value)?;
+    let bitemporal =
+        crate::engine::document::history::ops::is_bitemporal(engine.storage.as_ref(), collection)
+            .await
+            .unwrap_or(true);
+    if bitemporal { None } else { Some(key) }
 }
 
 // ── RangeScan ────────────────────────────────────────────────────────────────

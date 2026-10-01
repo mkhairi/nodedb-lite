@@ -39,24 +39,40 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in the Meta namespace under `index_spec:{collection}:{field}`. The SQL catalog lists
   it on the collection, with the field in JSON-path form (`$.scope`).
   `DROP INDEX` and `DROP COLLECTION` remove it. A duplicate `CREATE INDEX`
-  on the same field errors unless `IF NOT EXISTS` is given. The spec stays `Building`, so queries still plan as
-  full scans. Stores written before this change hold no specs and open
+  on the same field errors unless `IF NOT EXISTS` is given. Readiness is
+  derived at planning, never read from the record: see the index lookup
+  bullet below. Stores written before this change hold no specs and open
   unchanged.
 - A schemaless index spec now has in-memory postings: value to the ids of
   the documents holding it. They are built from the documents at open and on
   `CREATE INDEX`, and are never persisted. Every CRDT write moves its
   document between postings. Imports, history compaction and peer-id
   rotation rebuild the affected collection's postings. `DROP INDEX` and
-  `DROP COLLECTION` remove them. The index lookup reads them when they cover
-  the collection and field, and falls back to the Meta sparse-index entries
-  otherwise. Null, binary and container values are not indexed. Specs stay
-  `Building`, so query plans are unchanged. No on-disk format changes.
+  `DROP COLLECTION` remove them. Schemaless lookups read these in-memory postings only.
+  Null, binary and container values are not indexed. No on-disk format
+  changes.
 - `CrdtEngine::register_field_index`, `drop_field_index`,
   `drop_field_indexes` and `field_index_lookup` manage and read the
   postings. `CrdtEngine::restore_to_version` restores a row through the
   engine, so the postings follow it.
 - Opening a store now fails when the index-spec scan in Meta returns a
   storage error.
+- A `SELECT` on a schemaless collection with an equality on an indexed
+  field now plans an index lookup. A spec is `Ready` when the engine holds
+  its postings, the field is a top-level key other than `id`, and the index
+  is case-sensitive. Readiness is derived at planning time and never
+  persisted. The lookup returns the rows a full scan returns, in the same
+  `id, document` shape:
+  - The indexed equality is re-checked on every fetched row, so values that
+    share a posting key (`'true'` and `true`) stay apart.
+  - A literal that is not a string, or parses as a number, scans the
+    collection. The scan equality coerces numbers (`1` matches `'01'`), and
+    a null literal scans too, because a null matches no posting.
+  - A bitemporal collection scans, because its scan reads the history table.
+- `CREATE INDEX` on a schemaless collection writes no Meta sparse-index
+  entries. `DROP INDEX` still removes entries an older store holds.
+- `CREATE INDEX` on a schemaless collection refuses a dotted field
+  (`"a.b"`). The postings index top-level keys only.
 
 ### Fixed
 

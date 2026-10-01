@@ -7,23 +7,32 @@
 //! rewrite compares against. The SQL catalog reads the records back and lists
 //! them on the collection's `CollectionInfo`. A store written before specs
 //! existed holds none and opens unchanged.
+//!
+//! The persisted state is always `Building`. Readiness is derived when a
+//! statement is planned ([`load_planner_index_specs`]): a spec is `Ready`
+//! iff the CRDT engine holds its built postings and the lookup answers it
+//! exactly as a full scan would.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nodedb_sql::types::{EngineType, IndexSpec, IndexState, SqlCatalog};
 use nodedb_types::Namespace;
 
+use crate::engine::crdt::CrdtEngine;
 use crate::error::LiteError;
 use crate::query::catalog::LiteCatalog;
 use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::{StorageEngine, WriteOp};
 
+use super::indexes::bare_path;
+
 /// Meta-namespace key prefix for index spec records.
 const META_INDEX_SPEC_PREFIX: &str = "index_spec:";
 
 /// Build state of a persisted index. Only `Ready` lets the planner rewrite an
-/// equality into an index lookup.
+/// equality into an index lookup. Every record is written `Building`; the
+/// planner sees `Ready` only through [`load_planner_index_specs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum PersistedIndexState {
     Building,
@@ -52,10 +61,9 @@ impl PersistedIndexSpec {
             field: self.field.clone(),
             unique: self.unique,
             case_insensitive: self.case_insensitive,
-            state: match self.state {
-                PersistedIndexState::Building => IndexState::Building,
-                PersistedIndexState::Ready => IndexState::Ready,
-            },
+            // A persisted Ready is never trusted: readiness is derived by
+            // `load_planner_index_specs`.
+            state: IndexState::Building,
             predicate: self.predicate.clone(),
         }
     }
@@ -77,6 +85,35 @@ fn spec_key(collection: &str, canonical_field: &str) -> String {
     format!("{META_INDEX_SPEC_PREFIX}{collection}:{canonical_field}")
 }
 
+/// Whether `canonical_field` names one top-level key of a document, the only
+/// form the in-memory postings index (`$.scope`, not `$.a.b` or `$[0]`).
+fn is_top_level_field(canonical_field: &str) -> bool {
+    let bare = bare_path(canonical_field);
+    !bare.is_empty() && !bare.contains(['.', '['])
+}
+
+/// Whether an index lookup on `canonical_field` returns the rows a full scan
+/// returns for the same equality.
+///
+/// - A nested path indexes nothing.
+/// - `id` names the row id in the scan, not the document's `id` key.
+/// - A case-insensitive index receives the literal lowercased, so the scan's
+///   case-sensitive equality cannot be checked on the fetched rows.
+fn lookup_matches_scan(canonical_field: &str, case_insensitive: bool) -> bool {
+    !case_insensitive && is_top_level_field(canonical_field) && bare_path(canonical_field) != "id"
+}
+
+/// What a `CREATE INDEX` writes, from [`prepare_index_spec`].
+pub(crate) enum IndexSpecPlan {
+    /// The target is not a schemaless document collection. No spec is
+    /// written, and the index entries are backfilled.
+    NotSchemaless,
+    /// `IF NOT EXISTS` found the spec already written. Nothing is written.
+    Exists,
+    /// A new spec to write with [`write_index_spec`].
+    New(PendingIndexSpec),
+}
+
 /// An index spec record ready to write, produced by [`prepare_index_spec`].
 pub(crate) struct PendingIndexSpec {
     key: String,
@@ -88,14 +125,16 @@ pub(crate) struct PendingIndexSpec {
 }
 
 /// Build the spec record for a `CREATE INDEX` when the target is a schemaless
-/// document collection. Other engines get no spec record (`None`).
+/// document collection. Other engines get no spec record
+/// ([`IndexSpecPlan::NotSchemaless`]).
 ///
 /// Reads the key first and writes nothing, so the caller can refuse a
 /// duplicate before any side effect. An existing spec is an error unless
-/// `if_not_exists`, which returns `None` and keeps the existing record.
+/// `if_not_exists`, which returns [`IndexSpecPlan::Exists`] and keeps the
+/// existing record. A nested path is refused: the postings index top-level
+/// keys only.
 ///
-/// The spec is stored as `Building`: the planner does not rewrite queries
-/// to an index lookup until it is marked `Ready`.
+/// The spec is stored as `Building`. Readiness is derived at planning time.
 pub(crate) async fn prepare_index_spec<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     index_name: Option<&str>,
@@ -104,15 +143,15 @@ pub(crate) async fn prepare_index_spec<S: StorageEngine>(
     unique: bool,
     case_insensitive: bool,
     if_not_exists: bool,
-) -> Result<Option<PendingIndexSpec>, LiteError> {
+) -> Result<IndexSpecPlan, LiteError> {
     if !is_schemaless_document(engine, collection).await? {
-        return Ok(None);
+        return Ok(IndexSpecPlan::NotSchemaless);
     }
     let canonical = canonical_index_field(field);
     let key = spec_key(collection, &canonical);
     if let Some(existing) = engine.storage.get(Namespace::Meta, key.as_bytes()).await? {
         if if_not_exists {
-            return Ok(None);
+            return Ok(IndexSpecPlan::Exists);
         }
         let existing: PersistedIndexSpec =
             sonic_rs::from_slice(&existing).map_err(|e| LiteError::Serialization {
@@ -122,6 +161,14 @@ pub(crate) async fn prepare_index_spec<S: StorageEngine>(
             "index on {collection}({field}) already exists as {}",
             existing.name
         )));
+    }
+    if !is_top_level_field(&canonical) {
+        return Err(LiteError::BadRequest {
+            detail: format!(
+                "CREATE INDEX on {collection}({field}): a schemaless collection indexes \
+                 top-level fields only; index a top-level field instead of a nested path"
+            ),
+        });
     }
     let default_name = || {
         let bare = canonical.strip_prefix("$.").unwrap_or(&canonical);
@@ -139,7 +186,7 @@ pub(crate) async fn prepare_index_spec<S: StorageEngine>(
     let bytes = sonic_rs::to_vec(&spec).map_err(|e| LiteError::Serialization {
         detail: format!("encode index spec: {e}"),
     })?;
-    Ok(Some(PendingIndexSpec {
+    Ok(IndexSpecPlan::New(PendingIndexSpec {
         key,
         bytes,
         collection: collection.to_string(),
@@ -291,6 +338,34 @@ pub(crate) async fn load_index_specs<S: StorageEngine>(
     Ok(map)
 }
 
+/// Load every persisted index spec with the state the planner plans against.
+///
+/// A spec is `Ready` iff `crdt` holds its built postings and the lookup
+/// returns the rows a full scan returns ([`lookup_matches_scan`]). Every
+/// other spec is `Building`, whatever its record says, so the planner keeps
+/// the full scan. The
+/// postings are registered on `CREATE INDEX` and rebuilt at open, so a spec
+/// turns `Ready` at either point with no write.
+pub(crate) async fn load_planner_index_specs<S: StorageEngine>(
+    storage: &S,
+    crdt: &Mutex<CrdtEngine>,
+) -> Result<HashMap<String, Vec<IndexSpec>>, LiteError> {
+    let mut specs = load_index_specs(storage).await?;
+    let crdt = crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
+    for (collection, collection_specs) in specs.iter_mut() {
+        for spec in collection_specs.iter_mut() {
+            let ready = lookup_matches_scan(&spec.field, spec.case_insensitive)
+                && crdt.has_field_index(collection, &spec.field);
+            spec.state = if ready {
+                IndexState::Ready
+            } else {
+                IndexState::Building
+            };
+        }
+    }
+    Ok(specs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +376,57 @@ mod tests {
         assert_eq!(canonical_index_field("scope"), "$.scope");
         assert_eq!(canonical_index_field("$.a.b"), "$.a.b");
         assert_eq!(canonical_index_field("a.b"), "$.a.b");
+    }
+
+    #[test]
+    fn lookup_matches_scan_for_top_level_case_sensitive_fields_only() {
+        assert!(lookup_matches_scan("$.scope", false));
+        assert!(!lookup_matches_scan("$.scope", true));
+        assert!(!lookup_matches_scan("$.a.b", false));
+        assert!(!lookup_matches_scan("$[0]", false));
+        assert!(!lookup_matches_scan("$.id", false));
+        assert!(!lookup_matches_scan("$", false));
+    }
+
+    /// A record persisted as `Ready` is demoted when the derivation says not
+    /// ready: a nested field, or a top-level field with no postings.
+    #[tokio::test]
+    async fn persisted_ready_loads_as_building_without_postings() {
+        let storage = PagedbStorageMem::open_in_memory().await.unwrap();
+        for field in ["$.a.b", "$.scope"] {
+            let spec = PersistedIndexSpec {
+                collection: "notes".into(),
+                name: format!("idx_{field}"),
+                field: field.into(),
+                unique: false,
+                case_insensitive: false,
+                predicate: None,
+                state: PersistedIndexState::Ready,
+            };
+            storage
+                .put(
+                    Namespace::Meta,
+                    spec_key("notes", field).as_bytes(),
+                    &sonic_rs::to_vec(&spec).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let loaded = load_index_specs(&storage).await.unwrap();
+        assert!(
+            loaded["notes"]
+                .iter()
+                .all(|s| matches!(s.state, IndexState::Building)),
+            "the loader never surfaces a persisted Ready"
+        );
+        let crdt = Mutex::new(CrdtEngine::new(1).unwrap());
+        let planned = load_planner_index_specs(&storage, &crdt).await.unwrap();
+        assert!(
+            planned["notes"]
+                .iter()
+                .all(|s| matches!(s.state, IndexState::Building)),
+            "no postings or nested path: planner keeps the full scan"
+        );
     }
 
     #[tokio::test]

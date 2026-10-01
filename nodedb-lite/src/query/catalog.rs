@@ -453,10 +453,12 @@ mod tests {
             crate::nodedb::collection::ddl::load_persisted_collection_metas(db.storage.as_ref())
                 .await
                 .unwrap();
-        let index_specs =
-            crate::query::document_ops::index_spec::load_index_specs(db.storage.as_ref())
-                .await
-                .unwrap();
+        let index_specs = crate::query::document_ops::index_spec::load_planner_index_specs(
+            db.storage.as_ref(),
+            &db.crdt,
+        )
+        .await
+        .unwrap();
         LiteCatalog::new(
             Arc::clone(&db.crdt),
             Arc::clone(&db.strict),
@@ -484,9 +486,9 @@ mod tests {
         assert!(!idx.unique);
         assert!(!idx.case_insensitive);
         assert!(idx.predicate.is_none());
-        // Postings are not maintained on writes yet, so the planner must not
-        // rewrite queries to an index lookup.
-        assert_eq!(idx.state, IndexState::Building);
+        // The engine holds the built postings, so the planner may rewrite an
+        // equality on the field to an index lookup.
+        assert_eq!(idx.state, IndexState::Ready);
     }
 
     /// `CREATE INDEX` on a schemaless collection lists the index spec on the
