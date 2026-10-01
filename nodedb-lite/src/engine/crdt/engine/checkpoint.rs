@@ -144,7 +144,9 @@ impl CrdtEngine {
     /// A write whose collection was compacted between the plan and the commit
     /// is discarded rather than recorded: the bytes on disk describe a document
     /// that no longer exists, and the marks compaction dropped must stay
-    /// dropped so the next flush writes a fresh checkpoint.
+    /// dropped so the next flush writes a fresh checkpoint. A kept-marks
+    /// collection never has a write in flight when it is compacted, so only the
+    /// no-base path reaches the epoch-mismatch branch.
     ///
     /// Call only after the batch has committed — see [`Self::plan_persistence`].
     pub fn mark_persisted(&mut self, persisted: impl IntoIterator<Item = CrdtPersisted>) {
@@ -243,6 +245,44 @@ mod tests {
             matches!(replan[0].kind, super::CrdtWriteKind::Checkpoint { .. }),
             "and as a fresh checkpoint — an update exported from the discarded history does not \
              apply to the base on disk"
+        );
+    }
+
+    /// An update in flight means the persisted frontier is behind the document,
+    /// so compaction leaves the collection alone. The acknowledgement then
+    /// records the update, and nothing is left to plan: no fresh checkpoint is
+    /// owed.
+    #[test]
+    fn a_compaction_during_an_update_flush_waits_for_it() {
+        let mut engine = CrdtEngine::new(1).unwrap();
+        engine
+            .upsert("users", "u1", &[("n", LoroValue::I64(1))])
+            .unwrap();
+        let base = engine.plan_persistence().unwrap();
+        engine.mark_persisted(base.iter().map(|write| write.persisted()));
+
+        engine
+            .upsert("users", "u2", &[("n", LoroValue::I64(2))])
+            .unwrap();
+        let plan = engine.plan_persistence().unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(matches!(
+            plan[0].kind,
+            super::CrdtWriteKind::Delta { seq: 0 }
+        ));
+        let persisted: Vec<_> = plan.iter().map(|write| write.persisted()).collect();
+
+        // The batch is committing. Compaction must not replace the document the
+        // update was exported from.
+        let epoch_before = engine.state_epoch("users");
+        engine.compact_history().unwrap();
+        assert_eq!(engine.state_epoch("users"), epoch_before);
+
+        engine.mark_persisted(persisted);
+
+        assert!(
+            engine.plan_persistence().unwrap().is_empty(),
+            "the committed update is the disk form of the current document"
         );
     }
 }
