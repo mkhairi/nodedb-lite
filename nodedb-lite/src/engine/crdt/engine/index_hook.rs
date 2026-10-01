@@ -79,6 +79,30 @@ impl CrdtEngine {
         }
     }
 
+    /// Restore one row to its state at `version` through a forward mutation,
+    /// and move the row in the collection's document indexes.
+    ///
+    /// Returns the restore's delta bytes, or an empty vector when the row
+    /// already matches or the collection has no document. Used by
+    /// `RestoreToVersion`.
+    pub fn restore_to_version(
+        &mut self,
+        collection: &str,
+        doc_id: &str,
+        version: &loro::VersionVector,
+    ) -> Result<Vec<u8>, LiteError> {
+        let Some(state) = self.states.get(collection) else {
+            return Ok(Vec::new());
+        };
+        let restored = state.restore_to_version(collection, doc_id, version);
+        // The row may have changed even when the restore reports an error
+        // partway, so the index follows the row as it now stands.
+        self.sync_indexes(collection, [doc_id]);
+        restored.map_err(|e| LiteError::Storage {
+            detail: format!("restore_to_version '{collection}': {e}"),
+        })
+    }
+
     /// Remove every index entry of `collection`, keeping the definitions.
     pub(in crate::engine::crdt) fn clear_index_entries(&self, collection: &str) {
         if let Some(catalog) = &self.indexes {
