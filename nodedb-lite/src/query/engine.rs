@@ -176,6 +176,24 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             return result;
         }
 
+        let plans = self.plan_sql_with_params(sql, params).await?;
+
+        // One statement can plan to several units: `TRUNCATE a, b` yields one
+        // plan per collection. Every unit runs; the last result is the answer.
+        let mut result = QueryResult::empty();
+        for plan in &plans {
+            result = self.execute_plan(plan).await?;
+        }
+        Ok(result)
+    }
+
+    /// Plan `sql` with bound `params` against the current catalog, without
+    /// executing it. DDL the engine handles itself does not plan.
+    pub(crate) async fn plan_sql_with_params(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<SqlPlan>, LiteError> {
         let metas =
             crate::nodedb::collection::ddl::load_persisted_collection_metas(self.storage.as_ref())
                 .await
@@ -199,20 +217,12 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
 
         let sql_params: Vec<nodedb_sql::ParamValue> = params.iter().map(value_to_param).collect();
 
-        let plans = if sql_params.is_empty() {
+        if sql_params.is_empty() {
             nodedb_sql::plan_sql(sql, &catalog)
         } else {
             nodedb_sql::plan_sql_with_params(sql, &sql_params, &catalog)
         }
-        .map_err(LiteError::from)?;
-
-        // One statement can plan to several units: `TRUNCATE a, b` yields one
-        // plan per collection. Every unit runs; the last result is the answer.
-        let mut result = QueryResult::empty();
-        for plan in &plans {
-            result = self.execute_plan(plan).await?;
-        }
-        Ok(result)
+        .map_err(LiteError::from)
     }
 
     pub(in crate::query) async fn execute_plan(
