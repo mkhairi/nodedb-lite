@@ -41,14 +41,17 @@ pub(crate) fn lite_open_options() -> OpenOptions {
 /// async mutex (single-writer serialization is enforced by pagedb itself).
 pub struct PagedbStorage<V: Vfs + Clone> {
     pub(crate) db: Arc<Db<V>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) snapshot_descriptor: Option<super::snapshot::metadata::SnapshotDescriptor>,
 }
 
-// Manual Clone so we don't require `V: Clone` on the struct level — the
-// `Arc` clone is cheap and does not clone the underlying `Db`.
+// Clone shares the database handle and copies only nonsecret snapshot metadata.
 impl<V: Vfs + Clone> Clone for PagedbStorage<V> {
     fn clone(&self) -> Self {
         Self {
             db: Arc::clone(&self.db),
+            #[cfg(not(target_arch = "wasm32"))]
+            snapshot_descriptor: self.snapshot_descriptor.clone(),
         }
     }
 }

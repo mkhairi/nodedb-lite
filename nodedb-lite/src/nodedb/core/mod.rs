@@ -7,6 +7,8 @@ mod open;
 mod ops;
 mod rebuild;
 mod shutdown;
+#[cfg(not(target_arch = "wasm32"))]
+mod snapshot;
 mod sparse_ops;
 mod types;
 

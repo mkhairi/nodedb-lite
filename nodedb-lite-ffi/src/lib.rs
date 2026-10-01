@@ -22,6 +22,7 @@ pub mod ids;
 pub mod jni_bridge;
 pub mod memory;
 pub mod open;
+pub mod snapshot;
 pub(crate) mod status;
 pub mod sync;
 pub(crate) mod util;
@@ -37,6 +38,7 @@ pub use handle::NodeDbHandle;
 pub use ids::*;
 pub use memory::*;
 pub use open::*;
+pub use snapshot::*;
 pub use status::{
     NODEDB_ERR_FAILED, NODEDB_ERR_NOT_FOUND, NODEDB_ERR_NULL, NODEDB_ERR_UTF8, NODEDB_OK,
 };

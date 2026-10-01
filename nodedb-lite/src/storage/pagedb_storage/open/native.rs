@@ -51,12 +51,18 @@ impl PagedbStorage<DefaultVfs> {
     ) -> Result<Self, LiteError> {
         let path = path.as_ref();
         let kek = crate::storage::encryption::resolve_kek_native(&encryption, path)?;
+        let snapshot_descriptor = Some(
+            super::super::snapshot::metadata::SnapshotDescriptor::from_native(&encryption, path)?,
+        );
         let realm = RealmId::new([0u8; 16]);
 
         let vfs = pagedb::vfs::open_default(path).map_err(LiteError::from)?;
 
         match Db::open(vfs, kek, 4096, realm, lite_open_options()).await {
-            Ok(db) => Ok(Self { db: Arc::new(db) }),
+            Ok(db) => Ok(Self {
+                db: Arc::new(db),
+                snapshot_descriptor,
+            }),
             Err(e) if is_corruption(&e) && path.exists() => {
                 if !policy.may_discard() {
                     tracing::error!(
@@ -94,6 +100,9 @@ impl PagedbStorage<DefaultVfs> {
         encryption: &Encryption,
     ) -> Result<Self, LiteError> {
         let kek = crate::storage::encryption::resolve_kek_native(encryption, path)?;
+        let snapshot_descriptor = Some(
+            super::super::snapshot::metadata::SnapshotDescriptor::from_native(encryption, path)?,
+        );
         let realm = RealmId::new([0u8; 16]);
 
         let timestamp = crate::runtime::now_secs();
@@ -121,6 +130,9 @@ impl PagedbStorage<DefaultVfs> {
                     corrupt_path.display()
                 ),
             })?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            snapshot_descriptor,
+        })
     }
 }

@@ -22,6 +22,10 @@ impl PagedbStorage<MemVfs> {
         let db = Db::open(vfs, kek, 4096, realm, lite_open_options())
             .await
             .map_err(LiteError::from)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            #[cfg(not(target_arch = "wasm32"))]
+            snapshot_descriptor: None,
+        })
     }
 }

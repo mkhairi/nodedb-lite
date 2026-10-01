@@ -99,12 +99,12 @@ pub(crate) fn derive_key(
 // ─── Native-only helpers (salt sidecar + KEK resolution) ─────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
-fn salt_sidecar_path(db_path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn salt_sidecar_path(db_path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.salt", db_path.display()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn load_or_create_salt(db_path: &std::path::Path) -> Result<[u8; 16], LiteError> {
+pub(crate) fn load_or_create_salt(db_path: &std::path::Path) -> Result<[u8; 16], LiteError> {
     let sidecar = salt_sidecar_path(db_path);
 
     if sidecar.exists() {
@@ -264,6 +264,25 @@ pub(crate) async fn resolve_kek_opfs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[test]
+    fn existing_non_utf8_salt_sidecar_remains_readable() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"database-\xff".to_vec()));
+        let legacy_sidecar = std::path::PathBuf::from(format!("{}.salt", path.display()));
+        let salt = [0x42; 16];
+        std::fs::write(&legacy_sidecar, salt).unwrap();
+
+        assert_eq!(load_or_create_salt(&path).unwrap(), salt);
+        let mut byte_preserving_path = path.into_os_string();
+        byte_preserving_path.push(".salt");
+        assert!(!std::path::PathBuf::from(byte_preserving_path).exists());
+    }
 
     #[test]
     fn same_passphrase_and_salt_derives_same_key() {

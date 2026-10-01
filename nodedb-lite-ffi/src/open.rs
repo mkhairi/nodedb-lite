@@ -55,20 +55,8 @@ fn open_handle(
         }
     };
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        // The sync connect path runs close to the default 2 MiB worker stack
-        // floor — core dumps put it ~20 KiB from the end — so a deep poll can
-        // exhaust the stack and fault. Give the worker real headroom.
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            record_error(format!("failed to build tokio runtime: {e}"));
-            return std::ptr::null_mut();
-        }
+    let Some(rt) = create_runtime() else {
+        return std::ptr::null_mut();
     };
 
     let config = build_config();
@@ -110,8 +98,25 @@ fn open_handle(
     }) as *mut NodeDbHandle
 }
 
+/// Create the runtime shared by open and restore entry points.
+pub(crate) fn create_runtime() -> Option<tokio::runtime::Runtime> {
+    match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        // Sync connection polling needs more headroom than the default worker stack.
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => Some(rt),
+        Err(e) => {
+            record_error(format!("failed to build tokio runtime: {e}"));
+            None
+        }
+    }
+}
+
 /// Build a config with an optional memory override, `0` meaning "the default".
-fn config_with_memory(memory_mb: u64) -> LiteConfig {
+pub(crate) fn config_with_memory(memory_mb: u64) -> LiteConfig {
     if memory_mb == 0 {
         LiteConfig::default()
     } else {

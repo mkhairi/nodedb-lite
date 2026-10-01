@@ -7,6 +7,8 @@ pub(crate) mod errors;
 pub(crate) mod keys;
 pub(crate) mod open;
 pub(crate) mod segment_ext;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod snapshot;
 pub(crate) mod types;
 
 // Re-exported for the segment-backed storage modules, which are native-only;

@@ -507,6 +507,38 @@ int32_t nodedb_compact(struct NodeDbNodeDbHandle *handle,
                        uint64_t *out_file_bytes_freed);
 
 /**
+ * Write a snapshot of a persistent database to a new destination directory.
+ *
+ * Returns an existing status code. Read `nodedb_last_error` for the error reason.
+ * `:memory:` handles and destinations are refused.
+ *
+ * # Safety
+ * `handle` must be a database token, or NULL. Unknown tokens are refused.
+ * `destination` must be NULL or a valid null-terminated C string.
+ */
+int32_t nodedb_snapshot_to(struct NodeDbNodeDbHandle *handle, const char *destination);
+
+/**
+ * Restore a snapshot into a new persistent directory and return an open handle.
+ *
+ * Returns NULL on error. Read `nodedb_last_error` for the error reason.
+ * The caller frees the returned handle with `nodedb_close`.
+ * `memory_mb` of 0 uses the default memory budget.
+ * `:memory:` source and destination paths are refused.
+ *
+ * Encryption follows `nodedb_open`: NULL is refused for persistent storage.
+ * An empty passphrase explicitly selects plaintext. A nonempty passphrase selects encryption.
+ *
+ * # Safety
+ * `source` and `destination` must be NULL or valid null-terminated C strings.
+ * `passphrase` must be NULL or a valid null-terminated C string.
+ */
+struct NodeDbNodeDbHandle *nodedb_restore_from(const char *source,
+                                               const char *destination,
+                                               uint64_t memory_mb,
+                                               const char *passphrase);
+
+/**
  * Start background CRDT sync to an Origin server.
  *
  * Connects via WebSocket to the given URL, authenticates with the JWT token,

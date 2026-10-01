@@ -53,15 +53,9 @@ pub(crate) fn node_sources(index: &HnswIndex, ids: Option<&IndexIdMap>) -> Optio
         .collect()
 }
 
-/// The `(dim, vectors, surrogates)` segment payload for `index_key`, one
-/// slot per entry of `sources`, in order.
+/// Build segment vectors in node-id order from durable bound rows.
 ///
-/// A bound node's vector is read from its DURABLE row, never from the
-/// in-memory index: after a graph-only checkpoint restore the index nodes
-/// carry no vector bytes of their own. Returns `None` when there is nothing
-/// to publish, or when a bound document has no durable row or a vector of
-/// another width. The existing segment is then left alone; it no longer
-/// matches the index and is refused on the next load.
+/// Empty sources return `None`. Missing rows and invalid widths return corruption errors.
 pub(crate) async fn segment_payload<S: StorageEngine>(
     storage: &S,
     index_key: &str,
@@ -80,14 +74,9 @@ pub(crate) async fn segment_payload<S: StorageEngine>(
     for source in sources {
         match source {
             NodeSource::Bound(doc_id) => {
-                let Some(vector) = durable.remove(&doc_id) else {
-                    tracing::warn!(
-                        index_key,
-                        doc_id,
-                        "bound document has no durable vector; segment not written"
-                    );
-                    return Ok(None);
-                };
+                let vector = durable.remove(&doc_id).ok_or_else(|| LiteError::Corrupted {
+                    detail: format!("vector segment '{index_key}' has no durable row for '{doc_id}': restore the vector row"),
+                })?;
                 surrogates.push(doc_fingerprint(&doc_id));
                 vectors.push(vector);
             }
@@ -98,12 +87,20 @@ pub(crate) async fn segment_payload<S: StorageEngine>(
         }
     }
     let dim = vectors.first().map_or(0, Vec::len);
-    if dim == 0 || vectors.iter().any(|v| v.len() != dim) {
-        tracing::warn!(
-            index_key,
-            "segment vectors differ in width; segment not written"
-        );
-        return Ok(None);
+    if dim == 0 {
+        return Err(LiteError::Corrupted {
+            detail: format!(
+                "vector segment '{index_key}' has zero dimensions: restore valid vector rows"
+            ),
+        });
+    }
+    if let Some(vector) = vectors.iter().find(|v| v.len() != dim) {
+        return Err(LiteError::Corrupted {
+            detail: format!(
+                "vector segment '{index_key}' expects {dim} dimensions, found {}: restore matching vector rows",
+                vector.len()
+            ),
+        });
     }
     Ok(Some((dim, vectors, surrogates)))
 }
@@ -160,5 +157,62 @@ mod tests {
         assert_eq!(doc_fingerprint("a"), doc_fingerprint("a"));
         assert_ne!(doc_fingerprint("a"), doc_fingerprint("b"));
         assert_ne!(doc_fingerprint(""), 0);
+    }
+    #[tokio::test]
+    async fn payload_requires_durable_bound_rows_and_consistent_widths() {
+        use crate::storage::pagedb_storage::PagedbStorageMem;
+        let storage = PagedbStorageMem::open_in_memory().await.unwrap();
+        assert!(
+            segment_payload(&storage, "vectors", Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let missing = segment_payload(
+            &storage,
+            "vectors",
+            vec![NodeSource::Bound("missing".into())],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(missing, LiteError::Corrupted { .. }));
+        assert!(missing.to_string().contains("missing"));
+        let zero = segment_payload(&storage, "vectors", vec![NodeSource::Local(Vec::new())])
+            .await
+            .unwrap_err();
+        assert!(matches!(zero, LiteError::Corrupted { .. }));
+        let mismatch = segment_payload(
+            &storage,
+            "vectors",
+            vec![
+                NodeSource::Local(vec![1.0, 2.0]),
+                NodeSource::Local(vec![3.0]),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(mismatch, LiteError::Corrupted { .. }));
+        storage
+            .batch_write(&[crate::engine::vector::durable::put_op(
+                "vectors",
+                "bound",
+                &[4.0, 5.0],
+            )])
+            .await
+            .unwrap();
+        let payload = segment_payload(
+            &storage,
+            "vectors",
+            vec![
+                NodeSource::Bound("bound".into()),
+                NodeSource::Local(vec![1.0, 2.0]),
+            ],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(payload.0, 2);
+        assert_eq!(payload.1, vec![vec![4.0, 5.0], vec![1.0, 2.0]]);
+        assert_eq!(payload.2, vec![doc_fingerprint("bound"), 0]);
     }
 }
