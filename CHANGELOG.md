@@ -22,6 +22,11 @@ First release. Embedded NodeDB for Linux, macOS, Windows, Android and the browse
 
 ### Added
 
+- `diagnostic_dump()` reports `storage_readers`: tracked read transactions,
+  the oldest reader's commit id and age, and the non-abortable reader count.
+  A long-lived reader pins the free-page reuse floor. The new
+  `StorageEngine::reader_stats` method (default: all zero) and `ReaderStats`
+  type back it.
 - `NodeDbLite::vector_ids(collection)` returns the sorted doc ids that have a
   durable vector row in `collection`. It is exact membership, the same set a
   rebuild restores from, and costs one prefix scan without decoding vectors.
