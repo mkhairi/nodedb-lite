@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+#[cfg(test)]
+mod field_index_tests;
 pub mod index_reads;
 #[cfg(test)]
 mod index_spec_tests;
