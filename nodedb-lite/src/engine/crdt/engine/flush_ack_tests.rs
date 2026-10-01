@@ -138,3 +138,40 @@ fn a_compaction_during_a_flush_is_not_undone_by_its_acknowledgement() {
          apply to the base on disk"
     );
 }
+
+/// An update in flight means the persisted frontier is behind the document, so
+/// compaction leaves the collection alone. The acknowledgement then records the
+/// update, and nothing is left to plan: no fresh checkpoint is owed.
+#[test]
+fn a_compaction_during_an_update_flush_waits_for_it() {
+    let mut engine = CrdtEngine::new(1).unwrap();
+    engine
+        .upsert("users", "u1", &[("n", LoroValue::I64(1))])
+        .unwrap();
+    let base = engine.plan_persistence().unwrap();
+    engine.mark_persisted(base.iter().map(|write| write.persisted()));
+
+    engine
+        .upsert("users", "u2", &[("n", LoroValue::I64(2))])
+        .unwrap();
+    let plan = engine.plan_persistence().unwrap();
+    assert_eq!(plan.len(), 1);
+    assert!(matches!(
+        plan[0].kind,
+        super::CrdtWriteKind::Delta { seq: 0 }
+    ));
+    let persisted: Vec<_> = plan.iter().map(|write| write.persisted()).collect();
+
+    // The batch is committing. Compaction must not replace the document the
+    // update was exported from.
+    let epoch_before = engine.state_epoch("users");
+    engine.compact_history().unwrap();
+    assert_eq!(engine.state_epoch("users"), epoch_before);
+
+    engine.mark_persisted(persisted);
+
+    assert!(
+        engine.plan_persistence().unwrap().is_empty(),
+        "the committed update is the disk form of the current document"
+    );
+}

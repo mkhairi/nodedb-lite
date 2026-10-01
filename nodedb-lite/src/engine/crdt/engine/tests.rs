@@ -186,11 +186,9 @@ fn vector_clock_export() {
 
 /// A second compaction with no writes in between must do nothing at all.
 ///
-/// Compaction drops a collection's checkpoint marks, which forces the next
-/// flush to rewrite its whole base snapshot — an O(document) export. A
-/// periodic tick that compacts unconditionally therefore rewrites the entire
-/// store's snapshot set on a fixed interval whether or not anything changed,
-/// which is what grew an idle store by ~124 MB every five minutes.
+/// Compacting again rebuilds the document and its field indexes for nothing.
+/// A periodic tick that compacts unconditionally repeats that work on every
+/// interval whether or not anything changed.
 #[test]
 fn compacting_twice_without_writes_leaves_the_second_pass_with_nothing_to_do() {
     let mut engine = CrdtEngine::new(1).unwrap();

@@ -153,22 +153,21 @@ pub struct CrdtEngine {
     /// A flush plans and exports under the engine lock, then releases it while
     /// its batch commits. Compaction runs on its own timer and takes the same
     /// lock, so it can land in that window. It leaves the frontier where it was
-    /// but discards the history behind it, which invalidates both the base on
-    /// disk and any update exported from the old frontier — precisely what
-    /// [`CrdtEngine::compact_history`] drops the marks for. Acknowledging the
-    /// in-flight write by frontier alone would put those marks straight back,
-    /// leaving the collection recorded as persisted in a form that no longer
-    /// describes it. Each write carries the epoch it was planned at and is
-    /// applied only while that still matches.
+    /// but discards the history behind it. A collection whose marks compaction
+    /// drops must stay unmarked until a fresh checkpoint lands, and
+    /// [`CrdtEngine::compact_history`] defers any collection whose persisted
+    /// frontier is behind. Acknowledging the in-flight write by frontier alone
+    /// would put dropped marks straight back, leaving the collection recorded
+    /// as persisted in a form that no longer describes it. Each write carries
+    /// the epoch it was planned at and is applied only while that still
+    /// matches.
     pub(in crate::engine::crdt) state_epochs: HashMap<String, u64>,
     /// Each collection's oplog frontier as of its last history compaction.
     ///
     /// Compaction discards history behind the frontier, so a collection whose
     /// frontier has not moved since has no new history to discard and must be
-    /// left alone. Compacting it anyway is not merely wasted work: it drops the
-    /// collection's checkpoint marks, which forces the next flush to rewrite
-    /// its whole base snapshot. On a periodic tick over an idle store that
-    /// rewrites every collection, every tick, forever.
+    /// left alone. Compacting it anyway rebuilds the document and its field
+    /// indexes for nothing, on every periodic tick over an idle store.
     pub(in crate::engine::crdt) compacted_versions: HashMap<String, loro::VersionVector>,
     /// Pending deltas whose stored form is not known to match the queue, each
     /// with the revision of the entry that made it dirty.

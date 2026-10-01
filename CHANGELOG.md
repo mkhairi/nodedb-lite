@@ -76,6 +76,18 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `compact_crdt_history()` no longer forces a full snapshot rewrite of every
+  compacted collection. It used to drop each collection's persistence marks,
+  so the next flush wrote every compacted collection as a full Loro snapshot
+  in one commit. On a store compacting every 30 minutes that was 250-500 MB
+  per run, more than pagedb reuses per commit, and the file grew 400-600 MB an
+  hour. A collection persisted at its current frontier now keeps its marks:
+  the next flush writes only the update since that frontier, and disk history
+  is trimmed at the next checkpoint the updates earn. A collection with
+  operations not yet flushed is skipped and compacted on a later call, once
+  a flush has caught it up. A collection never persisted compacts as before.
+  Compaction still writes nothing to storage. No on-disk format change.
+
 - A reopened or lazily reloaded HNSW index no longer attaches the wrong
   vector to its nodes. The vector segment was built from the durable rows in
   document-id key order, but the graph numbers nodes in insertion order. When

@@ -26,6 +26,8 @@ mod spill;
 pub mod types;
 
 #[cfg(test)]
+mod compaction_tests;
+#[cfg(test)]
 mod field_index_tests;
 #[cfg(test)]
 mod flush_ack_tests;

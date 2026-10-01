@@ -147,7 +147,9 @@ impl CrdtEngine {
     /// A write whose collection was compacted between the plan and the commit
     /// is discarded rather than recorded: the bytes on disk describe a document
     /// that no longer exists, and the marks compaction dropped must stay
-    /// dropped so the next flush writes a fresh checkpoint.
+    /// dropped so the next flush writes a fresh checkpoint. A kept-marks
+    /// collection never has a write in flight when it is compacted, so only the
+    /// no-base path reaches the epoch-mismatch branch.
     ///
     /// Call only after the batch has committed — see [`Self::plan_persistence`].
     pub fn mark_persisted(&mut self, persisted: impl IntoIterator<Item = CrdtPersisted>) {
