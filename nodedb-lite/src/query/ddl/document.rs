@@ -7,8 +7,9 @@ use nodedb_types::value::Value;
 
 use crate::engine::document::history::ops::set_bitemporal;
 use crate::error::LiteError;
+use crate::query::document_ops::index_spec::index_spec_drop_all_ops;
 use crate::query::engine::LiteQueryEngine;
-use crate::storage::engine::StorageEngine;
+use crate::storage::engine::{StorageEngine, WriteOp};
 
 impl<S: StorageEngine> LiteQueryEngine<S> {
     /// Handle: `CREATE COLLECTION <name> WITH (bitemporal=true)`
@@ -83,9 +84,13 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             .map_err(|_| LiteError::LockPoisoned)?
             .drop_collection(name);
 
-        let key = format!("collection:{name}");
+        let mut ops = vec![WriteOp::Delete {
+            ns: nodedb_types::Namespace::Meta,
+            key: format!("collection:{name}").into_bytes(),
+        }];
+        ops.extend(index_spec_drop_all_ops(self.storage.as_ref(), name).await?);
         self.storage
-            .delete(nodedb_types::Namespace::Meta, key.as_bytes())
+            .batch_write(&ops)
             .await
             .map_err(|e| LiteError::Query(format!("storage: {e}")))?;
 

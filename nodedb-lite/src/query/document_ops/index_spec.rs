@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Persisted secondary-index specs for schemaless document collections.
+//!
+//! `CREATE INDEX` on a schemaless collection writes one spec record to the
+//! Meta namespace under `index_spec:{collection}:{field}`. `field` is stored in the
+//! planner's canonical JSON-path form (`$.scope`), the form the index-lookup
+//! rewrite compares against. The SQL catalog reads the records back and lists
+//! them on the collection's `CollectionInfo`. A store written before specs
+//! existed holds none and opens unchanged.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use nodedb_sql::types::{EngineType, IndexSpec, IndexState, SqlCatalog};
+use nodedb_types::Namespace;
+
+use crate::error::LiteError;
+use crate::query::catalog::LiteCatalog;
+use crate::query::engine::LiteQueryEngine;
+use crate::storage::engine::{StorageEngine, WriteOp};
+
+/// Meta-namespace key prefix for index spec records.
+const META_INDEX_SPEC_PREFIX: &str = "index_spec:";
+
+/// Build state of a persisted index. Only `Ready` lets the planner rewrite an
+/// equality into an index lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedIndexState {
+    Building,
+    Ready,
+}
+
+/// One persisted index spec, encoded as JSON like `CollectionMeta`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedIndexSpec {
+    collection: String,
+    name: String,
+    /// Canonical JSON-path form, for example `$.scope`.
+    field: String,
+    unique: bool,
+    case_insensitive: bool,
+    /// Partial-index predicate as SQL text. The planner rejects partial
+    /// indexes today, so this is always `None`.
+    predicate: Option<String>,
+    state: PersistedIndexState,
+}
+
+impl PersistedIndexSpec {
+    fn to_planner(&self) -> IndexSpec {
+        IndexSpec {
+            name: self.name.clone(),
+            field: self.field.clone(),
+            unique: self.unique,
+            case_insensitive: self.case_insensitive,
+            state: match self.state {
+                PersistedIndexState::Building => IndexState::Building,
+                PersistedIndexState::Ready => IndexState::Ready,
+            },
+            predicate: self.predicate.clone(),
+        }
+    }
+}
+
+/// Canonical index field form. Must match the private `canonical_index_field`
+/// in `nodedb-sql` (`engine_rules/index_lookup.rs`): a path that starts with
+/// `$` is kept, a bare name `f` becomes `$.f`. The planner compares an index
+/// spec's field against that form, so a drift here disables index lookups.
+fn canonical_index_field(field: &str) -> String {
+    if field.starts_with('$') {
+        field.to_string()
+    } else {
+        format!("$.{field}")
+    }
+}
+
+fn spec_key(collection: &str, canonical_field: &str) -> String {
+    format!("{META_INDEX_SPEC_PREFIX}{collection}:{canonical_field}")
+}
+
+/// An index spec record ready to write, produced by [`prepare_index_spec`].
+pub(crate) struct PendingIndexSpec {
+    key: String,
+    bytes: Vec<u8>,
+}
+
+/// Build the spec record for a `CREATE INDEX` when the target is a schemaless
+/// document collection. Other engines get no spec record (`None`).
+///
+/// Reads the key first and writes nothing, so the caller can refuse a
+/// duplicate before any side effect. An existing spec is an error unless
+/// `if_not_exists`, which returns `None` and keeps the existing record.
+///
+/// The spec is stored as `Building`: the planner does not rewrite queries
+/// to an index lookup until it is marked `Ready`.
+pub(crate) async fn prepare_index_spec<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    index_name: Option<&str>,
+    collection: &str,
+    field: &str,
+    unique: bool,
+    case_insensitive: bool,
+    if_not_exists: bool,
+) -> Result<Option<PendingIndexSpec>, LiteError> {
+    if !is_schemaless_document(engine, collection).await? {
+        return Ok(None);
+    }
+    let canonical = canonical_index_field(field);
+    let key = spec_key(collection, &canonical);
+    if let Some(existing) = engine.storage.get(Namespace::Meta, key.as_bytes()).await? {
+        if if_not_exists {
+            return Ok(None);
+        }
+        let existing: PersistedIndexSpec =
+            sonic_rs::from_slice(&existing).map_err(|e| LiteError::Serialization {
+                detail: format!("decode index spec: {e}"),
+            })?;
+        return Err(LiteError::Query(format!(
+            "index on {collection}({field}) already exists as {}",
+            existing.name
+        )));
+    }
+    let default_name = || {
+        let bare = canonical.strip_prefix("$.").unwrap_or(&canonical);
+        format!("idx_{collection}_{bare}")
+    };
+    let spec = PersistedIndexSpec {
+        collection: collection.to_string(),
+        name: index_name.map_or_else(default_name, str::to_string),
+        field: canonical.clone(),
+        unique,
+        case_insensitive,
+        predicate: None,
+        state: PersistedIndexState::Building,
+    };
+    let bytes = sonic_rs::to_vec(&spec).map_err(|e| LiteError::Serialization {
+        detail: format!("encode index spec: {e}"),
+    })?;
+    Ok(Some(PendingIndexSpec { key, bytes }))
+}
+
+/// Write a spec record built by [`prepare_index_spec`].
+pub(crate) async fn write_index_spec<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    pending: PendingIndexSpec,
+) -> Result<(), LiteError> {
+    engine
+        .storage
+        .put(Namespace::Meta, pending.key.as_bytes(), &pending.bytes)
+        .await
+}
+
+/// Resolve `collection` through the SQL catalog. A collection no engine knows
+/// yet counts as schemaless: Lite registers a schemaless collection on its
+/// first write.
+async fn is_schemaless_document<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    collection: &str,
+) -> Result<bool, LiteError> {
+    let metas =
+        crate::nodedb::collection::ddl::load_persisted_collection_metas(engine.storage.as_ref())
+            .await
+            .map_err(|e| LiteError::Storage {
+                detail: e.to_string(),
+            })?;
+    let catalog = LiteCatalog::new(
+        Arc::clone(&engine.crdt),
+        Arc::clone(&engine.strict),
+        Arc::clone(&engine.columnar),
+        metas,
+    );
+    let info = catalog
+        .get_collection(nodedb_types::DatabaseId::DEFAULT, collection)
+        .map_err(|e| LiteError::Query(e.to_string()))?;
+    Ok(info.is_none_or(|i| i.engine == EngineType::DocumentSchemaless))
+}
+
+/// Delete ops for the spec records a `DROP INDEX` names.
+///
+/// With a collection, a spec matches by index name or by field. Without one,
+/// a spec in any collection matches by index name only.
+pub(crate) async fn index_spec_drop_ops<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    collection: &str,
+    name_or_field: &str,
+) -> Result<Vec<WriteOp>, LiteError> {
+    let prefix = if collection.is_empty() {
+        META_INDEX_SPEC_PREFIX.to_string()
+    } else {
+        format!("{META_INDEX_SPEC_PREFIX}{collection}:")
+    };
+    let pairs = engine
+        .storage
+        .scan_prefix(Namespace::Meta, prefix.as_bytes())
+        .await?;
+    let canonical = canonical_index_field(name_or_field);
+    let mut ops = Vec::new();
+    for (key, value) in pairs {
+        // The Meta namespace holds other key families under the same prefix
+        // bytes. A record that does not decode as a spec is not one.
+        let Ok(spec) = sonic_rs::from_slice::<PersistedIndexSpec>(&value) else {
+            continue;
+        };
+        let matches = if collection.is_empty() {
+            spec.name == name_or_field
+        } else {
+            spec.collection == collection && (spec.name == name_or_field || spec.field == canonical)
+        };
+        if matches {
+            ops.push(WriteOp::Delete {
+                ns: Namespace::Meta,
+                key,
+            });
+        }
+    }
+    Ok(ops)
+}
+
+/// Delete ops for every spec record of `collection`, for `DROP COLLECTION`.
+pub(crate) async fn index_spec_drop_all_ops<S: StorageEngine>(
+    storage: &S,
+    collection: &str,
+) -> Result<Vec<WriteOp>, LiteError> {
+    let prefix = format!("{META_INDEX_SPEC_PREFIX}{collection}:");
+    let pairs = storage
+        .scan_prefix(Namespace::Meta, prefix.as_bytes())
+        .await?;
+    Ok(pairs
+        .into_iter()
+        .map(|(key, _)| WriteOp::Delete {
+            ns: Namespace::Meta,
+            key,
+        })
+        .collect())
+}
+
+/// Load every persisted index spec, grouped by collection name, in the
+/// planner's `IndexSpec` form.
+pub(crate) async fn load_index_specs<S: StorageEngine>(
+    storage: &S,
+) -> Result<HashMap<String, Vec<IndexSpec>>, LiteError> {
+    let pairs = storage
+        .scan_prefix(Namespace::Meta, META_INDEX_SPEC_PREFIX.as_bytes())
+        .await?;
+    let mut map: HashMap<String, Vec<IndexSpec>> = HashMap::new();
+    for (key, value) in &pairs {
+        // Skip records that are not specs, as the collection-meta loader does.
+        match sonic_rs::from_slice::<PersistedIndexSpec>(value) {
+            Ok(spec) => map
+                .entry(spec.collection.clone())
+                .or_default()
+                .push(spec.to_planner()),
+            Err(e) => tracing::warn!(
+                key = %String::from_utf8_lossy(key),
+                error = %e,
+                "index spec decode failed; skipping record"
+            ),
+        }
+    }
+    Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PagedbStorageMem;
+
+    #[test]
+    fn canonical_index_field_forms() {
+        assert_eq!(canonical_index_field("scope"), "$.scope");
+        assert_eq!(canonical_index_field("$.a.b"), "$.a.b");
+        assert_eq!(canonical_index_field("a.b"), "$.a.b");
+    }
+
+    #[tokio::test]
+    async fn loader_skips_non_spec_record_under_prefix() {
+        let storage = PagedbStorageMem::open_in_memory().await.unwrap();
+        storage
+            .put(
+                Namespace::Meta,
+                format!("{META_INDEX_SPEC_PREFIX}notes:junk").as_bytes(),
+                b"not json",
+            )
+            .await
+            .unwrap();
+        let specs = load_index_specs(&storage).await.unwrap();
+        assert!(specs.is_empty());
+    }
+}

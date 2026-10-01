@@ -30,6 +30,13 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   FtsSurrogates}`. `spatial_rtree_key(collection, field)` builds the key a
   `SpatialRtree` is tracked under. `FTS_SURROGATES_KEY` is the key
   `FtsSurrogates` is tracked under.
+- `CREATE INDEX` on a schemaless document collection persists the index spec
+  in the Meta namespace under `index_spec:{collection}:{field}`. The SQL catalog lists
+  it on the collection, with the field in JSON-path form (`$.scope`).
+  `DROP INDEX` and `DROP COLLECTION` remove it. A duplicate `CREATE INDEX`
+  on the same field errors unless `IF NOT EXISTS` is given. The spec stays `Building`, so queries still plan as
+  full scans. Stores written before this change hold no specs and open
+  unchanged.
 
 ### Fixed
 

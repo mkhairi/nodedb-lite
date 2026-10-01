@@ -3,7 +3,8 @@
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
 use super::super::{LockExt, NodeDbLite};
-use crate::storage::engine::StorageEngine;
+use crate::query::document_ops::index_spec::index_spec_drop_all_ops;
+use crate::storage::engine::{StorageEngine, WriteOp};
 
 /// Collection metadata stored in the KV store.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -151,11 +152,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
             fts.drop_collection(name);
         }
 
-        // Delete collection metadata from the KV store.
-        let key = format!("collection:{name}");
-        self.storage
-            .delete(nodedb_types::Namespace::Meta, key.as_bytes())
-            .await?;
+        // Delete collection metadata and index specs from the KV store.
+        let mut ops = vec![WriteOp::Delete {
+            ns: nodedb_types::Namespace::Meta,
+            key: format!("collection:{name}").into_bytes(),
+        }];
+        ops.extend(index_spec_drop_all_ops(self.storage.as_ref(), name).await?);
+        self.storage.batch_write(&ops).await?;
         Ok(())
     }
 

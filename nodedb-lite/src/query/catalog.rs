@@ -36,6 +36,9 @@ pub struct LiteCatalog<S: StorageEngine> {
     /// planning. The planner refuses table-shaped statements such as
     /// `TRUNCATE` on an array by name.
     array_names: Vec<String>,
+    /// Persisted index specs, keyed by collection name. Loaded by the query
+    /// engine (async) before planning, like `metas`.
+    index_specs: HashMap<String, Vec<IndexSpec>>,
 }
 
 impl<S: StorageEngine> LiteCatalog<S> {
@@ -51,6 +54,7 @@ impl<S: StorageEngine> LiteCatalog<S> {
             columnar,
             metas,
             array_names: Vec::new(),
+            index_specs: HashMap::new(),
         }
     }
 
@@ -58,6 +62,22 @@ impl<S: StorageEngine> LiteCatalog<S> {
     pub fn with_arrays(mut self, array_names: Vec<String>) -> Self {
         self.array_names = array_names;
         self
+    }
+
+    /// Register the persisted index specs the planner can see.
+    pub fn with_index_specs(mut self, index_specs: HashMap<String, Vec<IndexSpec>>) -> Self {
+        self.index_specs = index_specs;
+        self
+    }
+
+    /// Index specs listed on a collection's `CollectionInfo`. Specs persist
+    /// only for schemaless document collections, so every other engine
+    /// lists none.
+    fn indexes_for(&self, name: &str, engine: EngineType) -> Vec<IndexSpec> {
+        if engine != EngineType::DocumentSchemaless {
+            return Vec::new();
+        }
+        self.index_specs.get(name).cloned().unwrap_or_default()
     }
 
     /// Build a `CollectionInfo` from persisted metadata.
@@ -128,7 +148,7 @@ impl<S: StorageEngine> LiteCatalog<S> {
             columns,
             primary_key,
             has_auto_tier: false,
-            indexes: Vec::new(),
+            indexes: self.indexes_for(name, engine),
             bitemporal: desc.bitemporal,
             primary: desc.primary,
             vector_primary: desc.vector_primary.clone(),
@@ -188,7 +208,7 @@ impl<S: StorageEngine> LiteCatalog<S> {
             columns,
             primary_key,
             has_auto_tier: false,
-            indexes: Vec::new(),
+            indexes: self.indexes_for(name, engine),
             bitemporal: meta.bitemporal,
             primary: nodedb_types::PrimaryEngine::Document,
             vector_primary: None,
@@ -276,7 +296,7 @@ impl<S: StorageEngine> SqlCatalog for LiteCatalog<S> {
                 }],
                 primary_key: Some("id".into()),
                 has_auto_tier: false,
-                indexes: Vec::new(),
+                indexes: self.indexes_for(name, EngineType::DocumentSchemaless),
                 bitemporal: false,
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
@@ -392,13 +412,18 @@ fn convert_column_type(ct: &nodedb_types::columnar::ColumnType) -> SqlDataType {
 
 #[cfg(test)]
 mod tests {
+    use nodedb_client::NodeDb;
     use nodedb_types::collection::CollectionType;
     use nodedb_types::collection_config::{PartitionStrategy, PrimaryEngine};
     use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
+    use nodedb_types::document::Document;
     use nodedb_types::id::DatabaseId;
     use nodedb_types::sync::wire::CollectionDescriptor;
+    use nodedb_types::value::Value;
 
     use super::*;
+    #[cfg(not(target_arch = "wasm32"))]
+    use crate::{Encryption, PagedbStorageDefault};
     use crate::{NodeDbLite, PagedbStorageMem};
 
     async fn make_db() -> Arc<NodeDbLite<PagedbStorageMem>> {
@@ -423,9 +448,13 @@ mod tests {
         }
     }
 
-    async fn catalog_for(db: &NodeDbLite<PagedbStorageMem>) -> LiteCatalog<PagedbStorageMem> {
+    async fn catalog_for<S: StorageEngine>(db: &NodeDbLite<S>) -> LiteCatalog<S> {
         let metas =
             crate::nodedb::collection::ddl::load_persisted_collection_metas(db.storage.as_ref())
+                .await
+                .unwrap();
+        let index_specs =
+            crate::query::document_ops::index_spec::load_index_specs(db.storage.as_ref())
                 .await
                 .unwrap();
         LiteCatalog::new(
@@ -434,6 +463,211 @@ mod tests {
             Arc::clone(&db.columnar),
             metas,
         )
+        .with_index_specs(index_specs)
+    }
+
+    /// Write one schemaless document so the CRDT engine knows `collection`.
+    async fn put_scoped_doc<S: StorageEngine>(db: &NodeDbLite<S>, collection: &str) {
+        let mut doc = Document::new("d1");
+        doc.set("scope", Value::String("team-a".into()));
+        db.document_put(collection, doc).await.unwrap();
+    }
+
+    /// Check that `info` lists exactly the index `CREATE INDEX idx_notes_scope
+    /// ON notes (scope)` creates, in the planner's canonical field form.
+    fn assert_lists_scope_index(info: &CollectionInfo) {
+        assert_eq!(info.engine, EngineType::DocumentSchemaless);
+        assert_eq!(info.indexes.len(), 1, "one index spec listed");
+        let idx = &info.indexes[0];
+        assert_eq!(idx.name, "idx_notes_scope");
+        assert_eq!(idx.field, "$.scope", "field in canonical JSON-path form");
+        assert!(!idx.unique);
+        assert!(!idx.case_insensitive);
+        assert!(idx.predicate.is_none());
+        // Postings are not maintained on writes yet, so the planner must not
+        // rewrite queries to an index lookup.
+        assert_eq!(idx.state, IndexState::Building);
+    }
+
+    /// `CREATE INDEX` on a schemaless collection lists the index spec on the
+    /// collection's `CollectionInfo`. Before specs were persisted the catalog
+    /// always listed no indexes, so this assertion failed.
+    #[tokio::test]
+    async fn catalog_lists_index_after_create_index() {
+        let db = make_db().await;
+        put_scoped_doc(&db, "notes").await;
+        db.execute_sql("CREATE INDEX idx_notes_scope ON notes (scope)", &[])
+            .await
+            .unwrap();
+
+        let catalog = catalog_for(&db).await;
+        let info = catalog
+            .get_collection(DatabaseId::new(1), "notes")
+            .unwrap()
+            .expect("collection surfaced");
+        assert_lists_scope_index(&info);
+
+        db.execute_sql("DROP INDEX idx_notes_scope ON notes", &[])
+            .await
+            .unwrap();
+        let catalog = catalog_for(&db).await;
+        let info = catalog
+            .get_collection(DatabaseId::new(1), "notes")
+            .unwrap()
+            .expect("collection surfaced");
+        assert!(info.indexes.is_empty(), "DROP INDEX removes the spec");
+    }
+
+    /// A duplicate `CREATE INDEX` on the same field errors before any write,
+    /// and `IF NOT EXISTS` keeps the existing spec untouched.
+    #[tokio::test]
+    async fn duplicate_create_index_is_refused() {
+        let db = make_db().await;
+        put_scoped_doc(&db, "notes").await;
+        db.execute_sql("CREATE INDEX idx_notes_scope ON notes (scope)", &[])
+            .await
+            .unwrap();
+
+        let err = db
+            .execute_sql("CREATE INDEX other_name ON notes (scope)", &[])
+            .await
+            .expect_err("duplicate refused");
+        assert!(
+            err.to_string()
+                .contains("already exists as idx_notes_scope")
+        );
+
+        db.execute_sql(
+            "CREATE INDEX IF NOT EXISTS other_name ON notes (scope)",
+            &[],
+        )
+        .await
+        .unwrap();
+        let catalog = catalog_for(&db).await;
+        let info = catalog
+            .get_collection(DatabaseId::new(1), "notes")
+            .unwrap()
+            .expect("collection surfaced");
+        assert_lists_scope_index(&info);
+    }
+
+    /// `DROP COLLECTION` removes the collection's index specs.
+    #[tokio::test]
+    async fn drop_collection_removes_index_specs() {
+        let db = make_db().await;
+        db.execute_sql("CREATE COLLECTION notes", &[])
+            .await
+            .unwrap();
+        put_scoped_doc(&db, "notes").await;
+        db.execute_sql("CREATE INDEX idx_notes_scope ON notes (scope)", &[])
+            .await
+            .unwrap();
+        assert!(
+            crate::query::document_ops::index_spec::load_index_specs(db.storage.as_ref())
+                .await
+                .unwrap()
+                .contains_key("notes")
+        );
+
+        db.execute_sql("DROP COLLECTION notes", &[]).await.unwrap();
+
+        let specs = crate::query::document_ops::index_spec::load_index_specs(db.storage.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            !specs.contains_key("notes"),
+            "specs removed with collection"
+        );
+        let catalog = catalog_for(&db).await;
+        let listed = catalog
+            .get_collection(DatabaseId::new(1), "notes")
+            .unwrap()
+            .map(|i| i.indexes)
+            .unwrap_or_default();
+        assert!(listed.is_empty());
+    }
+
+    /// `NodeDbLite::drop_collection` removes the collection's index specs.
+    #[tokio::test]
+    async fn api_drop_collection_removes_index_specs() {
+        let db = make_db().await;
+        put_scoped_doc(&db, "notes").await;
+        db.execute_sql("CREATE INDEX idx_notes_scope ON notes (scope)", &[])
+            .await
+            .unwrap();
+
+        db.drop_collection("notes").await.unwrap();
+
+        let specs = crate::query::document_ops::index_spec::load_index_specs(db.storage.as_ref())
+            .await
+            .unwrap();
+        assert!(!specs.contains_key("notes"));
+    }
+
+    /// A strict collection persists no index spec: specs exist only for
+    /// schemaless document collections.
+    #[tokio::test]
+    async fn strict_collection_persists_no_index_spec() {
+        let db = make_db().await;
+        db.execute_sql(
+            "CREATE COLLECTION s (id INT PRIMARY KEY, scope TEXT) WITH (engine='document_strict')",
+            &[],
+        )
+        .await
+        .unwrap();
+        // The statement may succeed or be rejected for a strict collection.
+        // Either way no spec record is written.
+        let _outcome = db
+            .execute_sql("CREATE INDEX idx_s_scope ON s (scope)", &[])
+            .await;
+
+        let specs = crate::query::document_ops::index_spec::load_index_specs(db.storage.as_ref())
+            .await
+            .unwrap();
+        assert!(!specs.contains_key("s"));
+        let catalog = catalog_for(&db).await;
+        let info = catalog
+            .get_collection(DatabaseId::new(1), "s")
+            .unwrap()
+            .expect("collection surfaced");
+        assert_eq!(info.engine, EngineType::DocumentStrict);
+        assert!(info.indexes.is_empty());
+    }
+
+    /// The index spec is durable: a reopened database lists it again.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn index_spec_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index_spec.db");
+
+        {
+            let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+                .await
+                .unwrap();
+            let db = NodeDbLite::open(storage).await.unwrap();
+            // The DDL persists collection meta, so the reopened catalog
+            // resolves `notes` without depending on CRDT state replay.
+            db.execute_sql("CREATE COLLECTION notes", &[])
+                .await
+                .unwrap();
+            put_scoped_doc(&db, "notes").await;
+            db.execute_sql("CREATE INDEX idx_notes_scope ON notes (scope)", &[])
+                .await
+                .unwrap();
+            db.flush().await.unwrap();
+        }
+
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .unwrap();
+        let db = NodeDbLite::open(storage).await.unwrap();
+        let catalog = catalog_for(&db).await;
+        let info = catalog
+            .get_collection(DatabaseId::new(1), "notes")
+            .unwrap()
+            .expect("collection surfaced after reopen");
+        assert_lists_scope_index(&info);
     }
 
     /// lite#3 repro: a synced strict collection must surface its REAL engine,

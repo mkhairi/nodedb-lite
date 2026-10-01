@@ -9,6 +9,7 @@ use crate::query::engine::LiteQueryEngine;
 use crate::query::value_utils::{loro_value_to_string, value_to_string};
 use crate::storage::engine::{StorageEngine, WriteOp};
 
+use super::index_spec::index_spec_drop_ops;
 use super::is_strict;
 use super::reads::index_insert_id;
 
@@ -42,7 +43,8 @@ pub async fn register<S: StorageEngine>(
     })
 }
 
-/// DropIndex: remove all sparse-index entries for a field on a collection.
+/// DropIndex: remove all sparse-index entries for a field on a collection,
+/// plus the persisted spec that `field` names by index name or by field.
 pub async fn drop_index<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
@@ -66,6 +68,9 @@ pub async fn drop_index<S: StorageEngine>(
         }
     }
     let count = ops.len() as u64;
+    // The spec records go in the same batch, so the entries and the spec
+    // that lists them are removed together.
+    ops.extend(index_spec_drop_ops(engine, collection, field).await?);
     if !ops.is_empty() {
         engine
             .storage

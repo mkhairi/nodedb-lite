@@ -159,6 +159,13 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             crate::nodedb::collection::ddl::load_persisted_collection_metas(self.storage.as_ref())
                 .await
                 .unwrap_or_default();
+        // A failed load lists no indexes, so queries plan as full scans.
+        let index_specs = super::document_ops::index_spec::load_index_specs(self.storage.as_ref())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "index spec load failed; planning without indexes");
+                Default::default()
+            });
         let array_names: Vec<String> = self
             .array_state
             .lock()
@@ -173,7 +180,8 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             Arc::clone(&self.columnar),
             metas,
         )
-        .with_arrays(array_names);
+        .with_arrays(array_names)
+        .with_index_specs(index_specs);
 
         let sql_params: Vec<nodedb_sql::ParamValue> = params.iter().map(value_to_param).collect();
 
