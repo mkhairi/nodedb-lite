@@ -26,6 +26,11 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// were compacted away. Do not call it on a store that syncs with an
     /// Origin it may still need to reconcile old history with.
     ///
+    /// A collection with writes not yet flushed is skipped. A later call
+    /// compacts it once a flush has caught it up. Call `flush()` first to
+    /// compact every collection in one pass. Compaction writes nothing to
+    /// storage, and the flush after it writes only what changed since.
+    ///
     /// The same operation is reachable as the `TemporalPurgeCrdt` meta-op; this
     /// is the direct entry point for an embedding application that has no SQL
     /// surface.

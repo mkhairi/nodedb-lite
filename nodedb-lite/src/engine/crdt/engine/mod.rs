@@ -30,6 +30,9 @@ mod rotate;
 mod spill;
 pub mod types;
 
+#[cfg(test)]
+mod compaction_tests;
+
 pub use checkpoint::{CrdtPersisted, CrdtWrite, CrdtWriteKind};
 pub use lifecycle::TrackedImport;
 pub use types::{

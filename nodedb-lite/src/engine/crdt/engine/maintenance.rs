@@ -11,29 +11,58 @@ impl CrdtEngine {
     ///
     /// Replaces each internal LoroDoc with a shallow snapshot. Historical
     /// operations are discarded. Current state is fully preserved.
+    ///
+    /// Compaction never writes to storage, and it costs the next flush nothing
+    /// for a collection whose disk form is current. Each collection takes one
+    /// of three paths, decided by its persisted frontier:
+    ///
+    /// - Persisted at exactly the current frontier: compacted, with its
+    ///   persistence marks kept. Base plus updates on disk already replay to
+    ///   this state and version vector. A shallow snapshot keeps every
+    ///   operation after its root, so a later update exported from that
+    ///   frontier still applies on top of the disk form. Disk history is
+    ///   trimmed at the next checkpoint the updates earn on their own.
+    /// - Persisted at an older frontier: deferred, left uncompacted and not
+    ///   recorded as compacted. Its pending update is exported from the older
+    ///   frontier, which compaction can discard. It becomes eligible once a
+    ///   flush records the current frontier.
+    /// - No persisted frontier: compacted, marks dropped. The next flush
+    ///   writes a full checkpoint whether or not compaction runs.
+    ///
+    /// Dropping the marks of a persisted collection instead forced a full
+    /// snapshot of every compacted collection into one commit. A store
+    /// compacting every 30 minutes wrote 250-500 MB per run, more than the
+    /// file reuses per commit, so it grew 400-600 MB an hour.
+    ///
+    /// Crash safety: this function changes only memory. Disk holds exactly
+    /// what the last committed flush wrote, so a crash at any point restores
+    /// that. A kept-marks collection was persisted at its current frontier, so
+    /// restore reproduces the pre-compaction state and loses nothing. The next
+    /// update or checkpoint reaches disk through the normal flush batch.
     pub fn compact_history(&mut self) -> Result<(), LiteError> {
         // Only collections whose frontier has moved since their last
         // compaction. Compaction discards history behind the frontier, so a
         // collection that has taken no operations since has none to discard.
+        // Compacting it again is pure cost: the document is rebuilt.
         //
-        // Skipping them is the whole point. The bookkeeping below forces the
-        // next flush to rewrite a compacted collection's base snapshot, and a
-        // snapshot export is O(document). Doing that for every collection on
-        // every periodic tick rewrote the entire store's snapshot set on a
-        // fixed interval whether anything had changed or not — measured at
-        // ~124 MB every five minutes on an idle dogfood store, none of which
-        // is reclaimed until a restart.
-        let due: Vec<String> = self
+        // The flag records whether the disk form is current at this frontier.
+        let due: Vec<(String, bool)> = self
             .states
             .iter()
-            .filter(|(collection, state)| {
+            .filter_map(|(collection, state)| {
                 let frontier = state.oplog_version_vector();
-                self.compacted_versions.get(*collection) != Some(&frontier)
+                if self.compacted_versions.get(collection) == Some(&frontier) {
+                    return None;
+                }
+                match self.flushed_versions.get(collection) {
+                    Some(flushed) if *flushed == frontier => Some((collection.clone(), true)),
+                    Some(_) => None,
+                    None => Some((collection.clone(), false)),
+                }
             })
-            .map(|(collection, _)| collection.clone())
             .collect();
 
-        for collection in &due {
+        for (collection, persisted_at_frontier) in &due {
             let Some(state) = self.states.get_mut(collection) else {
                 continue;
             };
@@ -42,27 +71,22 @@ impl CrdtEngine {
             })?;
             let frontier = state.oplog_version_vector();
             self.compacted_versions.insert(collection.clone(), frontier);
-        }
 
-        // Compaction rewrites the document without advancing its frontier, so
-        // neither the persisted base nor the updates on top of it describe the
-        // document any more, and the discarded history means an update export
-        // from the old frontier may not even be possible. Dropping both marks
-        // forces a fresh checkpoint, which also deletes the stale updates —
-        // `next_delta_seq` is deliberately kept, since it is the count of the
-        // entries that checkpoint has to delete.
-        //
-        // Advancing the epoch is what keeps a flush that is committing right
-        // now from putting the marks back: its writes were exported from the
-        // document this call just replaced.
-        //
-        // Both are per collection, and only for the ones actually compacted —
-        // clearing the maps wholesale also discarded the marks of collections
-        // this call never touched.
-        for collection in &due {
-            self.flushed_versions.remove(collection);
-            self.checkpoint_bytes.remove(collection);
-            self.delta_bytes.remove(collection);
+            // A collection with no persisted frontier owes a full checkpoint
+            // already. Its marks are absent, and removing all three keeps them
+            // in step. `next_delta_seq` stays: it is the count of updates that
+            // checkpoint has to delete.
+            if !persisted_at_frontier {
+                self.flushed_versions.remove(collection);
+                self.checkpoint_bytes.remove(collection);
+                self.delta_bytes.remove(collection);
+            }
+            // A flush committing right now carries a write exported from the
+            // document this call replaced. The epoch makes its acknowledgement
+            // a no-op, so it cannot record marks for that form. For a
+            // kept-marks collection this is harmless: a flush plans a write
+            // only while the persisted frontier is behind, and such a
+            // collection is deferred above.
             self.advance_state_epoch(collection);
         }
         Ok(())
@@ -89,11 +113,9 @@ mod tests {
 
     /// A second compaction with no writes in between must do nothing at all.
     ///
-    /// Compaction drops a collection's checkpoint marks, which forces the next
-    /// flush to rewrite its whole base snapshot — an O(document) export. A
-    /// periodic tick that compacts unconditionally therefore rewrites the entire
-    /// store's snapshot set on a fixed interval whether or not anything changed,
-    /// which is what grew an idle store by ~124 MB every five minutes.
+    /// Compacting again rebuilds the document for nothing. A periodic tick
+    /// that compacts unconditionally repeats that work on every interval
+    /// whether or not anything changed.
     #[test]
     fn compacting_twice_without_writes_leaves_the_second_pass_with_nothing_to_do() {
         let mut engine = CrdtEngine::new(1).unwrap();
