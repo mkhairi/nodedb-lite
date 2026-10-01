@@ -49,6 +49,17 @@ pub(in crate::query::physical_visitor) fn vector_direct_write<'a, S>(
 where
     S: StorageEngine + 'a,
 {
+    vector_direct_write_coordinated(engine, None, args)
+}
+
+pub(in crate::query::physical_visitor) fn vector_direct_write_coordinated<'a, S>(
+    engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
+    args: DirectWriteArgs,
+) -> Result<LitePhysicalFut<'a>, LiteError>
+where
+    S: StorageEngine + 'a,
+{
     let DirectWriteArgs {
         collection,
         field,
@@ -78,59 +89,73 @@ where
     let crdt = Arc::clone(&engine.crdt);
 
     Ok(Box::pin(async move {
-        let dim = vector.len();
-        // First-insert config (quantization + storage dtype) when absent.
-        vector_state
-            .per_index_config
-            .lock_or_recover()
-            .entry(key.clone())
-            .or_insert_with(|| VectorPrimaryConfig {
-                vector_field: field.clone(),
-                dim: dim as u32,
-                quantization,
-                storage_dtype,
-                ..VectorPrimaryConfig::default()
-            });
-
-        let existing = read_row(&crdt, &collection, &doc_id);
-        let has_conflict_updates = !on_conflict_updates.is_empty();
-        let (row, command): (_, &'static str) = match (intent, existing) {
-            (VectorDirectWriteIntent::Insert, Some(_)) => {
-                return Err(LiteError::UniqueViolation {
-                    collection: collection.clone(),
-                    detail: format!("key '{doc_id}' already exists"),
-                });
-            }
-            (VectorDirectWriteIntent::InsertIfAbsent, Some(_)) => {
-                return Ok(QueryResult {
-                    columns: vec![],
-                    rows: vec![],
-                    rows_affected: 0,
-                    command: Some("INSERT".into()),
-                });
-            }
-            (VectorDirectWriteIntent::Upsert, Some(mut stored)) if has_conflict_updates => {
-                apply_patch(&mut stored, &on_conflict_updates, &incoming)?;
-                (stored, "UPDATE")
-            }
-            (VectorDirectWriteIntent::Upsert, Some(_)) => (incoming, "UPSERT"),
-            (VectorDirectWriteIntent::Insert, None) => (incoming, "INSERT"),
-            (VectorDirectWriteIntent::InsertIfAbsent, None) => (incoming, "INSERT"),
-            (VectorDirectWriteIntent::Upsert, None) if has_conflict_updates => (incoming, "INSERT"),
-            (VectorDirectWriteIntent::Upsert, None) => (incoming, "UPSERT"),
+        let guard = if permit.is_none() {
+            Some(engine.fts_state.admit_mutation().await)
+        } else {
+            None
         };
+        let result = async {
+            let dim = vector.len();
+            // First-insert config (quantization + storage dtype) when absent.
+            vector_state
+                .per_index_config
+                .lock_or_recover()
+                .entry(key.clone())
+                .or_insert_with(|| VectorPrimaryConfig {
+                    vector_field: field.clone(),
+                    dim: dim as u32,
+                    quantization,
+                    storage_dtype,
+                    ..VectorPrimaryConfig::default()
+                });
 
-        // A stored row keeps exactly one live node: binding the new vector
-        // tombstones the old one under the same lock.
-        insert_node(&vector_state, &key, &doc_id, &vector, op_name).await?;
-        write_row(&crdt, &collection, &doc_id, dim, &row, op_name)?;
-        reindex_documents(engine, &collection, [doc_id.as_str()])?;
+            let existing = read_row(&crdt, &collection, &doc_id);
+            let has_conflict_updates = !on_conflict_updates.is_empty();
+            let (row, command): (_, &'static str) = match (intent, existing) {
+                (VectorDirectWriteIntent::Insert, Some(_)) => {
+                    return Err(LiteError::UniqueViolation {
+                        collection: collection.clone(),
+                        detail: format!("key '{doc_id}' already exists"),
+                    });
+                }
+                (VectorDirectWriteIntent::InsertIfAbsent, Some(_)) => {
+                    return Ok(QueryResult {
+                        columns: vec![],
+                        rows: vec![],
+                        rows_affected: 0,
+                        command: Some("INSERT".into()),
+                    });
+                }
+                (VectorDirectWriteIntent::Upsert, Some(mut stored)) if has_conflict_updates => {
+                    apply_patch(&mut stored, &on_conflict_updates, &incoming)?;
+                    (stored, "UPDATE")
+                }
+                (VectorDirectWriteIntent::Upsert, Some(_)) => (incoming, "UPSERT"),
+                (VectorDirectWriteIntent::Insert, None) => (incoming, "INSERT"),
+                (VectorDirectWriteIntent::InsertIfAbsent, None) => (incoming, "INSERT"),
+                (VectorDirectWriteIntent::Upsert, None) if has_conflict_updates => {
+                    (incoming, "INSERT")
+                }
+                (VectorDirectWriteIntent::Upsert, None) => (incoming, "UPSERT"),
+            };
 
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-            rows_affected: 1,
-            command: Some(command.into()),
-        })
+            // A stored row keeps exactly one live node: binding the new vector
+            // tombstones the old one under the same lock.
+            insert_node(&vector_state, &key, &doc_id, &vector, op_name).await?;
+            write_row(&crdt, &collection, &doc_id, dim, &row, op_name)?;
+            reindex_documents(engine, &collection, [doc_id.as_str()])?;
+
+            Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+                rows_affected: 1,
+                command: Some(command.into()),
+            })
+        }
+        .await;
+        match guard {
+            Some(guard) => guard.finish(result),
+            None => result,
+        }
     }))
 }

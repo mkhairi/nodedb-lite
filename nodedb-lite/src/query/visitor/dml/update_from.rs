@@ -13,7 +13,7 @@ use nodedb_types::value::Value;
 
 use crate::error::LiteError;
 use crate::query::document_ops::sets::{collect_ids_pub, fetch_document_value_pub};
-use crate::query::document_ops::writes::point_update;
+use crate::query::document_ops::writes::point_update_admitted;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::value_utils::value_to_string;
 use crate::storage::engine::StorageEngine;
@@ -28,6 +28,7 @@ use super::rows::{convert_assignments, resolve_updates_with_source, result_to_ma
 #[allow(clippy::too_many_arguments)]
 pub(in crate::query::visitor) fn lower_update_from<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     collection: &str,
     _engine_type: EngineType,
     source: &SqlPlan,
@@ -44,7 +45,7 @@ pub(in crate::query::visitor) fn lower_update_from<'a, S: StorageEngine + 'a>(
     let updates = convert_assignments(assignments)?;
 
     Ok(Box::pin(async move {
-        let source_result = engine.execute_plan(&source).await?;
+        let source_result = engine.execute_plan_admitted(&source, Some(permit)).await?;
         let source_maps = result_to_maps(source_result);
 
         let mut source_index: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -70,7 +71,7 @@ pub(in crate::query::visitor) fn lower_update_from<'a, S: StorageEngine + 'a>(
             };
 
             let resolved = resolve_updates_with_source(&updates, &source_val)?;
-            point_update(engine, &target, doc_id, &resolved).await?;
+            point_update_admitted(engine, permit, &target, doc_id, &resolved).await?;
             affected += 1;
         }
 

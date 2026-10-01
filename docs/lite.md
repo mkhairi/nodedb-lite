@@ -75,6 +75,30 @@ Sync features:
 | WASM bundle                           | ~4.5 MB                 |
 | Mobile memory                         | < 100 MB (configurable) |
 
+## Search Index Declarations
+
+Lite SQL supports one anonymous search declaration per document or strict collection.
+
+```sql
+CREATE SEARCH INDEX ON articles (title, body) ANALYZER 'standard' FUZZY false;
+DROP SEARCH INDEX IF EXISTS fts_articles;
+```
+
+| Clause | Behavior |
+| --- | --- |
+| Field list | Indexes selected top-level string fields in existing and future rows. |
+| `ANALYZER` | Uses a registered analyzer name. The default is `standard`. |
+| `FUZZY` | Uses bare `true` or `false`. The default is `false`. |
+| Index name | Uses `fts_<collection>`. Quoted collection names preserve case. |
+| `DROP` | Reindexes every top-level string field with `standard` and `false` defaults. |
+| Collection type | Supports ordinary documents, bitemporal documents, and strict rows. Columnar declarations return an error. |
+
+Declarations persist across reopen, including collections without rows. Duplicate creation returns an error. Missing fields remain eligible for future string values.
+
+Searches continue against the previous index during rebuilding. Coordinated source writes wait for declaration publication. Synchronous mutation APIs return a busy error before mutation.
+
+Cancellation before admission leaves the declaration unchanged. After admission, the owned declaration task completes storage and publication even when its caller cancels. Runtime termination interrupts tasks, and reopening recovers from persisted declarations.
+
 ## FFI and WASM
 
 **C FFI** (`nodedb-lite-ffi`) — 12 extern functions with cbindgen-generated header. Kotlin/JNI bridge for Android.

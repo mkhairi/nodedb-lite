@@ -7,6 +7,7 @@ pub mod indexed;
 pub mod schema;
 #[cfg(test)]
 mod tests;
+mod text_source;
 
 pub use arrow::{column_type_to_arrow, strict_schema_to_arrow};
 pub use engine::StrictEngine;

@@ -20,13 +20,18 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
     /// CRDT store because Lite keeps those as separate engines.
     pub(super) async fn execute_insert(
         &self,
-        collection: &str,
-        engine: &EngineType,
-        route: WriteRoute,
-        rows: &[Vec<(String, SqlValue)>],
-        if_absent: bool,
-        primary_key: Option<&str>,
+        permit: &crate::engine::fts::coordinator::TextMutationPermit,
+        args: nodedb_sql::InsertVisitArgs<'_>,
     ) -> Result<QueryResult, LiteError> {
+        let nodedb_sql::InsertVisitArgs {
+            collection,
+            engine,
+            route,
+            rows,
+            if_absent,
+            primary_key,
+            column_schema: _,
+        } = args;
         match route {
             WriteRoute::ColumnarFamily => {
                 let (result, written) =
@@ -49,8 +54,11 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             }
             WriteRoute::Document => {}
         }
-        if *engine == EngineType::DocumentStrict {
-            return super::strict_dml::insert_strict(self, collection, rows, if_absent).await;
+        if engine == EngineType::DocumentStrict {
+            return super::strict_dml::insert_strict_admitted(
+                self, permit, collection, rows, if_absent,
+            )
+            .await;
         }
         // CRDT / schemaless path.
         let mut crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
@@ -112,6 +120,7 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
 
     pub(super) async fn execute_update(
         &self,
+        permit: &crate::engine::fts::coordinator::TextMutationPermit,
         collection: &str,
         engine: &EngineType,
         assignments: &[(String, nodedb_sql::types::SqlExpr)],
@@ -129,8 +138,9 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             .await;
         }
         if *engine == EngineType::DocumentStrict {
-            return super::strict_dml::update_strict(
+            return super::strict_dml::update_strict_admitted(
                 self,
+                permit,
                 collection,
                 assignments,
                 filters,
@@ -186,6 +196,7 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
 
     pub(super) async fn execute_delete(
         &self,
+        permit: &crate::engine::fts::coordinator::TextMutationPermit,
         collection: &str,
         engine: &EngineType,
         filters: &[Filter],
@@ -196,7 +207,14 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 .await;
         }
         if *engine == EngineType::DocumentStrict {
-            return super::strict_dml::delete_strict(self, collection, filters, target_keys).await;
+            return super::strict_dml::delete_strict_admitted(
+                self,
+                permit,
+                collection,
+                filters,
+                target_keys,
+            )
+            .await;
         }
         let targets = document_targets(self, collection, filters, target_keys)?;
         // CRDT / schemaless path.

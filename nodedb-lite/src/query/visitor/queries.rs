@@ -132,6 +132,7 @@ fn encode_result_msgpack(result: &QueryResult) -> Result<Vec<u8>, LiteError> {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_aggregate<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     input: &SqlPlan,
     group_by: &[SqlExpr],
     aggregates: &[AggregateExpr],
@@ -180,7 +181,7 @@ pub(super) fn lower_aggregate<'a, S: StorageEngine + 'a>(
         .collect();
 
     Ok(Box::pin(async move {
-        let source_result = engine.execute_plan(&input).await?;
+        let source_result = engine.execute_plan_admitted(&input, permit).await?;
         let rows = result_to_maps(source_result);
         let result = execute_aggregate(rows, &group_cols, &agg_specs, &[], &[], &sort_pairs, &gs)?;
         Ok(apply_having_result(result, &having_post, &agg_alias_map))
@@ -192,6 +193,7 @@ pub(super) fn lower_aggregate<'a, S: StorageEngine + 'a>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_join<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     left: &SqlPlan,
     right: &SqlPlan,
     on: &[(String, String)],
@@ -211,8 +213,8 @@ pub(super) fn lower_join<'a, S: StorageEngine + 'a>(
     let post_filters_bytes = encode_filters(filters)?;
 
     Ok(Box::pin(async move {
-        let left_result = engine.execute_plan(&left).await?;
-        let right_result = engine.execute_plan(&right).await?;
+        let left_result = engine.execute_plan_admitted(&left, permit).await?;
+        let right_result = engine.execute_plan_admitted(&right, permit).await?;
 
         let left_bytes = encode_result_msgpack(&left_result)?;
         let right_bytes = encode_result_msgpack(&right_result)?;
@@ -322,7 +324,7 @@ pub(super) fn lower_range_scan<'a, S: StorageEngine + 'a>(
         rls_filters: Vec::new(),
     };
 
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.document(&op)?;
 
     Ok(Box::pin(fut))
@@ -340,6 +342,7 @@ pub(super) fn lower_range_scan<'a, S: StorageEngine + 'a>(
 /// validation pass.
 pub(super) fn lower_cte<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     definitions: &[(String, SqlPlan)],
     outer: &SqlPlan,
 ) -> Result<LiteFut<'a>, LiteError> {
@@ -348,9 +351,9 @@ pub(super) fn lower_cte<'a, S: StorageEngine + 'a>(
 
     Ok(Box::pin(async move {
         for (_name, def_plan) in &definitions {
-            let _ = engine.execute_plan(def_plan).await?;
+            let _ = engine.execute_plan_admitted(def_plan, permit).await?;
         }
-        engine.execute_plan(&outer).await
+        engine.execute_plan_admitted(&outer, permit).await
     }))
 }
 
@@ -367,6 +370,7 @@ pub(super) fn lower_cte<'a, S: StorageEngine + 'a>(
 /// there is no gather step: the body already produces the full row stream.
 pub(super) fn lower_subquery<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     args: SubqueryVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
     let SubqueryVisitArgs {
@@ -386,7 +390,7 @@ pub(super) fn lower_subquery<'a, S: StorageEngine + 'a>(
     let sort_keys = sort_keys.to_vec();
 
     Ok(Box::pin(async move {
-        let mut result = engine.execute_plan(&input).await?;
+        let mut result = engine.execute_plan_admitted(&input, permit).await?;
 
         filter_rows(&mut result, &filters)?;
 

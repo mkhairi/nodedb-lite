@@ -69,21 +69,22 @@ const ARRAY_REFUSAL: &str = "TRUNCATE is not supported on the array engine: \
 
 /// Clear `collection` through the engine `engine_type` names. Exhaustive
 /// over `EngineType`: a new engine is a compile error here.
-pub(crate) async fn truncate_engine<S: StorageEngine>(
+pub(crate) async fn truncate_engine_coordinated<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
     collection: &str,
     engine_type: EngineType,
 ) -> Result<QueryResult, LiteError> {
     match engine_type {
         EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
-            document_ops::writes::truncate(engine, collection).await
+            document_ops::writes::truncate_coordinated(engine, permit, collection).await
         }
         // Records a delete of every key for the sync push to Origin.
         EngineType::KeyValue => kv_ops::sync_capture::truncate_recorded(engine, collection).await,
         // Lite keeps spatial rows in the columnar engine under the spatial
         // profile; the columnar clear also empties the R-tree entries.
         EngineType::Columnar | EngineType::Spatial => {
-            columnar_ops::writes::truncate(engine, collection).await
+            columnar_ops::writes::truncate_coordinated(engine, permit, collection).await
         }
         EngineType::Timeseries => timeseries_ops::truncate::truncate(engine, collection).await,
         EngineType::Array => Err(LiteError::Unsupported {
@@ -134,7 +135,7 @@ mod tests {
     #[tokio::test]
     async fn array_engine_is_refused_naming_drop_array() {
         let engine = test_engine().await;
-        let err = truncate_engine(&engine, "grid", EngineType::Array)
+        let err = truncate_engine_coordinated(&engine, None, "grid", EngineType::Array)
             .await
             .expect_err("array truncate is refused");
         assert!(err.to_string().contains("DROP ARRAY"), "{err}");

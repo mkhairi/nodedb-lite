@@ -33,6 +33,7 @@ use crate::storage::engine::StorageEngine;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_lateral_top_k_sql<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
     outer_sql: &SqlPlan,
     outer_alias: &str,
     inner_collection: &str,
@@ -44,7 +45,7 @@ pub(crate) async fn execute_lateral_top_k_sql<S: StorageEngine>(
     projection: &[JoinProjection],
     left_join: bool,
 ) -> Result<QueryResult, LiteError> {
-    let outer_result = engine.execute_plan(outer_sql).await?;
+    let outer_result = engine.execute_plan_admitted(outer_sql, permit).await?;
     let outer_rows = rows_to_maps(outer_result);
     let base_inner_filters = decode_filters(inner_filters)?;
     let effective_limit = if inner_limit == 0 {
@@ -178,7 +179,7 @@ pub(crate) async fn execute_nested_plan<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     plan: &PhysicalPlan,
 ) -> Result<Vec<HashMap<String, Value>>, LiteError> {
-    let mut visitor = LiteDataPlaneVisitor { engine };
+    let mut visitor = LiteDataPlaneVisitor::new(engine);
     let fut = nodedb_physical::dispatch(&mut visitor, plan)?;
     let result = fut.await?;
     Ok(rows_to_maps(result))

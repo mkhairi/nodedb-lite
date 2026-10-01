@@ -65,26 +65,51 @@ pub(in crate::query::physical_visitor) fn vector_direct_delete<'a, S>(
 where
     S: StorageEngine + 'a,
 {
+    vector_direct_delete_coordinated(engine, None, collection, field, targets)
+}
+
+pub(in crate::query::physical_visitor) fn vector_direct_delete_coordinated<'a, S>(
+    engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: String,
+    field: String,
+    targets: VectorWriteTargets,
+) -> LitePhysicalFut<'a>
+where
+    S: StorageEngine + 'a,
+{
     let key = index_key(&collection, &field);
     let vector_state = Arc::clone(&engine.vector_state);
     let crdt = Arc::clone(&engine.crdt);
     Box::pin(async move {
-        let hits = resolve_targets(&crdt, &collection, &targets)?;
-        let mut removed = 0u64;
-        for (doc_id, _) in hits {
-            remove_live_node(&vector_state, &key, &doc_id).await?;
-            remove_durable(&vector_state, &key, &doc_id, "DirectDelete").await?;
-            if delete_row(&crdt, &collection, &doc_id, "DirectDelete")? {
-                removed += 1;
+        let guard = if permit.is_none() {
+            Some(engine.fts_state.admit_mutation().await)
+        } else {
+            None
+        };
+        let result = async {
+            let hits = resolve_targets(&crdt, &collection, &targets)?;
+            let mut removed = 0u64;
+            for (doc_id, _) in hits {
+                remove_live_node(&vector_state, &key, &doc_id).await?;
+                remove_durable(&vector_state, &key, &doc_id, "DirectDelete").await?;
+                if delete_row(&crdt, &collection, &doc_id, "DirectDelete")? {
+                    removed += 1;
+                }
+                reindex_documents(engine, &collection, [doc_id.as_str()])?;
             }
-            reindex_documents(engine, &collection, [doc_id.as_str()])?;
+            Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+                rows_affected: removed,
+                command: Some("DELETE".into()),
+            })
         }
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-            rows_affected: removed,
-            command: Some("DELETE".into()),
-        })
+        .await;
+        match guard {
+            Some(guard) => guard.finish(result),
+            None => result,
+        }
     })
 }
 
@@ -109,6 +134,17 @@ pub(in crate::query::physical_visitor) fn vector_direct_update<'a, S>(
 where
     S: StorageEngine + 'a,
 {
+    vector_direct_update_coordinated(engine, None, args)
+}
+
+pub(in crate::query::physical_visitor) fn vector_direct_update_coordinated<'a, S>(
+    engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
+    args: DirectUpdateArgs,
+) -> Result<LitePhysicalFut<'a>, LiteError>
+where
+    S: StorageEngine + 'a,
+{
     let DirectUpdateArgs {
         collection,
         field,
@@ -127,31 +163,43 @@ where
     let vector_state = Arc::clone(&engine.vector_state);
     let crdt = Arc::clone(&engine.crdt);
     Ok(Box::pin(async move {
-        let hits = resolve_targets(&crdt, &collection, &targets)?;
-        let mut updated = 0u64;
-        for (doc_id, mut row) in hits {
-            let dim = match &new_vector {
-                Some(vector) => {
-                    // Binding the new vector tombstones the old node.
-                    insert_node(&vector_state, &key, &doc_id, vector, "DirectUpdate").await?;
-                    vector.len()
-                }
-                None => stored_dim(&row),
-            };
-            // The patch never targets the vector column: the planner routes
-            // that assignment through `new_vector`.
-            let excluded = HashMap::new();
-            apply_patch(&mut row, &payload_patch, &excluded)?;
-            write_row(&crdt, &collection, &doc_id, dim, &row, "DirectUpdate")?;
-            reindex_documents(engine, &collection, [doc_id.as_str()])?;
-            updated += 1;
+        let guard = if permit.is_none() {
+            Some(engine.fts_state.admit_mutation().await)
+        } else {
+            None
+        };
+        let result = async {
+            let hits = resolve_targets(&crdt, &collection, &targets)?;
+            let mut updated = 0u64;
+            for (doc_id, mut row) in hits {
+                let dim = match &new_vector {
+                    Some(vector) => {
+                        // Binding the new vector tombstones the old node.
+                        insert_node(&vector_state, &key, &doc_id, vector, "DirectUpdate").await?;
+                        vector.len()
+                    }
+                    None => stored_dim(&row),
+                };
+                // The patch never targets the vector column: the planner routes
+                // that assignment through `new_vector`.
+                let excluded = HashMap::new();
+                apply_patch(&mut row, &payload_patch, &excluded)?;
+                write_row(&crdt, &collection, &doc_id, dim, &row, "DirectUpdate")?;
+                reindex_documents(engine, &collection, [doc_id.as_str()])?;
+                updated += 1;
+            }
+            Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+                rows_affected: updated,
+                command: Some("UPDATE".into()),
+            })
         }
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-            rows_affected: updated,
-            command: Some("UPDATE".into()),
-        })
+        .await;
+        match guard {
+            Some(guard) => guard.finish(result),
+            None => result,
+        }
     }))
 }
 

@@ -20,6 +20,29 @@ pub async fn truncate<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
 ) -> Result<QueryResult, LiteError> {
+    truncate_coordinated(engine, None, collection).await
+}
+
+pub(crate) async fn truncate_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: &str,
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return truncate_admitted(engine, permit, collection).await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result = truncate_admitted(engine, guard.permit(), collection).await;
+    guard.finish(result)
+}
+
+pub(crate) async fn truncate_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    collection: &str,
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
+    crate::engine::fts::checkpoint::persist_checkpoint_incomplete(&*engine.storage).await?;
     engine.columnar.truncate(collection).await?;
     clear_overlays(engine, collection)?;
     Ok(truncated())
@@ -32,12 +55,15 @@ pub(crate) fn clear_overlays<S: StorageEngine>(
     collection: &str,
 ) -> Result<(), LiteError> {
     clear_spatial(engine, collection)?;
-    engine
-        .fts_state
-        .manager
-        .lock()
-        .map_err(|_| LiteError::LockPoisoned)?
-        .drop_collection(collection);
+    {
+        let mut manager = engine
+            .fts_state
+            .manager
+            .lock()
+            .map_err(|_| LiteError::LockPoisoned)?;
+        manager.remove_collection_postings(collection);
+        manager.ensure_declaration_indices()?;
+    }
     engine
         .timeseries
         .lock()

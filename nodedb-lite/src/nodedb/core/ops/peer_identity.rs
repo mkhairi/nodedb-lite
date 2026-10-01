@@ -37,6 +37,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// Every row is queued for re-push: the rebuilt documents share no history
     /// with what Origin holds, so the rotation is a resync, not a resume.
     pub async fn rotate_peer_id(&self) -> NodeDbResult<u64> {
+        let guard = self.fts_state.admit_mutation().await;
+        let result = self.rotate_peer_id_admitted(guard.permit()).await;
+        guard.finish(result)
+    }
+
+    async fn rotate_peer_id_admitted(
+        &self,
+        permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    ) -> NodeDbResult<u64> {
         let _change = self.identity_change.lock().await;
 
         // The identity is mutated on a copy so the store-wide guard is never
@@ -55,7 +64,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .map_err(|e| NodeDbError::storage(format!("peer-id rotation failed: {e}")))?;
         }
 
-        self.flush().await?;
+        self.flush_admitted(permit).await?;
 
         tracing::warn!(
             peer_id = new_peer_id,
@@ -73,6 +82,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// collide with the history the fork was detected against, which is the
     /// same refusal one step later.
     pub async fn regenerate_identity(&self) -> NodeDbResult<()> {
+        let guard = self.fts_state.admit_mutation().await;
+        let result = self.regenerate_identity_admitted(guard.permit()).await;
+        guard.finish(result)
+    }
+
+    async fn regenerate_identity_admitted(
+        &self,
+        permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    ) -> NodeDbResult<()> {
         let _change = self.identity_change.lock().await;
 
         let mut identity = self.identity.lock_or_recover().clone();
@@ -89,7 +107,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 .map_err(|e| NodeDbError::storage(format!("identity regeneration failed: {e}")))?;
         }
 
-        self.flush().await?;
+        self.flush_admitted(permit).await?;
 
         tracing::warn!(
             %lite_id,

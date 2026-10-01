@@ -13,55 +13,62 @@ impl<S: StorageEngine> NodeDbLite<S> {
     ///
     /// Returns the number of documents imported.
     pub async fn copy_from_ndjson(&self, collection: &str, ndjson: &str) -> NodeDbResult<u64> {
-        let mut docs: Vec<(String, Vec<(String, loro::LoroValue)>)> = Vec::new();
-        for line in ndjson.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let obj: serde_json::Value = serde_json::from_str(line)
-                .map_err(|e| NodeDbError::bad_request(format!("invalid JSON: {e}")))?;
-
-            let id = obj
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(nodedb_types::id_gen::uuid_v7);
-
-            let mut fields = Vec::new();
-            if let serde_json::Value::Object(map) = &obj {
-                for (k, v) in map {
-                    if k == "id" {
-                        continue;
-                    }
-                    fields.push((k.clone(), json_to_loro(v)));
+        let guard = self.fts_state.admit_mutation().await;
+        let result = async {
+            let mut docs: Vec<(String, Vec<(String, loro::LoroValue)>)> = Vec::new();
+            for line in ndjson.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
                 }
+                let obj: serde_json::Value = sonic_rs::from_str(line)
+                    .map_err(|e| NodeDbError::bad_request(format!("invalid JSON: {e}")))?;
+
+                let id = obj
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(nodedb_types::id_gen::uuid_v7);
+
+                let mut fields = Vec::new();
+                if let serde_json::Value::Object(map) = &obj {
+                    for (k, v) in map {
+                        if k == "id" {
+                            continue;
+                        }
+                        fields.push((k.clone(), json_to_loro(v)));
+                    }
+                }
+                docs.push((id, fields));
             }
-            docs.push((id, fields));
+
+            let mut crdt = self.crdt.lock_or_recover();
+            let count = docs.len() as u64;
+
+            use crate::engine::crdt::engine::CrdtField;
+            let borrowed_fields: Vec<Vec<CrdtField<'_>>> = docs
+                .iter()
+                .map(|(_, fields)| {
+                    fields
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.clone()))
+                        .collect()
+                })
+                .collect();
+
+            let ops: Vec<(&str, &str, &[CrdtField<'_>])> = docs
+                .iter()
+                .zip(borrowed_fields.iter())
+                .map(|((id, _), fields)| (collection, id.as_str(), fields.as_slice()))
+                .collect();
+
+            crdt.batch_upsert(&ops).map_err(NodeDbError::from)?;
+            drop(crdt);
+            self.reindex_documents_local(collection, docs.iter().map(|(id, _)| id.as_str()))?;
+            Ok(count)
         }
-
-        let mut crdt = self.crdt.lock_or_recover();
-        let count = docs.len() as u64;
-
-        use crate::engine::crdt::engine::CrdtField;
-        let borrowed_fields: Vec<Vec<CrdtField<'_>>> = docs
-            .iter()
-            .map(|(_, fields)| {
-                fields
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.clone()))
-                    .collect()
-            })
-            .collect();
-
-        let ops: Vec<(&str, &str, &[CrdtField<'_>])> = docs
-            .iter()
-            .zip(borrowed_fields.iter())
-            .map(|((id, _), fields)| (collection, id.as_str(), fields.as_slice()))
-            .collect();
-
-        crdt.batch_upsert(&ops).map_err(NodeDbError::from)?;
-        Ok(count)
+        .await;
+        guard.finish(result)
     }
 
     /// Import documents from CSV text.

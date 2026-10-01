@@ -9,8 +9,7 @@
 
 use std::sync::Arc;
 
-use nodedb_physical::physical_plan::{VectorDirectWriteIntent, VectorOp};
-use nodedb_types::RlsWriteCheck;
+use nodedb_physical::physical_plan::VectorOp;
 use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
@@ -20,21 +19,25 @@ use crate::query::engine::LiteQueryEngine;
 use crate::query::payload_filter::{and_metadata, payload_atoms_to_metadata};
 use crate::storage::engine::StorageEngine;
 
-use super::adapter::LitePhysicalFut;
-use super::adapter::policy::deny_policy;
-use super::vector_direct::{
-    DirectUpdateArgs, DirectWriteArgs, vector_direct_delete, vector_direct_truncate,
-    vector_direct_update, vector_direct_write,
-};
-use super::vector_sparse::{sparse_delete, sparse_insert, sparse_search};
-use super::vector_write::{
+use crate::query::physical_visitor::adapter::LitePhysicalFut;
+use crate::query::physical_visitor::vector_write::{
     vector_delete_by_id, vector_delete_by_surrogate, vector_drop_index, vector_insert,
     vector_query_stats, vector_set_params,
 };
-
 /// Entry point called by `LiteDataPlaneVisitor::vector()`.
-pub(super) fn execute_vector_op<'a, S>(
+pub(in crate::query::physical_visitor) fn execute_vector_op<'a, S>(
     engine: &'a LiteQueryEngine<S>,
+    op: &VectorOp,
+) -> Result<LitePhysicalFut<'a>, LiteError>
+where
+    S: StorageEngine + 'a,
+{
+    execute_vector_op_admitted(engine, None, op)
+}
+
+pub(in crate::query::physical_visitor) fn execute_vector_op_admitted<'a, S>(
+    engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     op: &VectorOp,
 ) -> Result<LitePhysicalFut<'a>, LiteError>
 where
@@ -192,184 +195,12 @@ where
             vector_drop_index(engine, index_key)
         }
 
-        // ── C. Vector-primary direct writes ───────────────────────────────────
-        VectorOp::DirectUpsert {
-            collection,
-            field,
-            surrogate,
-            pk_bytes,
-            vector,
-            payload,
-            quantization,
-            storage_dtype,
-            payload_indexes: _,
-            returning,
-            rls_filters,
-            on_conflict_updates,
-            rls_write_check,
-        } => {
-            deny_policy(
-                "VectorOp::DirectUpsert",
-                returning.as_ref(),
-                &[rls_filters.as_slice()],
-                rls_write_check,
-            )?;
-            vector_direct_write(
-                engine,
-                DirectWriteArgs {
-                    collection: collection.as_str().to_string(),
-                    field: field.clone(),
-                    surrogate: *surrogate,
-                    pk_bytes: pk_bytes.clone(),
-                    vector: vector.clone(),
-                    payload: payload.clone(),
-                    quantization: *quantization,
-                    storage_dtype: *storage_dtype,
-                    intent: VectorDirectWriteIntent::Upsert,
-                    on_conflict_updates: on_conflict_updates.clone(),
-                },
-            )
-        }
-
-        VectorOp::DirectInsert {
-            collection,
-            field,
-            surrogate,
-            pk_bytes,
-            vector,
-            payload,
-            quantization,
-            storage_dtype,
-            payload_indexes: _,
-            returning,
-            rls_filters,
-        } => {
-            deny_policy(
-                "VectorOp::DirectInsert",
-                returning.as_ref(),
-                &[rls_filters.as_slice()],
-                &RlsWriteCheck::NoPolicyApplies,
-            )?;
-            vector_direct_write(
-                engine,
-                DirectWriteArgs {
-                    collection: collection.as_str().to_string(),
-                    field: field.clone(),
-                    surrogate: *surrogate,
-                    pk_bytes: pk_bytes.clone(),
-                    vector: vector.clone(),
-                    payload: payload.clone(),
-                    quantization: *quantization,
-                    storage_dtype: *storage_dtype,
-                    intent: VectorDirectWriteIntent::Insert,
-                    on_conflict_updates: Vec::new(),
-                },
-            )
-        }
-
-        VectorOp::DirectInsertIfAbsent {
-            collection,
-            field,
-            surrogate,
-            pk_bytes,
-            vector,
-            payload,
-            quantization,
-            storage_dtype,
-            payload_indexes: _,
-            returning,
-            rls_filters,
-        } => {
-            deny_policy(
-                "VectorOp::DirectInsertIfAbsent",
-                returning.as_ref(),
-                &[rls_filters.as_slice()],
-                &RlsWriteCheck::NoPolicyApplies,
-            )?;
-            vector_direct_write(
-                engine,
-                DirectWriteArgs {
-                    collection: collection.as_str().to_string(),
-                    field: field.clone(),
-                    surrogate: *surrogate,
-                    pk_bytes: pk_bytes.clone(),
-                    vector: vector.clone(),
-                    payload: payload.clone(),
-                    quantization: *quantization,
-                    storage_dtype: *storage_dtype,
-                    intent: VectorDirectWriteIntent::InsertIfAbsent,
-                    on_conflict_updates: Vec::new(),
-                },
-            )
-        }
-
-        VectorOp::DirectDelete {
-            collection,
-            field,
-            targets,
-            returning,
-            rls_filters,
-            rls_write_check,
-        } => {
-            deny_policy(
-                "VectorOp::DirectDelete",
-                returning.as_ref(),
-                &[rls_filters.as_slice()],
-                rls_write_check,
-            )?;
-            Ok(vector_direct_delete(
-                engine,
-                collection.as_str().to_string(),
-                field.clone(),
-                targets.clone(),
-            ))
-        }
-
-        VectorOp::DirectUpdate {
-            collection,
-            field,
-            targets,
-            new_vector,
-            payload_patch,
-            quantization: _,
-            storage_dtype: _,
-            payload_indexes: _,
-            returning,
-            rls_filters,
-            rls_write_check,
-        } => {
-            deny_policy(
-                "VectorOp::DirectUpdate",
-                returning.as_ref(),
-                &[rls_filters.as_slice()],
-                rls_write_check,
-            )?;
-            vector_direct_update(
-                engine,
-                DirectUpdateArgs {
-                    collection: collection.as_str().to_string(),
-                    field: field.clone(),
-                    targets: targets.clone(),
-                    new_vector: new_vector.clone(),
-                    payload_patch: payload_patch.clone(),
-                },
-            )
-        }
-
-        VectorOp::DirectTruncate {
-            collection,
-            field,
-            restart_identity,
-        } => {
-            let col = collection.as_str().to_string();
-            let restart = *restart_identity;
-            let fut = vector_direct_truncate(engine, col.clone(), field.clone());
-            Ok(Box::pin(async move {
-                let result = fut.await?;
-                crate::query::truncate::restart_identity(engine, &col, restart);
-                Ok(result)
-            }))
-        }
+        VectorOp::DirectUpsert { .. }
+        | VectorOp::DirectInsert { .. }
+        | VectorOp::DirectInsertIfAbsent { .. }
+        | VectorOp::DirectDelete { .. }
+        | VectorOp::DirectUpdate { .. }
+        | VectorOp::DirectTruncate { .. } => super::direct::dispatch(engine, permit, op),
 
         // Resolve-before-propose splits a governed write into a read-only
         // resolution and a Raft-replicated apply. Lite has no Raft and no
@@ -432,43 +263,9 @@ where
         }),
 
         // ── E. Sparse inverted index ──────────────────────────────────────────
-        VectorOp::SparseInsert {
-            collection,
-            field_name,
-            doc_id,
-            entries,
-        } => sparse_insert(
-            engine,
-            collection.as_str().to_string(),
-            field_name.clone(),
-            doc_id.clone(),
-            entries.clone(),
-        ),
-
-        VectorOp::SparseSearch {
-            collection,
-            field_name,
-            query_entries,
-            top_k,
-        } => sparse_search(
-            engine,
-            collection.as_str().to_string(),
-            field_name.clone(),
-            query_entries.clone(),
-            *top_k,
-        ),
-
-        VectorOp::SparseDelete {
-            collection,
-            field_name,
-            doc_id,
-        } => Ok(sparse_delete(
-            engine,
-            collection.as_str().to_string(),
-            field_name.clone(),
-            doc_id.clone(),
-        )),
-
+        VectorOp::SparseInsert { .. }
+        | VectorOp::SparseSearch { .. }
+        | VectorOp::SparseDelete { .. } => super::sparse::dispatch(engine, op),
         VectorOp::MultiVectorInsert { .. } => Err(LiteError::BadRequest {
             detail: "MultiVectorInsert: Lite has no multi-vector (ColBERT-style) HNSW; \
                      these operations are unsupported on Lite."
@@ -490,16 +287,15 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
 
     use nodedb_physical::physical_plan::VectorOp;
     use nodedb_types::result::QueryResult;
-    use nodedb_types::value::Value;
     use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate};
 
     /// Build a bare-name `QualifiedCollection` for the single-database Lite tests.
-    fn qc(name: &str) -> QualifiedCollection {
+    pub(crate) fn qc(name: &str) -> QualifiedCollection {
         QualifiedCollection::new(DatabaseId::DEFAULT, name)
     }
 
@@ -514,7 +310,7 @@ mod tests {
     use crate::error::LiteError;
     use crate::query::engine::{LiteQueryEngine, LiteQueryEngineParams};
 
-    async fn make_engine() -> LiteQueryEngine<PagedbStorageMem> {
+    pub(crate) async fn make_engine() -> LiteQueryEngine<PagedbStorageMem> {
         use std::sync::Mutex;
         let storage = Arc::new(
             PagedbStorageMem::open_in_memory()
@@ -585,106 +381,22 @@ mod tests {
         }
     }
 
-    async fn run_op(engine: &LiteQueryEngine<PagedbStorageMem>, op: VectorOp) -> QueryResult {
+    pub(crate) async fn run_op(
+        engine: &LiteQueryEngine<PagedbStorageMem>,
+        op: VectorOp,
+    ) -> QueryResult {
         super::execute_vector_op(engine, &op)
             .unwrap_or_else(|e| panic!("execute_vector_op failed synchronously: {e}"))
             .await
             .unwrap_or_else(|e| panic!("vector op future failed: {e}"))
     }
 
-    fn sparse_insert(doc_id: &str, entries: Vec<(u32, f32)>) -> VectorOp {
+    pub(crate) fn sparse_insert(doc_id: &str, entries: Vec<(u32, f32)>) -> VectorOp {
         VectorOp::SparseInsert {
             collection: qc("col"),
             field_name: "sparse".to_string(),
             doc_id: doc_id.to_string(),
             entries,
-        }
-    }
-
-    #[tokio::test]
-    async fn vector_op_sparse_insert_then_search_ranks_by_dot_product() {
-        let engine = make_engine().await;
-        assert_eq!(
-            run_op(&engine, sparse_insert("low", vec![(1, 0.5)]))
-                .await
-                .rows_affected,
-            1
-        );
-        run_op(&engine, sparse_insert("high", vec![(1, 4.0)])).await;
-        run_op(&engine, sparse_insert("disjoint", vec![(99, 9.0)])).await;
-
-        let result = run_op(
-            &engine,
-            VectorOp::SparseSearch {
-                collection: qc("col"),
-                field_name: "sparse".to_string(),
-                query_entries: vec![(1, 1.0)],
-                top_k: 10,
-            },
-        )
-        .await;
-
-        assert_eq!(result.columns, vec!["id".to_string(), "score".to_string()]);
-        assert_eq!(result.rows.len(), 2, "disjoint document must be excluded");
-        assert_eq!(result.rows[0][0], Value::String("high".to_string()));
-        assert_eq!(result.rows[1][0], Value::String("low".to_string()));
-    }
-
-    #[tokio::test]
-    async fn vector_op_sparse_delete_removes_document() {
-        let engine = make_engine().await;
-        run_op(&engine, sparse_insert("d1", vec![(1, 1.0)])).await;
-
-        let delete = VectorOp::SparseDelete {
-            collection: qc("col"),
-            field_name: "sparse".to_string(),
-            doc_id: "d1".to_string(),
-        };
-        assert_eq!(run_op(&engine, delete.clone()).await.rows_affected, 1);
-        assert_eq!(
-            run_op(&engine, delete).await.rows_affected,
-            0,
-            "deleting an absent document affects no rows"
-        );
-
-        let result = run_op(
-            &engine,
-            VectorOp::SparseSearch {
-                collection: qc("col"),
-                field_name: "sparse".to_string(),
-                query_entries: vec![(1, 1.0)],
-                top_k: 10,
-            },
-        )
-        .await;
-        assert!(result.rows.is_empty());
-    }
-
-    #[tokio::test]
-    async fn vector_op_sparse_search_on_missing_index_is_empty_not_error() {
-        let engine = make_engine().await;
-        let result = run_op(
-            &engine,
-            VectorOp::SparseSearch {
-                collection: qc("never_written"),
-                field_name: "sparse".to_string(),
-                query_entries: vec![(1, 1.0)],
-                top_k: 10,
-            },
-        )
-        .await;
-        assert!(result.rows.is_empty());
-    }
-
-    #[tokio::test]
-    async fn vector_op_sparse_insert_rejects_non_finite_weight() {
-        let engine = make_engine().await;
-        match super::execute_vector_op(&engine, &sparse_insert("d1", vec![(1, f32::NAN)])) {
-            Err(LiteError::BadRequest { detail }) => {
-                assert!(detail.contains("SparseInsert"), "got: {detail}");
-            }
-            Err(other) => panic!("expected BadRequest, got Err({other})"),
-            Ok(_) => panic!("expected BadRequest, got Ok"),
         }
     }
 

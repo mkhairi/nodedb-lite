@@ -87,7 +87,7 @@ pub(crate) fn lower_array_slice<'a, S: StorageEngine + 'a>(
         system_time,
         valid_at_ms,
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.array(&op)?;
     Ok(Box::pin(fut))
 }
@@ -126,7 +126,7 @@ pub(crate) fn lower_array_project<'a, S: StorageEngine + 'a>(
         array_id: aid,
         attr_indices,
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.array(&op)?;
     Ok(Box::pin(fut))
 }
@@ -173,7 +173,7 @@ pub(crate) fn lower_array_agg<'a, S: StorageEngine + 'a>(
         system_as_of,
         valid_at_ms,
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.array(&op)?;
     Ok(Box::pin(fut))
 }
@@ -217,7 +217,7 @@ pub(crate) fn lower_array_elementwise<'a, S: StorageEngine + 'a>(
         attr_idx,
         cell_filter: None,
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.array(&op)?;
     Ok(Box::pin(fut))
 }

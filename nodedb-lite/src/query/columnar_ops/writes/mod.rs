@@ -7,5 +7,5 @@ mod rows;
 mod truncate;
 
 pub use ops::{InsertParams, delete, insert, update};
-pub(crate) use truncate::clear_overlays;
 pub use truncate::truncate;
+pub(crate) use truncate::{clear_overlays, truncate_coordinated};

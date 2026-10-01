@@ -5,9 +5,9 @@
 //! `LiteQueryEngine` methods without intermediate planning helpers.
 
 use nodedb_sql::ScanVisitArgs;
+use nodedb_sql::types::SqlValue;
 use nodedb_sql::types::filter::Filter;
 use nodedb_sql::types::query::EngineType;
-use nodedb_sql::types::{SqlValue, WriteRoute};
 use nodedb_sql::types_expr::SqlExpr;
 
 use crate::error::LiteError;
@@ -101,25 +101,34 @@ pub(super) fn lower_point_get<'a, S: StorageEngine + 'a>(
 
 pub(super) fn lower_insert<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
-    collection: &str,
-    engine_type: EngineType,
-    route: WriteRoute,
-    rows: &[Vec<(String, SqlValue)>],
-    if_absent: bool,
-    primary_key: Option<&str>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
+    args: nodedb_sql::InsertVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
+    let nodedb_sql::InsertVisitArgs {
+        collection,
+        engine: engine_type,
+        route,
+        rows,
+        if_absent,
+        primary_key,
+        column_schema: _,
+    } = args;
     let collection = collection.to_string();
     let rows = rows.to_vec();
     let primary_key = primary_key.map(str::to_string);
     Ok(Box::pin(async move {
         engine
             .execute_insert(
-                &collection,
-                &engine_type,
-                route,
-                &rows,
-                if_absent,
-                primary_key.as_deref(),
+                permit,
+                nodedb_sql::InsertVisitArgs {
+                    collection: &collection,
+                    engine: engine_type,
+                    route,
+                    rows: &rows,
+                    if_absent,
+                    primary_key: primary_key.as_deref(),
+                    column_schema: &[],
+                },
             )
             .await
     }))
@@ -127,6 +136,7 @@ pub(super) fn lower_insert<'a, S: StorageEngine + 'a>(
 
 pub(super) fn lower_update<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     collection: &str,
     engine_type: EngineType,
     assignments: &[(String, SqlExpr)],
@@ -140,6 +150,7 @@ pub(super) fn lower_update<'a, S: StorageEngine + 'a>(
     Ok(Box::pin(async move {
         engine
             .execute_update(
+                permit,
                 &collection,
                 &engine_type,
                 &assignments,
@@ -152,6 +163,7 @@ pub(super) fn lower_update<'a, S: StorageEngine + 'a>(
 
 pub(super) fn lower_delete<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     collection: &str,
     engine_type: EngineType,
     filters: &[Filter],
@@ -162,7 +174,7 @@ pub(super) fn lower_delete<'a, S: StorageEngine + 'a>(
     let target_keys = target_keys.to_vec();
     Ok(Box::pin(async move {
         engine
-            .execute_delete(&collection, &engine_type, &filters, &target_keys)
+            .execute_delete(permit, &collection, &engine_type, &filters, &target_keys)
             .await
     }))
 }

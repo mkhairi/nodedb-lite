@@ -14,6 +14,7 @@ use super::LiteFut;
 
 pub(super) fn join<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     args: JoinVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
     let JoinVisitArgs {
@@ -27,12 +28,13 @@ pub(super) fn join<'a, S: StorageEngine + 'a>(
         filters,
     } = args;
     lower_join(
-        engine, left, right, on, join_type, condition, limit, projection, filters,
+        engine, permit, left, right, on, join_type, condition, limit, projection, filters,
     )
 }
 
 pub(super) fn aggregate<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     args: AggregateVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
     let AggregateVisitArgs {
@@ -46,6 +48,7 @@ pub(super) fn aggregate<'a, S: StorageEngine + 'a>(
     } = args;
     lower_aggregate(
         engine,
+        permit,
         input,
         group_by,
         aggregates,
@@ -58,41 +61,46 @@ pub(super) fn aggregate<'a, S: StorageEngine + 'a>(
 
 pub(super) fn union<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     inputs: &[nodedb_sql::types::SqlPlan],
     distinct: bool,
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_union(engine, inputs, distinct)
+    lower_union(engine, permit, inputs, distinct)
 }
 
 pub(super) fn intersect<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     left: &nodedb_sql::types::SqlPlan,
     right: &nodedb_sql::types::SqlPlan,
     all: bool,
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_intersect(engine, left, right, all)
+    lower_intersect(engine, permit, left, right, all)
 }
 
 pub(super) fn except<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     left: &nodedb_sql::types::SqlPlan,
     right: &nodedb_sql::types::SqlPlan,
     all: bool,
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_except(engine, left, right, all)
+    lower_except(engine, permit, left, right, all)
 }
 
 pub(super) fn cte<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     definitions: &[(String, nodedb_sql::types::SqlPlan)],
     outer: &nodedb_sql::types::SqlPlan,
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_cte(engine, definitions, outer)
+    lower_cte(engine, permit, definitions, outer)
 }
 
 pub(super) fn subquery<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     args: SubqueryVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_subquery(engine, args)
+    lower_subquery(engine, permit, args)
 }

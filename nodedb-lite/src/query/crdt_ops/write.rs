@@ -18,6 +18,33 @@ pub async fn handle_apply<S: StorageEngine>(
     delta: &[u8],
     mutation_id: u64,
 ) -> Result<QueryResult, LiteError> {
+    handle_apply_coordinated(engine, None, collection, delta, mutation_id).await
+}
+
+pub(crate) async fn handle_apply_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: &str,
+    delta: &[u8],
+    mutation_id: u64,
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return handle_apply_admitted(engine, permit, collection, delta, mutation_id).await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result =
+        handle_apply_admitted(engine, guard.permit(), collection, delta, mutation_id).await;
+    guard.finish(result)
+}
+
+pub(crate) async fn handle_apply_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    collection: &str,
+    delta: &[u8],
+    mutation_id: u64,
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
     let result = {
         let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
         crdt.import_remote(collection, delta)
@@ -64,6 +91,30 @@ pub async fn handle_import_snapshot<S: StorageEngine>(
     collection: &str,
     bytes: &[u8],
 ) -> Result<QueryResult, LiteError> {
+    handle_import_snapshot_coordinated(engine, None, collection, bytes).await
+}
+
+pub(crate) async fn handle_import_snapshot_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: &str,
+    bytes: &[u8],
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return handle_import_snapshot_admitted(engine, permit, collection, bytes).await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result = handle_import_snapshot_admitted(engine, guard.permit(), collection, bytes).await;
+    guard.finish(result)
+}
+
+pub(crate) async fn handle_import_snapshot_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    collection: &str,
+    bytes: &[u8],
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
     let imported = engine
         .crdt
         .lock()

@@ -10,8 +10,12 @@
 mod format;
 mod restore;
 mod serialize;
+mod trust;
 mod write;
 
 pub(crate) use restore::restore_fts;
 pub(crate) use serialize::serialize_fts;
+pub(crate) use trust::{
+    checkpoint_compatible, persist_checkpoint_complete, persist_checkpoint_incomplete,
+};
 pub(crate) use write::write_serialized_fts;

@@ -12,7 +12,7 @@
 //! | `fts:_surrogates`               | MessagePack `FtsSurrogateState`            |
 //! | `fts:_layout`                   | one byte — checkpoint layout version       |
 //! | `fts:{index_key}:doclens`       | MessagePack `Vec<(u32,u32)>` — surrogate/len |
-//! | `fts:{index_key}:meta:{subkey}` | raw bytes (fieldnorms/analyzer/language)   |
+//! | `fts:{index_key}:meta:{subkey}` | raw bytes (fieldnorms/analyzer/language/fuzzy)   |
 //!
 //! ### pagedb segments — used when `as_fts_segment_ext()` returns `Some`
 //!
@@ -64,7 +64,7 @@ pub(super) const CHECKPOINT_PREFIX: &[u8] = b"fts:";
 pub(super) const SEGMENT_INDEX_PREFIX: &[u8] = b"fts:_seg_idx:";
 
 /// Known meta subkeys written by `nodedb-fts`.
-pub(super) const META_SUBKEYS: &[&str] = &["fieldnorms", "analyzer", "language"];
+pub(super) const META_SUBKEYS: &[&str] = &["fieldnorms", "analyzer", "language", "fuzzy"];
 
 /// Lite is single-database/single-tenant: both scope ids are 0.
 pub(super) const DB: u64 = 0;

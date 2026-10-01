@@ -30,8 +30,25 @@ pub(crate) fn execute_text_op<'a, S: StorageEngine + 'a>(
 ///
 /// An empty `field` names the whole-document index. Ops that write or
 /// configure the index ignore `field`.
+pub(crate) fn execute_text_op_admitted<'a, S: StorageEngine + 'a>(
+    engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
+    op: &TextOp,
+) -> Result<LitePhysicalFut<'a>, LiteError> {
+    execute_text_op_on_field_admitted(engine, permit, op, "")
+}
+
 pub(crate) fn execute_text_op_on_field<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    op: &TextOp,
+    field: &str,
+) -> Result<LitePhysicalFut<'a>, LiteError> {
+    execute_text_op_on_field_admitted(engine, None, op, field)
+}
+
+pub(crate) fn execute_text_op_on_field_admitted<'a, S: StorageEngine + 'a>(
+    engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     op: &TextOp,
     field: &str,
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
@@ -142,13 +159,24 @@ pub(crate) fn execute_text_op_on_field<'a, S: StorageEngine + 'a>(
             surrogate,
             text,
             provenance: _,
-        } => Ok(fts_index_doc(engine, collection.as_str(), *surrogate, text)),
+        } => Ok(fts_index_doc(
+            engine,
+            permit,
+            collection.as_str(),
+            *surrogate,
+            text,
+        )),
 
         TextOp::FtsDeleteDoc {
             collection,
             surrogate,
             provenance: _,
-        } => Ok(fts_delete_doc(engine, collection.as_str(), *surrogate)),
+        } => Ok(fts_delete_doc(
+            engine,
+            permit,
+            collection.as_str(),
+            *surrogate,
+        )),
 
         // ── Config write ──────────────────────────────────────────────────────
         TextOp::SetTextConfig {
@@ -157,6 +185,7 @@ pub(crate) fn execute_text_op_on_field<'a, S: StorageEngine + 'a>(
             fuzzy_default,
         } => text_set_config(
             engine,
+            permit,
             collection.as_str().to_string(),
             analyzer_name.clone(),
             *fuzzy_default,

@@ -7,6 +7,7 @@ use nodedb_types::Namespace;
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 
 use crate::engine::crdt::{CrdtEngine, CrdtWriteKind};
+use crate::engine::fts::coordinator::TextMutationPermit;
 use crate::nodedb::lock_ext::LockExt;
 
 use super::super::types::{META_CRDT_DELTAS, META_LAST_FLUSHED_MID, NodeDbLite};
@@ -34,10 +35,18 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
     /// Persist all in-memory state to storage (call before shutdown).
     pub async fn flush(&self) -> NodeDbResult<()> {
+        let permit = self.fts_state.admit_exclusive().await;
+        self.flush_admitted(&permit).await
+    }
+
+    pub(crate) async fn flush_admitted(&self, _permit: &TextMutationPermit) -> NodeDbResult<()> {
         // One flush at a time: the CRDT update sequence is allocated under the
         // `crdt` guard but committed after it is released, so concurrent
         // flushes would hand out the same numbers. See `flush_lock`.
         let _flush_guard = self.flush_lock.lock().await;
+        crate::engine::fts::checkpoint::persist_checkpoint_incomplete(self.storage.as_ref())
+            .await
+            .map_err(NodeDbError::from)?;
 
         // Drain the buffered KV writes first — they have their own batch-commit
         // path. Without this, `flush()` (and the auto-flush timer) would not
@@ -254,6 +263,57 @@ impl<S: StorageEngine> NodeDbLite<S> {
             q.flush_staging().await.map_err(NodeDbError::from)?;
         }
 
+        if self.fts_state.checkpoint_trusted() {
+            let revisions = self
+                .fts_state
+                .manager
+                .lock_or_recover()
+                .declaration_revisions();
+            crate::engine::fts::checkpoint::persist_checkpoint_complete(
+                self.storage.as_ref(),
+                &revisions,
+            )
+            .await
+            .map_err(NodeDbError::from)?;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::nodedb::LockExt;
+    use crate::{LiteConfig, NodeDbLite, PagedbStorageMem};
+    use nodedb_client::NodeDb;
+    use nodedb_types::Value;
+    use nodedb_types::document::Document;
+
+    #[tokio::test]
+    async fn successful_flush_preserves_interrupted_mutation_distrust() {
+        let storage = PagedbStorageMem::open_in_memory().await.unwrap();
+        let db = NodeDbLite::open_with_config(
+            storage,
+            LiteConfig {
+                auto_flush_ms: 0,
+                sync_enabled: false,
+                ..LiteConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        drop(db.fts_state.admit_mutation().await);
+        let mut document = Document::new("one");
+        document.set("body", Value::String("laterwrite".into()));
+        db.document_put("articles", document).await.unwrap();
+        db.flush().await.unwrap();
+        let revisions = db
+            .fts_state
+            .manager
+            .lock_or_recover()
+            .declaration_revisions();
+        assert!(!crate::engine::fts::checkpoint::checkpoint_compatible(
+            db.storage.as_ref(), &revisions,
+        ).await.unwrap());
+        assert!(!db.fts_state.checkpoint_trusted());
     }
 }

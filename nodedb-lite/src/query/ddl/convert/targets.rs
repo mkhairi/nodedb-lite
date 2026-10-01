@@ -1,12 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
 //! DDL handlers for CONVERT COLLECTION between storage modes.
 //!
 //! - CONVERT COLLECTION <name> TO strict (<col_defs>)
 //! - CONVERT COLLECTION <name> TO columnar (<col_defs>)
 //! - CONVERT COLLECTION <name> TO document
 
-use nodedb_types::columnar::{
-    ColumnDef, ColumnType, ColumnarProfile, ColumnarSchema, StrictSchema,
-};
+use nodedb_types::columnar::{ColumnarProfile, ColumnarSchema, StrictSchema};
 use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
@@ -15,7 +14,8 @@ use crate::index::IndexEngine;
 use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
-use super::parser::parse_strict_create_sql;
+use super::schema::{conversion_refused, document_to_row, parse_convert_sql};
+use crate::nodedb::convert::value_to_loro;
 
 impl<S: StorageEngine> LiteQueryEngine<S> {
     /// Handle: CONVERT COLLECTION <name> TO strict (<col_defs>)
@@ -42,6 +42,21 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         source_name: &str,
         target_schema: StrictSchema,
     ) -> Result<QueryResult, LiteError> {
+        let guard = self.fts_state.admit_mutation().await;
+        let result = self
+            .convert_to_strict_admitted(guard.permit(), source_name, target_schema)
+            .await;
+        guard.finish(result)
+    }
+
+    pub(in crate::query) async fn convert_to_strict_admitted(
+        &self,
+        permit: &crate::engine::fts::coordinator::TextMutationPermit,
+        source_name: &str,
+        target_schema: StrictSchema,
+    ) -> Result<QueryResult, LiteError> {
+        let _permit = permit;
+        crate::engine::fts::checkpoint::persist_checkpoint_incomplete(&*self.storage).await?;
         // Read all documents from the source (CRDT/schemaless).
         let docs: Vec<nodedb_types::document::Document> = {
             let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
@@ -104,7 +119,7 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             .manager
             .lock()
             .map_err(|_| LiteError::LockPoisoned)?
-            .drop_collection(source_name);
+            .remove_collection_postings(source_name);
         crate::query::text_index::index_strict_rows(
             self,
             source_name,
@@ -144,6 +159,36 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         source_name: &str,
         target_schema: StrictSchema,
     ) -> Result<QueryResult, LiteError> {
+        let guard = self.fts_state.admit_mutation().await;
+        let result = self
+            .convert_to_columnar_admitted(guard.permit(), source_name, target_schema)
+            .await;
+        guard.finish(result)
+    }
+
+    pub(in crate::query) async fn convert_to_columnar_admitted(
+        &self,
+        permit: &crate::engine::fts::coordinator::TextMutationPermit,
+        source_name: &str,
+        target_schema: StrictSchema,
+    ) -> Result<QueryResult, LiteError> {
+        let _permit = permit;
+        crate::engine::fts::checkpoint::persist_checkpoint_incomplete(&*self.storage).await?;
+        if self
+            .fts_state
+            .manager
+            .lock()
+            .map_err(|_| LiteError::LockPoisoned)?
+            .declaration_for(source_name)
+            .is_some()
+        {
+            return Err(LiteError::Unsupported {
+                detail: format!(
+                    "CONVERT COLLECTION '{source_name}' TO columnar retains an active SEARCH INDEX: DROP SEARCH INDEX first"
+                ),
+            });
+        }
+
         let columnar_schema = ColumnarSchema::new(target_schema.columns)
             .map_err(|e| LiteError::Query(e.to_string()))?;
 
@@ -209,6 +254,20 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         &self,
         source_name: &str,
     ) -> Result<QueryResult, LiteError> {
+        let guard = self.fts_state.admit_mutation().await;
+        let result = self
+            .convert_to_document_admitted(guard.permit(), source_name)
+            .await;
+        guard.finish(result)
+    }
+
+    pub(in crate::query) async fn convert_to_document_admitted(
+        &self,
+        permit: &crate::engine::fts::coordinator::TextMutationPermit,
+        source_name: &str,
+    ) -> Result<QueryResult, LiteError> {
+        let _permit = permit;
+        crate::engine::fts::checkpoint::persist_checkpoint_incomplete(&*self.storage).await?;
         let mut written: Vec<String> = Vec::new();
 
         if let Some(schema) = self.strict.schema(source_name) {
@@ -257,7 +316,7 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                 .manager
                 .lock()
                 .map_err(|_| LiteError::LockPoisoned)?
-                .drop_collection(source_name);
+                .remove_collection_postings(source_name);
             crate::query::text_index::reindex_documents(
                 self,
                 source_name,
@@ -276,185 +335,5 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
             rows_affected: converted,
             command: None,
         })
-    }
-
-    /// Re-declare the indexes of `collection` over `engine` rows and build
-    /// them from those rows: a conversion that failed leaves its source
-    /// indexed as it was.
-    async fn restore_indexes(
-        &self,
-        collection: &str,
-        engine: IndexEngine,
-    ) -> Result<(), LiteError> {
-        for def in self
-            .indexes
-            .move_collection(&*self.storage, collection, engine)
-            .await?
-        {
-            crate::query::document_ops::indexes::rebuild_index(self, def).await?;
-        }
-        Ok(())
-    }
-
-    /// Decode every stored tuple of the strict collection `collection`.
-    /// A tuple that does not decode fails the read: skipping it would lose
-    /// the row.
-    async fn decode_strict_rows(
-        &self,
-        collection: &str,
-        schema: &StrictSchema,
-    ) -> Result<Vec<Vec<Value>>, LiteError> {
-        let raw = self.strict.scan_raw(collection).await?;
-        let decoder = nodedb_strict::TupleDecoder::new(schema);
-        raw.iter()
-            .map(|tuple_bytes| {
-                decoder
-                    .extract_all(tuple_bytes)
-                    .map_err(|e| LiteError::Corrupted {
-                        detail: format!("strict tuple of '{collection}' does not decode: {e}"),
-                    })
-            })
-            .collect()
-    }
-
-    /// Read rows from any source (CRDT or strict) as Vec<Value>.
-    async fn read_source_rows(
-        &self,
-        collection: &str,
-        target_columns: &[ColumnDef],
-    ) -> Result<Vec<Vec<Value>>, LiteError> {
-        // Try CRDT first.
-        {
-            let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-            let ids = crdt.list_ids(collection);
-            if !ids.is_empty() {
-                return Ok(ids
-                    .iter()
-                    .filter_map(|id| {
-                        crdt.read(collection, id).map(|loro_val| {
-                            let doc = crate::nodedb::convert::loro_value_to_document(id, &loro_val);
-                            document_to_row(&doc.fields, target_columns)
-                        })
-                    })
-                    .collect());
-            }
-        }
-
-        // Try strict.
-        if let Some(schema) = self.strict.schema(collection) {
-            return self.decode_strict_rows(collection, &schema).await;
-        }
-
-        Err(LiteError::Query(format!(
-            "collection '{collection}' not found in any storage mode"
-        )))
-    }
-}
-
-/// The error a conversion returns after rolling back: a storage-class
-/// failure keeps its type, anything else is the row not fitting the target.
-fn conversion_refused(source: &str, target: &str, row: &str, e: LiteError) -> LiteError {
-    match e {
-        LiteError::Storage { .. } | LiteError::Corrupted { .. } | LiteError::LockPoisoned => e,
-        other => LiteError::BadRequest {
-            detail: format!(
-                "CONVERT COLLECTION '{source}' TO {target} stopped at row '{row}' and was \
-                 rolled back: {other}"
-            ),
-        },
-    }
-}
-
-/// Parse CONVERT COLLECTION <name> TO <mode> [(<col_defs>)]
-fn parse_convert_sql(sql: &str, target_mode: &str) -> Result<(String, StrictSchema), LiteError> {
-    let parts: Vec<&str> = sql.split_whitespace().collect();
-    let source_name = parts
-        .get(2)
-        .ok_or(LiteError::Query("expected collection name".into()))?
-        .to_lowercase();
-
-    // Validate that the SQL TO clause matches the expected target mode.
-    if let Some(to_idx) = parts.iter().position(|p| p.eq_ignore_ascii_case("TO"))
-        && let Some(mode) = parts.get(to_idx + 1)
-        && !mode.eq_ignore_ascii_case(target_mode)
-    {
-        return Err(LiteError::Query(format!(
-            "expected CONVERT TO {target_mode}, got '{mode}'"
-        )));
-    }
-
-    // If there are column defs in parens, parse them.
-    if sql.contains('(') {
-        let (_, schema) = parse_strict_create_sql(sql)?;
-        Ok((source_name, schema))
-    } else {
-        Ok((source_name, default_convert_schema()))
-    }
-}
-
-/// Target schema when a CONVERT names no columns: a text `id` key plus a
-/// text `data` column.
-pub(in crate::query) fn default_convert_schema() -> StrictSchema {
-    StrictSchema {
-        columns: vec![
-            ColumnDef::required("id", ColumnType::String).with_primary_key(),
-            ColumnDef::nullable("data", ColumnType::String),
-        ],
-        version: 1,
-        dropped_columns: Vec::new(),
-        bitemporal: false,
-    }
-}
-
-/// Convert a Document's fields to a Vec<Value> matching the target schema.
-fn document_to_row(
-    fields: &std::collections::HashMap<String, Value>,
-    target_columns: &[ColumnDef],
-) -> Vec<Value> {
-    target_columns
-        .iter()
-        .map(|col| fields.get(&col.name).cloned().unwrap_or(Value::Null))
-        .collect()
-}
-
-// Re-use the crate-wide value_to_loro conversion.
-use crate::nodedb::convert::value_to_loro;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_convert_with_schema() {
-        let sql = "CONVERT COLLECTION users TO strict (id BIGINT NOT NULL PRIMARY KEY, name TEXT)";
-        let (name, schema) = parse_convert_sql(sql, "strict").expect("parse");
-        assert_eq!(name, "users");
-        assert_eq!(schema.columns.len(), 2);
-    }
-
-    #[test]
-    fn parse_convert_without_schema() {
-        let sql = "CONVERT COLLECTION users TO document";
-        let (name, _schema) = parse_convert_sql(sql, "document").expect("parse");
-        assert_eq!(name, "users");
-    }
-
-    #[test]
-    fn document_to_row_maps_fields() {
-        let mut fields = std::collections::HashMap::new();
-        fields.insert("name".into(), Value::String("Alice".into()));
-        fields.insert("age".into(), Value::Integer(30));
-
-        let columns = vec![
-            ColumnDef::required("name", ColumnType::String),
-            ColumnDef::nullable("age", ColumnType::Int64),
-            ColumnDef::nullable("email", ColumnType::String),
-        ];
-
-        let row = document_to_row(&fields, &columns);
-        assert_eq!(row.len(), 3);
-        assert_eq!(row[0], Value::String("Alice".into()));
-        assert_eq!(row[1], Value::Integer(30));
-        assert_eq!(row[2], Value::Null); // email not in doc.
     }
 }

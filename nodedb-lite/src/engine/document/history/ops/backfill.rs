@@ -8,8 +8,6 @@ use nodedb_types::Namespace;
 use crate::error::LiteError;
 use crate::storage::engine::{StorageEngine, WriteOp};
 
-use std::collections::HashMap;
-
 use super::super::key::{coll_prefix, format_sys_from, latest_version_key, parse_sys_from};
 use super::super::value::{VersionTag, decode_value};
 
@@ -20,101 +18,140 @@ use super::super::value::{VersionTag, decode_value};
 /// code), the function scans history, computes the correct pointers, and
 /// overwrites any that are missing or stale — safe to call repeatedly.
 ///
-/// A log line at `INFO` level reports the number of pointer rows written.
+/// Pages retain one document across boundaries. Pointer writes use bounded batches.
 pub async fn backfill_latest_version<S: StorageEngine>(
     storage: &S,
     collection: &str,
 ) -> Result<(), LiteError> {
+    backfill_pages(storage, collection, 128, 8 * 1024 * 1024).await
+}
+
+async fn backfill_pages<S: StorageEngine>(
+    storage: &S,
+    collection: &str,
+    max_records: usize,
+    max_bytes: usize,
+) -> Result<(), LiteError> {
     let prefix = coll_prefix(collection);
-    let entries = storage
-        .scan_prefix(Namespace::DocumentHistory, &prefix)
-        .await?;
-
-    if entries.is_empty() {
-        return Ok(());
-    }
-
-    // Walk all history rows and track, per doc_id, the highest system_from_ms
-    // seen alongside its VersionTag.  The last row (highest timestamp) is the
-    // current state of each document.
-    let mut latest: HashMap<String, (i64, VersionTag)> = HashMap::new();
-
-    for (key, value) in &entries {
-        let after_prefix = match key.get(prefix.len()..) {
-            Some(s) => s,
-            None => continue,
-        };
-        let nul = match after_prefix.iter().position(|&b| b == 0) {
-            Some(p) => p,
-            None => continue,
-        };
-        let doc_id = match std::str::from_utf8(&after_prefix[..nul]) {
-            Ok(s) => s.to_owned(),
-            Err(_) => continue,
-        };
-        let decoded = match decode_value(value) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let sys_from = match parse_sys_from(key) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        // Higher timestamp = more recent; last-writer wins.
-        let entry = latest.entry(doc_id).or_insert((sys_from, decoded.tag));
-        if sys_from >= entry.0 {
-            *entry = (sys_from, decoded.tag);
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut latest: Option<(String, i64, VersionTag)> = None;
+    let mut operations = Vec::new();
+    let mut operation_bytes = 0usize;
+    loop {
+        let page = storage
+            .scan_prefix_from_budgeted(
+                Namespace::DocumentHistory,
+                &prefix,
+                cursor.as_deref(),
+                max_records,
+                max_bytes,
+            )
+            .await?;
+        if page.entries.is_empty() {
+            break;
         }
-    }
-
-    // Build one batch: set pointer for live docs, delete pointer for tombstoned/erased.
-    let mut ops: Vec<WriteOp> = Vec::with_capacity(latest.len());
-    let mut written = 0usize;
-
-    for (doc_id, (sys_from, tag)) in latest {
-        let pointer_key = latest_version_key(collection, &doc_id);
-        if tag == VersionTag::Live {
-            let pointer_value = format_sys_from(sys_from).into_bytes();
-            // Only write if pointer is absent or stale.
-            let existing = storage.get(Namespace::LatestVersion, &pointer_key).await?;
-            let expected = pointer_value.clone();
-            if existing.as_deref() != Some(&expected) {
-                ops.push(WriteOp::Put {
-                    ns: Namespace::LatestVersion,
-                    key: pointer_key,
-                    value: pointer_value,
-                });
-                written += 1;
-            }
-        } else {
-            // Non-live: remove stale pointer if present.
-            if storage
-                .get(Namespace::LatestVersion, &pointer_key)
-                .await?
-                .is_some()
+        for (key, value) in page.entries {
+            cursor = Some(key.clone());
+            let suffix = &key[prefix.len()..];
+            let Some(separator) = suffix.iter().position(|&byte| byte == 0) else {
+                continue;
+            };
+            let Ok(id) = std::str::from_utf8(&suffix[..separator]) else {
+                continue;
+            };
+            let Ok(decoded) = decode_value(&value) else {
+                continue;
+            };
+            let Some(timestamp) = parse_sys_from(&key) else {
+                continue;
+            };
+            if latest
+                .as_ref()
+                .is_some_and(|(previous, _, _)| previous != id)
+                && let Some(previous) = latest.take()
             {
-                ops.push(WriteOp::Delete {
-                    ns: Namespace::LatestVersion,
-                    key: pointer_key,
-                });
-                written += 1;
+                queue_pointer(
+                    storage,
+                    collection,
+                    previous,
+                    &mut operations,
+                    &mut operation_bytes,
+                    max_records,
+                    max_bytes,
+                )
+                .await?;
+            }
+            match &mut latest {
+                Some((_, previous, tag)) if timestamp >= *previous => {
+                    *previous = timestamp;
+                    *tag = decoded.tag;
+                }
+                None => latest = Some((id.to_owned(), timestamp, decoded.tag)),
+                _ => {}
             }
         }
     }
-
-    if !ops.is_empty() {
-        storage.batch_write(&ops).await?;
-    }
-
-    if written > 0 {
-        tracing::info!(
+    if let Some(previous) = latest {
+        queue_pointer(
+            storage,
             collection,
-            written,
-            "backfilled LatestVersion index from DocumentHistory"
-        );
+            previous,
+            &mut operations,
+            &mut operation_bytes,
+            max_records,
+            max_bytes,
+        )
+        .await?;
     }
+    if !operations.is_empty() {
+        storage.batch_write(&operations).await?;
+    }
+    Ok(())
+}
 
+async fn queue_pointer<S: StorageEngine>(
+    storage: &S,
+    collection: &str,
+    (id, timestamp, tag): (String, i64, VersionTag),
+    operations: &mut Vec<WriteOp>,
+    bytes: &mut usize,
+    max_records: usize,
+    max_bytes: usize,
+) -> Result<(), LiteError> {
+    let key = latest_version_key(collection, &id);
+    let value = if tag == VersionTag::Live {
+        format_sys_from(timestamp).into_bytes()
+    } else {
+        Vec::new()
+    };
+    let cost = key.len().saturating_add(value.len());
+    if cost > max_bytes {
+        return Err(LiteError::Backpressure {
+            detail: format!(
+                "history pointer '{collection}:{id}' exceeds {max_bytes} bytes. Shorten the document ID or increase the source page budget"
+            ),
+        });
+    }
+    if !operations.is_empty()
+        && (operations.len() >= max_records || cost > max_bytes.saturating_sub(*bytes))
+    {
+        storage.batch_write(operations).await?;
+        operations.clear();
+        *bytes = 0;
+    }
+    *bytes += cost;
+    operations.push(if tag == VersionTag::Live {
+        WriteOp::Put {
+            ns: Namespace::LatestVersion,
+            key,
+            value,
+        }
+    } else {
+        WriteOp::Delete {
+            ns: Namespace::LatestVersion,
+            key,
+        }
+    });
     Ok(())
 }
 
@@ -128,6 +165,42 @@ mod tests {
     use super::super::read::versioned_get_current;
     use super::super::write::versioned_put;
     use super::*;
+
+    #[tokio::test]
+    async fn history_page_boundaries_preserve_latest_versions_and_tombstones() {
+        let storage = mem_storage().await;
+        versioned_put(&storage, "c", "a", b"first", 10, None, None)
+            .await
+            .unwrap();
+        versioned_put(&storage, "c", "a", b"second", 20, None, None)
+            .await
+            .unwrap();
+        super::super::write::versioned_tombstone(&storage, "c", "a", 30, None)
+            .await
+            .unwrap();
+        versioned_put(&storage, "c", "ab", b"neighbor", 10, None, None)
+            .await
+            .unwrap();
+        storage
+            .delete(Namespace::LatestVersion, &latest_version_key("c", "ab"))
+            .await
+            .unwrap();
+        backfill_pages(&storage, "c", 1, 4096).await.unwrap();
+        assert!(
+            versioned_get_current(&storage, "c", "a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            versioned_get_current(&storage, "c", "ab")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            b"neighbor"
+        );
+    }
 
     async fn mem_storage() -> PagedbStorageMem {
         PagedbStorageMem::open_in_memory()

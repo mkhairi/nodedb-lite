@@ -10,6 +10,7 @@ mod crdt_list;
 mod dispatch;
 mod document;
 mod document_batch;
+mod document_vector;
 mod graph;
 mod graph_traversal;
 mod graph_walk;

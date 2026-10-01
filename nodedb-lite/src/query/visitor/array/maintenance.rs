@@ -37,7 +37,7 @@ pub(crate) fn lower_array_flush<'a, S: StorageEngine + 'a>(
             array_id: aid,
             wal_lsn: 0,
         };
-        let mut phys = LiteDataPlaneVisitor { engine };
+        let mut phys = LiteDataPlaneVisitor::new(engine);
         phys.array(&op)?.await
     }))
 }
@@ -53,7 +53,7 @@ pub(crate) fn lower_array_compact<'a, S: StorageEngine + 'a>(
         array_id: aid,
         audit_retain_ms,
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.array(&op)?;
     Ok(Box::pin(fut))
 }

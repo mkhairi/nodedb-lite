@@ -98,7 +98,7 @@ pub(super) fn lower_kv_delete<'a, S: StorageEngine + 'a>(
             rls_filters: Vec::new(),
             provenance: None,
         };
-        let mut phys = LiteDataPlaneVisitor { engine };
+        let mut phys = LiteDataPlaneVisitor::new(engine);
         phys.kv(&op)?.await
     }))
 }
@@ -150,7 +150,7 @@ pub(super) fn lower_kv_update<'a, S: StorageEngine + 'a>(
                 returning: None,
                 rls_filters: Vec::new(),
             };
-            let mut phys = LiteDataPlaneVisitor { engine };
+            let mut phys = LiteDataPlaneVisitor::new(engine);
             affected += phys.kv(&op)?.await?.rows_affected;
         }
         Ok(QueryResult {

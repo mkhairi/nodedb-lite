@@ -67,6 +67,7 @@ fn sort_key_to_spec(k: &SortKey) -> SortKeySpec {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_lateral_top_k<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     outer: &SqlPlan,
     outer_alias: Option<&str>,
     inner_collection: &str,
@@ -93,6 +94,7 @@ pub(super) fn lower_lateral_top_k<'a, S: StorageEngine + 'a>(
         use crate::query::query_ops::lateral_top_k::execute_lateral_top_k_sql;
         execute_lateral_top_k_sql(
             engine,
+            permit,
             &outer_sql,
             &outer_alias_str,
             &inner_col,
@@ -114,6 +116,7 @@ pub(super) fn lower_lateral_top_k<'a, S: StorageEngine + 'a>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_lateral_loop<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     outer: &SqlPlan,
     outer_alias: Option<&str>,
     inner: &SqlPlan,
@@ -136,6 +139,7 @@ pub(super) fn lower_lateral_loop<'a, S: StorageEngine + 'a>(
         use crate::query::query_ops::lateral_loop::execute_lateral_loop_sql;
         execute_lateral_loop_sql(
             engine,
+            permit,
             &outer_sql,
             &outer_alias_str,
             &inner_sql,
@@ -237,6 +241,7 @@ mod tests {
         let outer = scan_plan("users");
         let result = super::lower_lateral_top_k(
             &engine,
+            None,
             &outer,
             Some("u"),
             "orders",
@@ -258,6 +263,7 @@ mod tests {
         let inner = scan_plan("employees");
         let result = super::lower_lateral_loop(
             &engine,
+            None,
             &outer,
             Some("d"),
             &inner,

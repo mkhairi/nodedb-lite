@@ -108,7 +108,7 @@ pub(super) fn lower_timeseries_scan<'a, S: StorageEngine + 'a>(
         sort_keys: Vec::new(),
     };
 
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.timeseries(&op)?;
     if !sorted {
         return Ok(Box::pin(fut));
@@ -151,6 +151,7 @@ fn extract_temporal(scope: &TemporalScope) -> (nodedb_types::SystemTimeScope, Op
 /// `Vec<HashMap<String, Value>>`.
 pub(super) fn lower_timeseries_ingest<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     collection: &str,
     rows: &[Vec<(String, SqlValue)>],
 ) -> Result<LiteFut<'a>, LiteError> {
@@ -192,7 +193,10 @@ pub(super) fn lower_timeseries_ingest<'a, S: StorageEngine + 'a>(
         rls_filters: Vec::new(),
     };
 
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor {
+        engine,
+        permit: Some(permit),
+    };
     let fut = phys.timeseries(&op)?;
     Ok(Box::pin(fut))
 }
@@ -290,7 +294,8 @@ mod tests {
             ("ts".to_string(), SqlValue::Int(1_700_000_000_000)),
             ("value".to_string(), SqlValue::Float(42.0)),
         ]];
-        let result = super::lower_timeseries_ingest(&engine, "metrics", &rows);
+        let guard = engine.fts_state.admit_mutation().await;
+        let result = super::lower_timeseries_ingest(&engine, guard.permit(), "metrics", &rows);
         assert!(result.is_ok());
     }
 }

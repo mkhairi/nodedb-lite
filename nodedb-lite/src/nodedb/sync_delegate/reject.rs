@@ -21,7 +21,7 @@ pub(super) fn handle_reject_with_policy_impl<S: StorageEngine>(
     db: &NodeDbLite<S>,
     mutation_id: u64,
     hint: &CompensationHint,
-) {
+) -> nodedb_types::error::NodeDbResult<()> {
     // A peer-id collision never reaches the policy path. Policy resolution
     // treats an unrecognised refusal as a constraint the row violated: it
     // deletes the local row and drops the delta. Here the row is valid and
@@ -35,46 +35,63 @@ pub(super) fn handle_reject_with_policy_impl<S: StorageEngine>(
             "Origin refused this delta's Loro peer id as another replica's — \
              rotating the local peer id and resyncing"
         );
-        return;
+        return Ok(());
     }
 
-    let mut crdt = db.crdt.lock_or_recover();
-    match crdt.reject_delta_with_policy(mutation_id, hint) {
-        Some(nodedb_crdt::PolicyResolution::AutoResolved(action)) => {
-            tracing::info!(
-                mutation_id,
-                action = ?action,
-                "SyncDelegate: delta auto-resolved by policy"
-            );
-        }
-        Some(nodedb_crdt::PolicyResolution::Deferred {
-            retry_after_ms,
-            attempt,
-            ..
-        }) => {
-            tracing::info!(
-                mutation_id,
+    let guard = db
+        .fts_state
+        .try_admit_mutation("reject delta with policy")
+        .map_err(nodedb_types::error::NodeDbError::from)?;
+    let result = (|| {
+        let mut crdt = db.crdt.lock_or_recover();
+        let affected = crdt
+            .pending_deltas()
+            .iter()
+            .find(|delta| delta.mutation_id == mutation_id)
+            .map(|delta| (delta.collection.clone(), delta.document_id.clone()));
+        match crdt.reject_delta_with_policy(mutation_id, hint) {
+            Some(nodedb_crdt::PolicyResolution::AutoResolved(action)) => {
+                tracing::info!(
+                    mutation_id,
+                    action = ?action,
+                    "SyncDelegate: delta auto-resolved by policy"
+                );
+            }
+            Some(nodedb_crdt::PolicyResolution::Deferred {
                 retry_after_ms,
                 attempt,
-                "SyncDelegate: delta deferred for retry"
-            );
+                ..
+            }) => {
+                tracing::info!(
+                    mutation_id,
+                    retry_after_ms,
+                    attempt,
+                    "SyncDelegate: delta deferred for retry"
+                );
+            }
+            Some(nodedb_crdt::PolicyResolution::Escalate { .. }) => {
+                tracing::warn!(mutation_id, "SyncDelegate: delta escalated to DLQ (policy)");
+            }
+            Some(nodedb_crdt::PolicyResolution::WebhookRequired { webhook_url, .. }) => {
+                tracing::warn!(
+                    mutation_id,
+                    webhook_url,
+                    "SyncDelegate: delta requires webhook (not supported on Lite)"
+                );
+                let _ = crdt.reject_delta(mutation_id);
+            }
+            None => {
+                tracing::debug!(
+                    mutation_id,
+                    "SyncDelegate: reject_with_policy — delta not found"
+                );
+            }
         }
-        Some(nodedb_crdt::PolicyResolution::Escalate { .. }) => {
-            tracing::warn!(mutation_id, "SyncDelegate: delta escalated to DLQ (policy)");
+        drop(crdt);
+        if let Some((collection, id)) = affected {
+            db.reindex_documents_local(&collection, [id.as_str()])?;
         }
-        Some(nodedb_crdt::PolicyResolution::WebhookRequired { webhook_url, .. }) => {
-            tracing::warn!(
-                mutation_id,
-                webhook_url,
-                "SyncDelegate: delta requires webhook (not supported on Lite)"
-            );
-            let _ = crdt.reject_delta(mutation_id);
-        }
-        None => {
-            tracing::debug!(
-                mutation_id,
-                "SyncDelegate: reject_with_policy — delta not found"
-            );
-        }
-    }
+        Ok(())
+    })();
+    guard.finish(result)
 }

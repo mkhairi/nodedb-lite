@@ -25,6 +25,7 @@ fn row_key(row: &[Value]) -> String {
 
 pub(super) fn lower_union<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     inputs: &[SqlPlan],
     distinct: bool,
 ) -> Result<LiteFut<'a>, LiteError> {
@@ -36,7 +37,7 @@ pub(super) fn lower_union<'a, S: StorageEngine + 'a>(
         let mut seen: HashSet<String> = HashSet::new();
 
         for plan in &inputs {
-            let result = engine.execute_plan(plan).await?;
+            let result = engine.execute_plan_admitted(plan, permit).await?;
             if columns.is_empty() {
                 columns = result.columns.clone();
             }
@@ -65,6 +66,7 @@ pub(super) fn lower_union<'a, S: StorageEngine + 'a>(
 
 pub(super) fn lower_intersect<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     left: &SqlPlan,
     right: &SqlPlan,
     all: bool,
@@ -73,8 +75,8 @@ pub(super) fn lower_intersect<'a, S: StorageEngine + 'a>(
     let right = right.clone();
 
     Ok(Box::pin(async move {
-        let left_result = engine.execute_plan(&left).await?;
-        let right_result = engine.execute_plan(&right).await?;
+        let left_result = engine.execute_plan_admitted(&left, permit).await?;
+        let right_result = engine.execute_plan_admitted(&right, permit).await?;
 
         let columns = left_result.columns.clone();
 
@@ -127,6 +129,7 @@ pub(super) fn lower_intersect<'a, S: StorageEngine + 'a>(
 
 pub(super) fn lower_except<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     left: &SqlPlan,
     right: &SqlPlan,
     all: bool,
@@ -135,8 +138,8 @@ pub(super) fn lower_except<'a, S: StorageEngine + 'a>(
     let right = right.clone();
 
     Ok(Box::pin(async move {
-        let left_result = engine.execute_plan(&left).await?;
-        let right_result = engine.execute_plan(&right).await?;
+        let left_result = engine.execute_plan_admitted(&left, permit).await?;
+        let right_result = engine.execute_plan_admitted(&right, permit).await?;
 
         let columns = left_result.columns.clone();
 

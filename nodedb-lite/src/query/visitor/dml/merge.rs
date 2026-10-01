@@ -18,7 +18,9 @@ use crate::error::LiteError;
 use crate::query::document_ops::sets::{
     build_insert_map, collect_ids_pub, fetch_document_value_pub,
 };
-use crate::query::document_ops::writes::{point_delete, point_insert, point_update};
+use crate::query::document_ops::writes::{
+    point_delete_admitted, point_insert_admitted, point_update_admitted,
+};
 use crate::query::engine::LiteQueryEngine;
 use crate::query::value_utils::value_to_string;
 use crate::storage::engine::StorageEngine;
@@ -35,6 +37,7 @@ use super::rows::{
 #[allow(clippy::too_many_arguments)]
 pub(in crate::query::visitor) fn lower_merge<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     target: &str,
     _engine_type: EngineType,
     source: &SqlPlan,
@@ -51,7 +54,7 @@ pub(in crate::query::visitor) fn lower_merge<'a, S: StorageEngine + 'a>(
     let phys_clauses = convert_merge_clauses(clauses)?;
 
     Ok(Box::pin(async move {
-        let source_result = engine.execute_plan(&source).await?;
+        let source_result = engine.execute_plan_admitted(&source, Some(permit)).await?;
         let source_maps = result_to_maps(source_result);
 
         let mut source_index: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -78,7 +81,8 @@ pub(in crate::query::visitor) fn lower_merge<'a, S: StorageEngine + 'a>(
                     .iter()
                     .find(|c| c.kind == MergeClauseKind::Matched);
                 if let Some(arm) = arm {
-                    apply_merge_action(engine, &target, doc_id, &arm.action, source_row).await?;
+                    apply_merge_action(engine, permit, &target, doc_id, &arm.action, source_row)
+                        .await?;
                     affected += 1;
                 }
             } else {
@@ -88,8 +92,15 @@ pub(in crate::query::visitor) fn lower_merge<'a, S: StorageEngine + 'a>(
                 if let Some(arm) = arm {
                     // No source row for this target — NOT MATCHED BY SOURCE arms
                     // are UPDATE/DELETE only, so an empty source suffices.
-                    apply_merge_action(engine, &target, doc_id, &arm.action, &HashMap::new())
-                        .await?;
+                    apply_merge_action(
+                        engine,
+                        permit,
+                        &target,
+                        doc_id,
+                        &arm.action,
+                        &HashMap::new(),
+                    )
+                    .await?;
                     affected += 1;
                 }
             }
@@ -103,7 +114,8 @@ pub(in crate::query::visitor) fn lower_merge<'a, S: StorageEngine + 'a>(
             for (source_key, source_row) in &source_index {
                 if !matched_source_keys.contains(source_key) {
                     let doc_id = extract_id(source_row);
-                    apply_merge_action(engine, &target, &doc_id, &arm.action, source_row).await?;
+                    apply_merge_action(engine, permit, &target, &doc_id, &arm.action, source_row)
+                        .await?;
                     affected += 1;
                 }
             }
@@ -120,6 +132,7 @@ pub(in crate::query::visitor) fn lower_merge<'a, S: StorageEngine + 'a>(
 
 pub(super) async fn apply_merge_action<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
     target: &str,
     doc_id: &str,
     action: &MergeActionOp,
@@ -127,10 +140,10 @@ pub(super) async fn apply_merge_action<S: StorageEngine>(
 ) -> Result<(), LiteError> {
     match action {
         MergeActionOp::Update { updates } => {
-            point_update(engine, target, doc_id, updates).await?;
+            point_update_admitted(engine, permit, target, doc_id, updates).await?;
         }
         MergeActionOp::Delete => {
-            point_delete(engine, target, doc_id).await?;
+            point_delete_admitted(engine, permit, target, doc_id).await?;
         }
         MergeActionOp::Insert { columns, values } => {
             // Evaluate each value against the source row: literals decode
@@ -139,7 +152,7 @@ pub(super) async fn apply_merge_action<S: StorageEngine>(
             let row_map = build_insert_map(columns, values, source_row)?;
             let id = extract_id(&row_map);
             let bytes = row_to_msgpack(&row_map)?;
-            point_insert(engine, target, &id, &bytes, true).await?;
+            point_insert_admitted(engine, permit, target, &id, &bytes, true).await?;
         }
         MergeActionOp::DoNothing => {}
     }

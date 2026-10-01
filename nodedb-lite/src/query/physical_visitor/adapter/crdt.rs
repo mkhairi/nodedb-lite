@@ -14,6 +14,7 @@ use super::policy::deny_policy;
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     op: &CrdtOp,
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
     match op {
@@ -38,7 +39,14 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let delta_bytes = delta.clone();
             let mid = *mutation_id;
             Ok(Box::pin(async move {
-                crdt_ops::write::handle_apply(engine, col.as_str(), &delta_bytes, mid).await
+                crdt_ops::write::handle_apply_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &delta_bytes,
+                    mid,
+                )
+                .await
             }))
         }
 
@@ -48,7 +56,13 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let col = collection.clone();
             let bytes = bytes.clone();
             Ok(Box::pin(async move {
-                crdt_ops::write::handle_import_snapshot(engine, col.as_str(), &bytes).await
+                crdt_ops::write::handle_import_snapshot_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &bytes,
+                )
+                .await
             }))
         }
 
@@ -148,8 +162,9 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let doc_id = document_id.clone();
             let target_json = target_version_json.clone();
             Ok(Box::pin(async move {
-                crdt_ops::version::handle_restore_to_version(
+                crdt_ops::version::handle_restore_to_version_coordinated(
                     engine,
+                    permit,
                     col.as_str(),
                     &doc_id,
                     &target_json,
@@ -165,8 +180,13 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let col = collection.clone();
             let target_json = target_version_json.clone();
             Ok(Box::pin(async move {
-                crdt_ops::version::handle_compact_at_version(engine, col.as_str(), &target_json)
-                    .await
+                crdt_ops::version::handle_compact_at_version_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &target_json,
+                )
+                .await
             }))
         }
 
@@ -184,8 +204,9 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let idx = *index;
             let fields = fields_json.clone();
             Ok(Box::pin(async move {
-                crdt_ops::list::handle_list_insert(
+                crdt_ops::list::handle_list_insert_coordinated(
                     engine,
+                    permit,
                     col.as_str(),
                     &doc_id,
                     &path,
@@ -208,7 +229,15 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let path = list_path.clone();
             let idx = *index;
             Ok(Box::pin(async move {
-                crdt_ops::list::handle_list_delete(engine, col.as_str(), &doc_id, &path, idx).await
+                crdt_ops::list::handle_list_delete_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &doc_id,
+                    &path,
+                    idx,
+                )
+                .await
             }))
         }
 
@@ -226,8 +255,16 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let from = *from_index;
             let to = *to_index;
             Ok(Box::pin(async move {
-                crdt_ops::list::handle_list_move(engine, col.as_str(), &doc_id, &path, from, to)
-                    .await
+                crdt_ops::list::handle_list_move_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &doc_id,
+                    &path,
+                    from,
+                    to,
+                )
+                .await
             }))
         }
 
@@ -256,14 +293,17 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let verb = *verb;
             let returning = returning.clone();
             Ok(Box::pin(async move {
-                crdt_ops::doc_row::handle_doc_upsert(
+                crdt_ops::doc_row::handle_doc_upsert_coordinated(
                     engine,
-                    col.as_str(),
-                    &doc_id,
-                    &fields,
-                    partial,
-                    verb,
-                    returning.as_ref(),
+                    permit,
+                    crdt_ops::doc_row::DocUpsertRequest {
+                        collection: col.as_str(),
+                        document_id: &doc_id,
+                        fields_json: &fields,
+                        partial,
+                        verb,
+                        returning: returning.as_ref(),
+                    },
                 )
                 .await
             }))
@@ -287,8 +327,9 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let doc_id = document_id.clone();
             let returning = returning.clone();
             Ok(Box::pin(async move {
-                crdt_ops::doc_row::handle_doc_delete(
+                crdt_ops::doc_row::handle_doc_delete_coordinated(
                     engine,
+                    permit,
                     col.as_str(),
                     &doc_id,
                     returning.as_ref(),

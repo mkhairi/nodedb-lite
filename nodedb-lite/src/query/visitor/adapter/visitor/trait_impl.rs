@@ -6,9 +6,6 @@
 //! becomes a hard compile error here, which is the intended forcing
 //! function for exhaustive coverage.
 
-use std::future::Future;
-use std::pin::Pin;
-
 use nodedb_sql::PlanVisitor;
 use nodedb_sql::fts_types::FtsQuery;
 use nodedb_sql::temporal::TemporalScope;
@@ -24,26 +21,13 @@ use nodedb_sql::{
     TimeseriesScanVisitArgs, UpdateFromVisitArgs, UpsertVisitArgs, VectorPrimaryDeleteVisitArgs,
     VectorPrimaryInsertVisitArgs, VectorPrimaryUpdateVisitArgs, VectorSearchVisitArgs,
 };
-use nodedb_types::result::QueryResult;
 
 use crate::error::LiteError;
-use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
 use super::{admin, array, ddl, dml, kv, reads_combine, reads_scan, reads_search, vector};
 
-// On wasm32 the StorageEngine futures are `!Send`, so we cannot require Send
-// on the visitor future type.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) type LiteFut<'a> =
-    Pin<Box<dyn Future<Output = Result<QueryResult, LiteError>> + Send + 'a>>;
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) type LiteFut<'a> = Pin<Box<dyn Future<Output = Result<QueryResult, LiteError>> + 'a>>;
-
-pub(crate) struct LiteVisitor<'a, S: StorageEngine> {
-    pub(crate) engine: &'a LiteQueryEngine<S>,
-}
+use super::types::{LiteFut, LiteVisitor};
 
 impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
     type Output = LiteFut<'a>;
@@ -80,11 +64,11 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
     }
 
     fn insert(&mut self, args: InsertVisitArgs<'_>) -> Result<LiteFut<'a>, LiteError> {
-        dml::insert(self.engine, args)
+        dml::insert(self.engine, self.mutation_permit()?, args)
     }
 
     fn upsert(&mut self, args: UpsertVisitArgs<'_>) -> Result<LiteFut<'a>, LiteError> {
-        dml::upsert(self.engine, args)
+        dml::upsert(self.engine, self.mutation_permit()?, args)
     }
 
     fn update(
@@ -94,16 +78,18 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         assignments: &[(String, SqlExpr)],
         filters: &[Filter],
         target_keys: &[SqlValue],
-        returning: bool,
+        _returning: bool,
     ) -> Result<LiteFut<'a>, LiteError> {
         dml::update(
             self.engine,
-            collection,
-            engine_type,
-            assignments,
-            filters,
-            target_keys,
-            returning,
+            self.mutation_permit()?,
+            dml::UpdateRequest {
+                collection,
+                engine_type,
+                assignments,
+                filters,
+                target_keys,
+            },
         )
     }
 
@@ -114,7 +100,14 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         filters: &[Filter],
         target_keys: &[SqlValue],
     ) -> Result<LiteFut<'a>, LiteError> {
-        dml::delete(self.engine, collection, engine_type, filters, target_keys)
+        dml::delete(
+            self.engine,
+            self.mutation_permit()?,
+            collection,
+            engine_type,
+            filters,
+            target_keys,
+        )
     }
 
     fn truncate(
@@ -123,7 +116,13 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         engine: EngineType,
         restart_identity: bool,
     ) -> Result<LiteFut<'a>, LiteError> {
-        admin::truncate(self.engine, collection, engine, restart_identity)
+        admin::truncate(
+            self.engine,
+            self.mutation_permit()?,
+            collection,
+            engine,
+            restart_identity,
+        )
     }
 
     fn vector_search(&mut self, args: VectorSearchVisitArgs<'_>) -> Result<LiteFut<'a>, LiteError> {
@@ -175,19 +174,26 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         limit: usize,
         column_map: &[(String, SqlExpr)],
     ) -> Result<LiteFut<'a>, LiteError> {
-        dml::insert_select(self.engine, target, source, limit, column_map)
+        dml::insert_select(
+            self.engine,
+            self.mutation_permit()?,
+            target,
+            source,
+            limit,
+            column_map,
+        )
     }
 
     fn update_from(&mut self, args: UpdateFromVisitArgs<'_>) -> Result<LiteFut<'a>, LiteError> {
-        dml::update_from(self.engine, args)
+        dml::update_from(self.engine, self.mutation_permit()?, args)
     }
 
     fn join(&mut self, args: JoinVisitArgs<'_>) -> Result<LiteFut<'a>, LiteError> {
-        reads_combine::join(self.engine, args)
+        reads_combine::join(self.engine, self.permit, args)
     }
 
     fn aggregate(&mut self, args: AggregateVisitArgs<'_>) -> Result<LiteFut<'a>, LiteError> {
-        reads_combine::aggregate(self.engine, args)
+        reads_combine::aggregate(self.engine, self.permit, args)
     }
 
     fn union(
@@ -195,7 +201,7 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         inputs: &[nodedb_sql::types::SqlPlan],
         distinct: bool,
     ) -> Result<LiteFut<'a>, LiteError> {
-        reads_combine::union(self.engine, inputs, distinct)
+        reads_combine::union(self.engine, self.permit, inputs, distinct)
     }
 
     fn intersect(
@@ -204,7 +210,7 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         right: &nodedb_sql::types::SqlPlan,
         all: bool,
     ) -> Result<LiteFut<'a>, LiteError> {
-        reads_combine::intersect(self.engine, left, right, all)
+        reads_combine::intersect(self.engine, self.permit, left, right, all)
     }
 
     fn except(
@@ -213,7 +219,7 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         right: &nodedb_sql::types::SqlPlan,
         all: bool,
     ) -> Result<LiteFut<'a>, LiteError> {
-        reads_combine::except(self.engine, left, right, all)
+        reads_combine::except(self.engine, self.permit, left, right, all)
     }
 
     fn cte(
@@ -221,15 +227,15 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         definitions: &[(String, nodedb_sql::types::SqlPlan)],
         outer: &nodedb_sql::types::SqlPlan,
     ) -> Result<LiteFut<'a>, LiteError> {
-        reads_combine::cte(self.engine, definitions, outer)
+        reads_combine::cte(self.engine, self.permit, definitions, outer)
     }
 
     fn subquery(&mut self, args: SubqueryVisitArgs<'_>) -> Result<LiteFut<'a>, LiteError> {
-        reads_combine::subquery(self.engine, args)
+        reads_combine::subquery(self.engine, self.permit, args)
     }
 
     fn merge(&mut self, args: MergeVisitArgs<'_>) -> Result<LiteFut<'a>, LiteError> {
-        dml::merge(self.engine, args)
+        dml::merge(self.engine, self.mutation_permit()?, args)
     }
 
     fn multi_vector_search(
@@ -279,21 +285,21 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         collection: &str,
         rows: &[Vec<(String, SqlValue)>],
     ) -> Result<LiteFut<'a>, LiteError> {
-        dml::timeseries_ingest(self.engine, collection, rows)
+        dml::timeseries_ingest(self.engine, self.mutation_permit()?, collection, rows)
     }
 
     fn vector_primary_insert(
         &mut self,
         args: VectorPrimaryInsertVisitArgs<'_>,
     ) -> Result<LiteFut<'a>, LiteError> {
-        vector::vector_primary_insert(self.engine, args)
+        vector::vector_primary_insert(self.engine, self.mutation_permit()?, args)
     }
 
     fn vector_primary_delete(
         &mut self,
         args: VectorPrimaryDeleteVisitArgs<'_>,
     ) -> Result<LiteFut<'a>, LiteError> {
-        vector::vector_primary_delete(self.engine, args)
+        vector::vector_primary_delete(self.engine, self.mutation_permit()?, args)
     }
 
     fn vector_primary_truncate(
@@ -302,14 +308,20 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
         field: &str,
         restart_identity: bool,
     ) -> Result<LiteFut<'a>, LiteError> {
-        vector::vector_primary_truncate(self.engine, collection, field, restart_identity)
+        vector::vector_primary_truncate(
+            self.engine,
+            self.mutation_permit()?,
+            collection,
+            field,
+            restart_identity,
+        )
     }
 
     fn vector_primary_update(
         &mut self,
         args: VectorPrimaryUpdateVisitArgs<'_>,
     ) -> Result<LiteFut<'a>, LiteError> {
-        vector::vector_primary_update(self.engine, args)
+        vector::vector_primary_update(self.engine, self.mutation_permit()?, args)
     }
 
     fn recursive_scan(
@@ -327,11 +339,11 @@ impl<'a, S: StorageEngine + 'a> PlanVisitor for LiteVisitor<'a, S> {
     }
 
     fn lateral_top_k(&mut self, args: LateralTopKVisitArgs<'_>) -> Result<LiteFut<'a>, LiteError> {
-        reads_scan::lateral_top_k(self.engine, args)
+        reads_scan::lateral_top_k(self.engine, self.permit, args)
     }
 
     fn lateral_loop(&mut self, args: LateralLoopVisitArgs<'_>) -> Result<LiteFut<'a>, LiteError> {
-        reads_scan::lateral_loop(self.engine, args)
+        reads_scan::lateral_loop(self.engine, self.permit, args)
     }
 
     fn kv_insert(

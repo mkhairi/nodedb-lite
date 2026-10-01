@@ -12,6 +12,7 @@ use super::LitePhysicalFut;
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     op: &MetaOp,
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
     match op {
@@ -38,7 +39,10 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let n = name.clone();
             let lsn = *purge_lsn;
             Ok(Box::pin(async move {
-                meta_ops::handle_unregister_collection(engine, tid, &n, lsn).await
+                meta_ops::lifecycle::handle_unregister_collection_coordinated(
+                    engine, permit, tid, &n, lsn,
+                )
+                .await
             }))
         }
         MetaOp::UnregisterMaterializedView { tenant_id, name } => {
@@ -58,7 +62,14 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let old = old_collection.clone();
             let new = new_collection.clone();
             Ok(Box::pin(async move {
-                meta_ops::handle_rename_collection(engine, tid, old.as_str(), new.as_str()).await
+                meta_ops::lifecycle::handle_rename_collection_coordinated(
+                    engine,
+                    permit,
+                    tid,
+                    old.as_str(),
+                    new.as_str(),
+                )
+                .await
             }))
         }
         // Lite's convert probes its own per-engine stores (CRDT, strict) and
@@ -74,7 +85,14 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let tt = target_type.clone();
             let sj = schema_json.clone();
             Ok(Box::pin(async move {
-                meta_ops::handle_convert_collection(engine, col.as_str(), &tt, &sj).await
+                meta_ops::lifecycle::handle_convert_collection_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &tt,
+                    &sj,
+                )
+                .await
             }))
         }
         MetaOp::RegisterContinuousAggregate { def } => {

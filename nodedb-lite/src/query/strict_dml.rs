@@ -31,6 +31,32 @@ pub async fn insert_strict<S: StorageEngine>(
     rows: &[Vec<(String, SqlValue)>],
     if_absent: bool,
 ) -> Result<QueryResult, LiteError> {
+    insert_strict_coordinated(engine, None, collection, rows, if_absent).await
+}
+
+pub(crate) async fn insert_strict_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: &str,
+    rows: &[Vec<(String, SqlValue)>],
+    if_absent: bool,
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return insert_strict_admitted(engine, permit, collection, rows, if_absent).await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result = insert_strict_admitted(engine, guard.permit(), collection, rows, if_absent).await;
+    guard.finish(result)
+}
+
+pub(crate) async fn insert_strict_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    collection: &str,
+    rows: &[Vec<(String, SqlValue)>],
+    if_absent: bool,
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
     let strict = &engine.strict;
     let schema = strict
         .schema(collection)
@@ -91,6 +117,50 @@ pub async fn update_strict<S: StorageEngine>(
     filters: &[Filter],
     target_keys: &[SqlValue],
 ) -> Result<QueryResult, LiteError> {
+    update_strict_coordinated(engine, None, collection, assignments, filters, target_keys).await
+}
+
+pub(crate) async fn update_strict_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: &str,
+    assignments: &[(String, SqlExpr)],
+    filters: &[Filter],
+    target_keys: &[SqlValue],
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return update_strict_admitted(
+            engine,
+            permit,
+            collection,
+            assignments,
+            filters,
+            target_keys,
+        )
+        .await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result = update_strict_admitted(
+        engine,
+        guard.permit(),
+        collection,
+        assignments,
+        filters,
+        target_keys,
+    )
+    .await;
+    guard.finish(result)
+}
+
+pub(crate) async fn update_strict_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    collection: &str,
+    assignments: &[(String, SqlExpr)],
+    filters: &[Filter],
+    target_keys: &[SqlValue],
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
     let strict = &engine.strict;
     let schema = strict
         .schema(collection)
@@ -144,6 +214,33 @@ pub async fn delete_strict<S: StorageEngine>(
     filters: &[Filter],
     target_keys: &[SqlValue],
 ) -> Result<QueryResult, LiteError> {
+    delete_strict_coordinated(engine, None, collection, filters, target_keys).await
+}
+
+pub(crate) async fn delete_strict_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: &str,
+    filters: &[Filter],
+    target_keys: &[SqlValue],
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return delete_strict_admitted(engine, permit, collection, filters, target_keys).await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result =
+        delete_strict_admitted(engine, guard.permit(), collection, filters, target_keys).await;
+    guard.finish(result)
+}
+
+pub(crate) async fn delete_strict_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    collection: &str,
+    filters: &[Filter],
+    target_keys: &[SqlValue],
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
     let strict = &engine.strict;
     let schema = strict
         .schema(collection)

@@ -72,7 +72,9 @@ impl<S: StorageEngine> crate::sync::SyncDelegate for NodeDbLite<S> {
         mutation_id: u64,
         hint: &nodedb_types::sync::compensation::CompensationHint,
     ) {
-        super::reject::handle_reject_with_policy_impl(self, mutation_id, hint);
+        if let Err(error) = super::reject::handle_reject_with_policy_impl(self, mutation_id, hint) {
+            tracing::error!(mutation_id, %error, "delta rejection maintenance returned an error");
+        }
     }
 
     fn import_remote(&self, collection: &str, data: &[u8]) {

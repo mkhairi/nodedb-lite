@@ -21,20 +21,26 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         &self,
         name: &str,
     ) -> Result<QueryResult, LiteError> {
-        set_bitemporal(&*self.storage, name, true)
-            .await
-            .map_err(|e| LiteError::Query(e.to_string()))?;
+        let guard = self.fts_state.admit_mutation().await;
+        let result = async {
+            crate::engine::fts::checkpoint::persist_checkpoint_incomplete(&*self.storage).await?;
+            set_bitemporal(&*self.storage, name, true)
+                .await
+                .map_err(|e| LiteError::Query(e.to_string()))?;
 
-        self.register_document_collection(name, true).await?;
+            self.register_document_collection(name, true).await?;
 
-        Ok(QueryResult {
-            columns: vec!["result".into()],
-            rows: vec![vec![Value::String(format!(
-                "bitemporal document collection '{name}' created"
-            ))]],
-            rows_affected: 0,
-            command: None,
-        })
+            Ok(QueryResult {
+                columns: vec!["result".into()],
+                rows: vec![vec![Value::String(format!(
+                    "bitemporal document collection '{name}' created"
+                ))]],
+                rows_affected: 0,
+                command: None,
+            })
+        }
+        .await;
+        guard.finish(result)
     }
 
     /// Handle: `CREATE COLLECTION <name>` with no engine and no flags.
@@ -49,16 +55,22 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         &self,
         name: &str,
     ) -> Result<QueryResult, LiteError> {
-        self.register_document_collection(name, false).await?;
+        let guard = self.fts_state.admit_mutation().await;
+        let result = async {
+            crate::engine::fts::checkpoint::persist_checkpoint_incomplete(&*self.storage).await?;
+            self.register_document_collection(name, false).await?;
 
-        Ok(QueryResult {
-            columns: vec!["result".into()],
-            rows: vec![vec![Value::String(format!(
-                "document collection '{name}' created"
-            ))]],
-            rows_affected: 0,
-            command: None,
-        })
+            Ok(QueryResult {
+                columns: vec!["result".into()],
+                rows: vec![vec![Value::String(format!(
+                    "document collection '{name}' created"
+                ))]],
+                rows_affected: 0,
+                command: None,
+            })
+        }
+        .await;
+        guard.finish(result)
     }
 
     /// Handle: `DROP COLLECTION <name>` for a schemaless document collection.
@@ -71,31 +83,39 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         &self,
         name: &str,
     ) -> Result<QueryResult, LiteError> {
-        self.crdt
-            .lock()
-            .map_err(|_| LiteError::LockPoisoned)?
-            .clear_collection(name)
-            .map_err(|e| LiteError::Query(e.to_string()))?;
-        self.indexes.drop_collection(&*self.storage, name).await?;
+        let guard = self.fts_state.admit_mutation().await;
+        let result = async {
+            self.fts_state
+                .persist_collection_tombstone(&*self.storage, name, guard.permit())
+                .await?;
+            self.crdt
+                .lock()
+                .map_err(|_| LiteError::LockPoisoned)?
+                .clear_collection(name)
+                .map_err(|e| LiteError::Query(e.to_string()))?;
+            self.indexes.drop_collection(&*self.storage, name).await?;
 
-        self.fts_state
-            .manager
-            .lock()
-            .map_err(|_| LiteError::LockPoisoned)?
-            .drop_collection(name);
+            self.fts_state
+                .manager
+                .lock()
+                .map_err(|_| LiteError::LockPoisoned)?
+                .drop_collection(name);
 
-        let key = format!("collection:{name}");
-        self.storage
-            .delete(nodedb_types::Namespace::Meta, key.as_bytes())
-            .await
-            .map_err(|e| LiteError::Query(format!("storage: {e}")))?;
+            let key = format!("collection:{name}");
+            self.storage
+                .delete(nodedb_types::Namespace::Meta, key.as_bytes())
+                .await
+                .map_err(|e| LiteError::Query(format!("storage: {e}")))?;
 
-        Ok(QueryResult {
-            columns: vec!["result".into()],
-            rows: vec![vec![Value::String(format!("collection '{name}' dropped"))]],
-            rows_affected: 0,
-            command: None,
-        })
+            Ok(QueryResult {
+                columns: vec!["result".into()],
+                rows: vec![vec![Value::String(format!("collection '{name}' dropped"))]],
+                rows_affected: 0,
+                command: None,
+            })
+        }
+        .await;
+        guard.finish(result)
     }
 
     /// Persist collection metadata and register the name with the CRDT engine.

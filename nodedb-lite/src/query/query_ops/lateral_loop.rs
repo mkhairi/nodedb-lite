@@ -31,6 +31,7 @@ use crate::storage::engine::StorageEngine;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_lateral_loop_sql<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
     outer_sql: &SqlPlan,
     outer_alias: &str,
     inner_sql: &SqlPlan,
@@ -42,7 +43,7 @@ pub(crate) async fn execute_lateral_loop_sql<S: StorageEngine>(
 ) -> Result<QueryResult, LiteError> {
     use crate::query::query_ops::joins::common::rows_to_maps;
 
-    let outer_result = engine.execute_plan(outer_sql).await?;
+    let outer_result = engine.execute_plan_admitted(outer_sql, permit).await?;
     let outer_rows = rows_to_maps(outer_result);
 
     if outer_row_cap > 0 && outer_rows.len() > outer_row_cap {
@@ -59,7 +60,7 @@ pub(crate) async fn execute_lateral_loop_sql<S: StorageEngine>(
     for outer_row in &outer_rows {
         let outer_prefixed = prefix_row(outer_row, outer_alias);
 
-        let inner_result = engine.execute_plan(inner_sql).await?;
+        let inner_result = engine.execute_plan_admitted(inner_sql, permit).await?;
         let inner_all = rows_to_maps(inner_result);
 
         let mut corr_filters: Vec<ScanFilter> = Vec::new();

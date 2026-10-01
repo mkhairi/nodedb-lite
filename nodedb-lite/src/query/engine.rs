@@ -218,7 +218,24 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         &self,
         plan: &SqlPlan,
     ) -> Result<QueryResult, LiteError> {
-        let mut visitor = super::visitor::LiteVisitor { engine: self };
+        if plan_mutates_source(plan) {
+            let guard = self.fts_state.admit_mutation().await;
+            let result = self.execute_plan_admitted(plan, Some(guard.permit())).await;
+            guard.finish(result)
+        } else {
+            self.execute_plan_admitted(plan, None).await
+        }
+    }
+
+    pub(in crate::query) async fn execute_plan_admitted(
+        &self,
+        plan: &SqlPlan,
+        permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    ) -> Result<QueryResult, LiteError> {
+        let mut visitor = super::visitor::LiteVisitor {
+            engine: self,
+            permit,
+        };
         let mut result = nodedb_sql::dispatch(&mut visitor, plan)?.await?;
         // The shared plan dispatcher hands the visitor a point get without its
         // SELECT list, so the list is applied here, as the scan path applies
@@ -368,4 +385,50 @@ pub(crate) fn test_kv_local() -> Arc<KvLocalState> {
     Arc::new(KvLocalState::new(
         std::num::NonZeroUsize::new(64).expect("non-zero"),
     ))
+}
+
+fn plan_mutates_source(plan: &SqlPlan) -> bool {
+    match plan {
+        SqlPlan::Insert(_)
+        | SqlPlan::KvInsert(_)
+        | SqlPlan::Upsert(_)
+        | SqlPlan::InsertSelect { .. }
+        | SqlPlan::Update { .. }
+        | SqlPlan::UpdateFrom { .. }
+        | SqlPlan::Delete { .. }
+        | SqlPlan::Truncate { .. }
+        | SqlPlan::Merge(_)
+        | SqlPlan::TimeseriesIngest(_)
+        | SqlPlan::VectorPrimaryInsert(_)
+        | SqlPlan::VectorPrimaryDelete(_)
+        | SqlPlan::VectorPrimaryUpdate(_)
+        | SqlPlan::VectorPrimaryTruncate(_)
+        | SqlPlan::CreateArray(_)
+        | SqlPlan::DropArray { .. }
+        | SqlPlan::AlterArray(_)
+        | SqlPlan::InsertArray(_)
+        | SqlPlan::DeleteArray(_)
+        | SqlPlan::ArrayFlush { .. }
+        | SqlPlan::ArrayCompact { .. } => true,
+        SqlPlan::Join { left, right, .. }
+        | SqlPlan::Intersect { left, right, .. }
+        | SqlPlan::Except { left, right, .. } => {
+            plan_mutates_source(left) || plan_mutates_source(right)
+        }
+        SqlPlan::Aggregate { input, .. } | SqlPlan::Subquery { input, .. } => {
+            plan_mutates_source(input)
+        }
+        SqlPlan::Union { inputs, .. } => inputs.iter().any(plan_mutates_source),
+        SqlPlan::LateralTopK(plan) => plan_mutates_source(&plan.outer),
+        SqlPlan::LateralLoop(plan) => {
+            plan_mutates_source(&plan.outer) || plan_mutates_source(&plan.inner)
+        }
+        SqlPlan::Cte(plan) => {
+            plan.definitions
+                .iter()
+                .any(|(_, plan)| plan_mutates_source(plan))
+                || plan_mutates_source(&plan.outer)
+        }
+        _ => false,
+    }
 }

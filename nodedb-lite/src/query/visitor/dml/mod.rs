@@ -6,8 +6,6 @@
 mod insert_select;
 mod merge;
 mod rows;
-#[cfg(test)]
-mod tests;
 mod update_from;
 
 pub(super) use insert_select::lower_insert_select;

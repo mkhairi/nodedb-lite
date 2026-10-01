@@ -30,68 +30,75 @@ impl<S: StorageEngine> NodeDbLite<S> {
         &self,
         descriptor: &CollectionDescriptor,
     ) -> NodeDbResult<()> {
-        let name = descriptor.name.as_str();
-        let key = format!("collection:{name}");
+        let guard = self.fts_state.admit_mutation().await;
+        let result = async {
+            let name = descriptor.name.as_str();
+            let key = format!("collection:{name}");
 
-        // Idempotent create-only: never clobber existing local metadata.
-        if self
-            .storage
-            .get(nodedb_types::Namespace::Meta, key.as_bytes())
-            .await?
-            .is_some()
-        {
-            return Ok(());
-        }
+            // Idempotent create-only: never clobber existing local metadata.
+            if self
+                .storage
+                .get(nodedb_types::Namespace::Meta, key.as_bytes())
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
 
-        // Per-engine materialization. Exhaustive over `CollectionType` so a new
-        // engine variant forces a decision here rather than silently NOP-ing.
-        let mut config_json: Option<String> = None;
-        match &descriptor.collection_type {
-            // Schemaless documents: the CRDT engine creates the collection
-            // lazily on first write. Nothing to register engine-side.
-            CollectionType::Document(DocumentMode::Schemaless) => {}
-            // Strict documents: register the schema with the strict engine so
-            // reads/writes and the catalog resolve the real columns. Guard on
-            // absence so a partially-materialized prior attempt is tolerated.
-            CollectionType::Document(DocumentMode::Strict(schema)) => {
-                if self.strict.schema(name).is_none() {
-                    self.strict.create_collection(name, schema.clone()).await?;
+            // Per-engine materialization. Exhaustive over `CollectionType` so a new
+            // engine variant forces a decision here rather than silently NOP-ing.
+            let mut config_json: Option<String> = None;
+            match &descriptor.collection_type {
+                // Schemaless documents: the CRDT engine creates the collection
+                // lazily on first write. Nothing to register engine-side.
+                CollectionType::Document(DocumentMode::Schemaless) => {}
+                // Strict documents: register the schema with the strict engine so
+                // reads/writes and the catalog resolve the real columns. Guard on
+                // absence so a partially-materialized prior attempt is tolerated.
+                CollectionType::Document(DocumentMode::Strict(schema)) => {
+                    if self.strict.schema(name).is_none() {
+                        self.strict.create_collection(name, schema.clone()).await?;
+                    }
+                }
+                // Columnar / timeseries / spatial share one storage core and are
+                // created lazily on first insert. Persist meta only.
+                CollectionType::Columnar(ColumnarProfile::Plain)
+                | CollectionType::Columnar(ColumnarProfile::Timeseries { .. })
+                | CollectionType::Columnar(ColumnarProfile::Spatial { .. }) => {}
+                // Key-Value: reuse the existing KV create path to register the
+                // config, then overwrite the meta below with the authoritative one
+                // (descriptor_json + bitemporal). One source of truth wins.
+                CollectionType::KeyValue(cfg) => {
+                    self.create_kv_collection_admitted(guard.permit(), name, cfg)
+                        .await?;
+                    config_json = Some(
+                        sonic_rs::to_string(cfg)
+                            .map_err(|e| NodeDbError::storage(e.to_string()))?,
+                    );
                 }
             }
-            // Columnar / timeseries / spatial share one storage core and are
-            // created lazily on first insert. Persist meta only.
-            CollectionType::Columnar(ColumnarProfile::Plain)
-            | CollectionType::Columnar(ColumnarProfile::Timeseries { .. })
-            | CollectionType::Columnar(ColumnarProfile::Spatial { .. }) => {}
-            // Key-Value: reuse the existing KV create path to register the
-            // config, then overwrite the meta below with the authoritative one
-            // (descriptor_json + bitemporal). One source of truth wins.
-            CollectionType::KeyValue(cfg) => {
-                self.create_kv_collection(name, cfg).await?;
-                config_json = Some(
-                    sonic_rs::to_string(cfg).map_err(|e| NodeDbError::storage(e.to_string()))?,
-                );
-            }
+
+            let descriptor_json =
+                sonic_rs::to_string(descriptor).map_err(|e| NodeDbError::storage(e.to_string()))?;
+
+            let meta = CollectionMeta {
+                name: name.to_string(),
+                collection_type: descriptor.collection_type.as_str().to_string(),
+                created_at_ms: crate::runtime::now_millis(),
+                fields: descriptor.fields.clone(),
+                config_json,
+                descriptor_json: Some(descriptor_json),
+                bitemporal: descriptor.bitemporal,
+                crdt: descriptor.crdt,
+            };
+            let bytes = sonic_rs::to_vec(&meta).map_err(|e| NodeDbError::storage(e.to_string()))?;
+            self.storage
+                .put(nodedb_types::Namespace::Meta, key.as_bytes(), &bytes)
+                .await?;
+            Ok(())
         }
-
-        let descriptor_json =
-            sonic_rs::to_string(descriptor).map_err(|e| NodeDbError::storage(e.to_string()))?;
-
-        let meta = CollectionMeta {
-            name: name.to_string(),
-            collection_type: descriptor.collection_type.as_str().to_string(),
-            created_at_ms: crate::runtime::now_millis(),
-            fields: descriptor.fields.clone(),
-            config_json,
-            descriptor_json: Some(descriptor_json),
-            bitemporal: descriptor.bitemporal,
-            crdt: descriptor.crdt,
-        };
-        let bytes = sonic_rs::to_vec(&meta).map_err(|e| NodeDbError::storage(e.to_string()))?;
-        self.storage
-            .put(nodedb_types::Namespace::Meta, key.as_bytes(), &bytes)
-            .await?;
-        Ok(())
+        .await;
+        guard.finish(result)
     }
 }
 

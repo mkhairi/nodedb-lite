@@ -74,7 +74,7 @@ pub(super) fn lower_multi_vector_search<'a, S: StorageEngine + 'a>(
         filter_bitmap: None,
         rls_filters: Vec::new(),
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.vector(&op)?;
     Ok(Box::pin(fut))
 }
@@ -102,7 +102,7 @@ pub(super) fn lower_sparse_search<'a, S: StorageEngine + 'a>(
         query_entries: query_entries.to_vec(),
         top_k,
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.vector(&op)?;
     Ok(Box::pin(fut))
 }
@@ -138,7 +138,7 @@ pub(super) fn lower_hybrid_search<'a, S: StorageEngine + 'a>(
         rls_filters: Vec::new(),
         score_alias: score_alias.map(|s| s.to_string()),
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.text(&op)?;
     Ok(Box::pin(fut))
 }
@@ -180,7 +180,7 @@ pub(super) fn lower_hybrid_search_triple<'a, S: StorageEngine + 'a>(
         rls_filters: Vec::new(),
         score_alias: score_alias.map(|s| s.to_string()),
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.text(&op)?;
     Ok(Box::pin(fut))
 }
@@ -219,7 +219,7 @@ pub(super) fn lower_spatial_scan<'a, S: StorageEngine + 'a>(
         rls_filters: Vec::new(),
         prefilter: None,
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.spatial(&op)?;
     Ok(Box::pin(fut))
 }

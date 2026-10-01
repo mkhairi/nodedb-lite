@@ -64,6 +64,12 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         &self,
         sql: &str,
     ) -> Option<Result<QueryResult, LiteError>> {
+        if let Some(statement) = super::search_index::parse_search_index_ddl(sql) {
+            return Some(match statement {
+                Ok(statement) => self.handle_search_index(statement).await,
+                Err(error) => Err(error),
+            });
+        }
         let upper = sql.trim().to_uppercase();
 
         // ── Forms with no typed representation in the shared DDL parser ──

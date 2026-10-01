@@ -9,104 +9,15 @@ use crate::query::document_ops;
 use crate::query::engine::LiteQueryEngine;
 use crate::storage::engine::StorageEngine;
 
-use super::LitePhysicalFut;
-use super::document_index;
-use super::policy::deny_policy;
+use crate::query::physical_visitor::adapter::LitePhysicalFut;
+use crate::query::physical_visitor::adapter::policy::deny_policy;
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     op: &DocumentOp,
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
     match op {
-        DocumentOp::PointGet {
-            collection,
-            document_id,
-            rls_filters,
-            ..
-        } => {
-            // PointGet carries no write-check slot: it never writes.
-            deny_policy(
-                "DocumentOp::PointGet",
-                None,
-                &[rls_filters.as_slice()],
-                &RlsWriteCheck::NoPolicyApplies,
-            )?;
-            let col = collection.clone();
-            let doc_id = document_id.clone();
-            Ok(Box::pin(async move {
-                document_ops::reads::point_get(engine, col.as_str(), &doc_id).await
-            }))
-        }
-
-        DocumentOp::Scan {
-            collection,
-            limit,
-            offset,
-            ..
-        } => {
-            let col = collection.clone();
-            let limit = *limit;
-            let offset = *offset;
-            Ok(Box::pin(async move {
-                document_ops::reads::scan(engine, col.as_str(), limit, offset).await
-            }))
-        }
-
-        DocumentOp::RangeScan {
-            collection,
-            lower,
-            upper,
-            limit,
-            rls_filters,
-            ..
-        } => {
-            // RangeScan carries no write-check slot: it never writes.
-            deny_policy(
-                "DocumentOp::RangeScan",
-                None,
-                &[rls_filters.as_slice()],
-                &RlsWriteCheck::NoPolicyApplies,
-            )?;
-            let col = collection.clone();
-            let lower = lower.clone();
-            let upper = upper.clone();
-            let limit = *limit;
-            Ok(Box::pin(async move {
-                document_ops::reads::range_scan(
-                    engine,
-                    col.as_str(),
-                    lower.as_deref(),
-                    upper.as_deref(),
-                    limit,
-                )
-                .await
-            }))
-        }
-
-        DocumentOp::IndexedFetch {
-            collection,
-            path,
-            value,
-            limit,
-            offset,
-            ..
-        } => {
-            document_index::indexed_fetch(engine, collection.as_str(), path, value, *limit, *offset)
-        }
-
-        DocumentOp::IndexLookup {
-            collection,
-            path,
-            value,
-        } => document_index::index_lookup(engine, collection.as_str(), path, value),
-
-        DocumentOp::EstimateCount { collection, .. } => {
-            let col = collection.clone();
-            Ok(Box::pin(async move {
-                document_ops::reads::estimate_count(engine, col.as_str()).await
-            }))
-        }
-
         DocumentOp::PointPut {
             collection,
             document_id,
@@ -127,7 +38,14 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let doc_id = document_id.clone();
             let val = value.clone();
             Ok(Box::pin(async move {
-                document_ops::writes::point_put(engine, col.as_str(), &doc_id, &val).await
+                document_ops::writes::point_put_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &doc_id,
+                    &val,
+                )
+                .await
             }))
         }
 
@@ -153,8 +71,15 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let val = value.clone();
             let if_absent = *if_absent;
             Ok(Box::pin(async move {
-                document_ops::writes::point_insert(engine, col.as_str(), &doc_id, &val, if_absent)
-                    .await
+                document_ops::writes::point_insert_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &doc_id,
+                    &val,
+                    if_absent,
+                )
+                .await
             }))
         }
 
@@ -177,7 +102,14 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let doc_id = document_id.clone();
             let updates = updates.clone();
             Ok(Box::pin(async move {
-                document_ops::writes::point_update(engine, col.as_str(), &doc_id, &updates).await
+                document_ops::writes::point_update_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &doc_id,
+                    &updates,
+                )
+                .await
             }))
         }
 
@@ -198,7 +130,13 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let col = collection.clone();
             let doc_id = document_id.clone();
             Ok(Box::pin(async move {
-                document_ops::writes::point_delete(engine, col.as_str(), &doc_id).await
+                document_ops::writes::point_delete_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &doc_id,
+                )
+                .await
             }))
         }
 
@@ -220,7 +158,8 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let col = collection.clone();
             let docs = documents.clone();
             Ok(Box::pin(async move {
-                document_ops::writes::batch_insert(engine, col.as_str(), &docs).await
+                document_ops::writes::batch_insert_coordinated(engine, permit, col.as_str(), &docs)
+                    .await
             }))
         }
 
@@ -245,8 +184,15 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let val = value.clone();
             let conflict_updates = on_conflict_updates.clone();
             Ok(Box::pin(async move {
-                document_ops::writes::upsert(engine, col.as_str(), &doc_id, &val, &conflict_updates)
-                    .await
+                document_ops::writes::upsert_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &doc_id,
+                    &val,
+                    &conflict_updates,
+                )
+                .await
             }))
         }
 
@@ -258,7 +204,9 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let col = collection.clone();
             let restart = *restart_identity;
             Ok(Box::pin(async move {
-                let result = document_ops::writes::truncate(engine, col.as_str()).await?;
+                let result =
+                    document_ops::writes::truncate_coordinated(engine, permit, col.as_str())
+                        .await?;
                 crate::query::truncate::restart_identity(engine, col.as_str(), restart);
                 Ok(result)
             }))
@@ -281,7 +229,13 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let col = collection.clone();
             let updates = updates.clone();
             Ok(Box::pin(async move {
-                document_ops::writes::bulk_update(engine, col.as_str(), &updates).await
+                document_ops::writes::bulk_update_coordinated(
+                    engine,
+                    permit,
+                    col.as_str(),
+                    &updates,
+                )
+                .await
             }))
         }
 
@@ -304,41 +258,6 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             }))
         }
 
-        DocumentOp::Register {
-            collection,
-            storage_mode,
-            ..
-        } => {
-            let col = collection.clone();
-            let mode = storage_mode.clone();
-            Ok(Box::pin(async move {
-                document_ops::indexes::register(engine, col.as_str(), &mode).await
-            }))
-        }
-
-        DocumentOp::DropIndex { collection, field } => {
-            document_index::drop_index(engine, collection.as_str(), field)
-        }
-
-        DocumentOp::BackfillIndex {
-            collection,
-            path,
-            is_array,
-            unique,
-            case_insensitive,
-            predicate,
-        } => document_index::backfill_index(
-            engine,
-            collection.as_str(),
-            document_index::BackfillFlags {
-                path,
-                is_array: *is_array,
-                unique: *unique,
-                case_insensitive: *case_insensitive,
-                predicate: predicate.as_deref(),
-            },
-        ),
-
         DocumentOp::InsertSelect {
             target_collection,
             source_collection,
@@ -349,8 +268,14 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let source = source_collection.clone();
             let limit = *source_limit;
             Ok(Box::pin(async move {
-                document_ops::sets::insert_select(engine, target.as_str(), source.as_str(), limit)
-                    .await
+                document_ops::sets::insert_select_coordinated(
+                    engine,
+                    permit,
+                    target.as_str(),
+                    source.as_str(),
+                    limit,
+                )
+                .await
             }))
         }
 
@@ -379,13 +304,16 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let source_join = source_join_col.clone();
             let updates = updates.clone();
             Ok(Box::pin(async move {
-                document_ops::sets::update_from_join(
+                document_ops::sets::update_from_join_coordinated(
                     engine,
-                    target.as_str(),
-                    source.as_str(),
-                    &alias,
-                    &target_join,
-                    &source_join,
+                    permit,
+                    document_ops::sets::DocumentJoin {
+                        target_collection: target.as_str(),
+                        source_collection: source.as_str(),
+                        source_alias: &alias,
+                        target_join_col: &target_join,
+                        source_join_col: &source_join,
+                    },
                     &updates,
                 )
                 .await
@@ -417,64 +345,24 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let source_join = source_join_col.clone();
             let clauses = clauses.clone();
             Ok(Box::pin(async move {
-                document_ops::sets::merge(
+                document_ops::sets::merge_coordinated(
                     engine,
-                    target.as_str(),
-                    source.as_str(),
-                    &alias,
-                    &target_join,
-                    &source_join,
+                    permit,
+                    document_ops::sets::DocumentJoin {
+                        target_collection: target.as_str(),
+                        source_collection: source.as_str(),
+                        source_alias: &alias,
+                        target_join_col: &target_join,
+                        source_join_col: &source_join,
+                    },
                     &clauses,
                 )
                 .await
             }))
         }
 
-        DocumentOp::MaterializeScan {
-            collection,
-            cursor,
-            count,
-            ..
-        } => {
-            let col = collection.clone();
-            let cursor = cursor.clone();
-            let count = *count;
-            Ok(Box::pin(async move {
-                document_ops::sets::materialize_scan(engine, col.as_str(), &cursor, count).await
-            }))
-        }
-
-        // A materialized-sum binding splits its write across the source row and
-        // the target balance, which Origin homes on separate vShards and commits
-        // through Calvin. Lite has no binding maintenance, so a plan carrying
-        // this op would apply the source write and silently lose the balance.
-        DocumentOp::ApplyBalanceDelta {
-            collection, column, ..
-        } => Err(LiteError::Unsupported {
-            detail: format!(
-                "ApplyBalanceDelta on {collection}.{column}: materialized-sum \
-                 bindings are maintained by the Origin data plane and are \
-                 unsupported on the Lite engine"
-            ),
-        }),
-
-        // ResolveWrite/ResolvedWrite split a governed write into a resolve
-        // pass and a replay pass so every replica applies the same decision.
-        // Lite has no replica set to keep in sync, so its SQL visitor and CRDT
-        // sync execute Merge/UpdateFromJoin/PointUpdate/etc. directly and
-        // never wrap them in this pair.
-        DocumentOp::ResolveWrite(_) => Err(LiteError::Unsupported {
-            detail: "DocumentOp::ResolveWrite is the resolve pass of a governed \
-                     write Origin replays across replicas; Lite's single-node \
-                     engine executes writes directly and never emits it"
-                .into(),
-        }),
-
-        DocumentOp::ResolvedWrite { .. } => Err(LiteError::Unsupported {
-            detail: "DocumentOp::ResolvedWrite replays a decision made by \
-                     Origin's Raft leader, which has no equivalent on the \
-                     single-node Lite engine"
-                .into(),
+        _ => Err(LiteError::BadRequest {
+            detail: "document write dispatch received a non-write operation".into(),
         }),
     }
 }

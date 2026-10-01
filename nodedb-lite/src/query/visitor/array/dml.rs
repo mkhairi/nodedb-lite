@@ -67,7 +67,7 @@ pub(crate) fn lower_insert_array<'a, S: StorageEngine + 'a>(
         wal_lsn: 0,
         provenance: None,
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.array(&op)?;
     Ok(Box::pin(fut))
 }
@@ -96,7 +96,7 @@ pub(crate) fn lower_delete_array<'a, S: StorageEngine + 'a>(
         wal_lsn: 0,
         provenance: None,
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.array(&op)?;
     Ok(Box::pin(fut))
 }

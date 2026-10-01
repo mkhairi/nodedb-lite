@@ -39,8 +39,8 @@ impl<S: StorageEngine> NodeDbLite<S> {
     ///
     /// Configuration is resolved from environment variables via
     /// [`LiteConfig::from_env()`], falling back to defaults when variables are
-    /// absent or malformed — which includes the default one-second auto-flush
-    /// interval, so writes are durable within a second of landing.
+    /// absent or malformed. The default auto-flush interval is one second.
+    /// The timer schedules flushes without a hard completion deadline.
     ///
     /// The instance's Loro peer id is not a parameter: it is minted on first
     /// open and persisted with the data it authors. A caller-supplied id is
@@ -334,27 +334,27 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .map_err(NodeDbError::storage)?;
         }
 
-        // Rebuild text indices from CRDT state only when the checkpoint is
-        // missing or incomplete. A complete checkpoint has already loaded the
-        // full index without re-tokenizing source documents. A checkpoint
-        // written before per-field indexing is kept (it holds strict rows
-        // nothing else re-indexes) and schemaless documents are re-indexed on
-        // top of it.
+        // Ordinary CRDT postings can reuse compatible checkpoints. Durable strict
+        // and valid-time sources replace their postings on every open.
         {
-            // `sparse_checkpoint_present` covers databases written before the
-            // sparse index existed: they have a valid FTS checkpoint but no
-            // sparse one, so emptiness alone cannot distinguish "no sparse
-            // columns" from "never checkpointed". The first flush writes the
-            // sparse catalog key even when empty, so this rebuild runs once.
             let fts_empty = db.fts_state.manager.lock_or_recover().is_empty();
             if fts_empty || !fts_checkpoint_complete || !sparse_checkpoint_present {
                 db.rebuild_text_indices().await?;
             }
-            // Updates replayed on top of a snapshot can postdate the FTS
-            // checkpoint: re-index the rows they changed.
+            db.rebuild_authoritative_text_indices().await?;
             for (collection, rows) in &replayed_rows {
+                if db.strict.schema(collection).is_some()
+                    || crate::engine::document::history::ops::is_bitemporal(
+                        db.storage.as_ref(),
+                        collection,
+                    )
+                    .await?
+                {
+                    continue;
+                }
                 db.reindex_documents_local(collection, rows.iter().map(String::as_str))?;
             }
+            db.fts_state.mark_checkpoint_trusted();
         }
 
         // Rebuild spatial indices if restore produced empty trees.

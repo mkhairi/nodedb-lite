@@ -2,13 +2,18 @@
 
 //! Cold-start index rebuild helpers for `NodeDbLite`.
 //!
-//! Separate sub-modules handle each index family so no single file exceeds
-//! the 500-line limit:
+//! Each module handles one index family.
 //!
-//! - `text`  — FTS + Spatial rebuild (CRDT + DocumentHistory)
+//! - `text` — Ordinary and authoritative FTS recovery.
+//! - `columnar_text` — Columnar FTS and system geohash recovery.
+//! - `sparse` — Sparse recovery from CRDT and DocumentHistory.
+//! - `spatial` — Spatial recovery from CRDT geometry fields.
 //! - `graph` — CSR adjacency rebuild (CRDT + Namespace::Graph KV + GraphHistory)
 //! - `graph_edge_migration` — one-time legacy edge CRDT key rewrite
 
+mod columnar_text;
 pub(super) mod graph;
 pub(super) mod graph_edge_migration;
+mod sparse;
+mod spatial;
 pub(super) mod text;

@@ -207,6 +207,7 @@ pub(super) fn recursive_value<'a, S: StorageEngine + 'a>(
 
 pub(super) fn lateral_top_k<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     args: LateralTopKVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
     let LateralTopKVisitArgs {
@@ -223,6 +224,7 @@ pub(super) fn lateral_top_k<'a, S: StorageEngine + 'a>(
     } = args;
     lower_lateral_top_k(
         engine,
+        permit,
         outer,
         outer_alias,
         inner_collection,
@@ -238,6 +240,7 @@ pub(super) fn lateral_top_k<'a, S: StorageEngine + 'a>(
 
 pub(super) fn lateral_loop<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     args: LateralLoopVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
     let LateralLoopVisitArgs {
@@ -252,6 +255,7 @@ pub(super) fn lateral_loop<'a, S: StorageEngine + 'a>(
     } = args;
     lower_lateral_loop(
         engine,
+        permit,
         outer,
         outer_alias,
         inner,

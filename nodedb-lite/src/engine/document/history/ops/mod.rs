@@ -11,11 +11,13 @@
 //! - [`backfill`] — rebuilding the `LatestVersion` index for legacy databases.
 
 pub mod backfill;
+mod current_page;
 pub mod flags;
 pub mod read;
 pub mod write;
 
 pub use backfill::backfill_latest_version;
+pub(crate) use current_page::current_document_page;
 pub use flags::{is_bitemporal, set_bitemporal};
 pub use read::{scan_live_documents, versioned_get_as_of, versioned_get_current};
 pub use write::{versioned_put, versioned_tombstone};

@@ -22,6 +22,7 @@ use super::adapter::LitePhysicalFut;
 /// both being `None` is a valid no-op that still succeeds.
 pub(super) fn text_set_config<'a, S>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     collection: String,
     analyzer_name: Option<String>,
     fuzzy_default: Option<bool>,
@@ -31,10 +32,22 @@ where
 {
     let fts_state = Arc::clone(&engine.fts_state);
     Ok(Box::pin(async move {
+        let guard = if permit.is_none() {
+            Some(fts_state.admit_mutation().await)
+        } else {
+            None
+        };
+        let result = async {
         let mut mgr = fts_state
             .manager
             .lock()
             .map_err(|_| LiteError::LockPoisoned)?;
+        if mgr.declaration_for(&collection).is_some() {
+            return Err(LiteError::Unsupported {
+                detail: format!("unstructured text mutation on '{collection}' retains an active SEARCH INDEX: use source document writes or DROP SEARCH INDEX first"),
+            });
+        }
+
         if let Some(name) = analyzer_name.as_deref() {
             mgr.set_collection_analyzer(&collection, name)?;
         }
@@ -47,5 +60,11 @@ where
             rows_affected: 0,
             command: None,
         })
+
+        }.await;
+        match guard {
+            Some(guard) => guard.finish(result),
+            None => result,
+        }
     }))
 }

@@ -63,6 +63,39 @@ pub async fn handle_unregister_collection<S: StorageEngine>(
     name: &str,
     _purge_lsn: u64,
 ) -> Result<QueryResult, LiteError> {
+    handle_unregister_collection_coordinated(engine, None, _tenant_id, name, _purge_lsn).await
+}
+
+pub(crate) async fn handle_unregister_collection_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    _tenant_id: u64,
+    name: &str,
+    _purge_lsn: u64,
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return handle_unregister_collection_admitted(engine, permit, _tenant_id, name, _purge_lsn)
+            .await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result =
+        handle_unregister_collection_admitted(engine, guard.permit(), _tenant_id, name, _purge_lsn)
+            .await;
+    guard.finish(result)
+}
+
+pub(crate) async fn handle_unregister_collection_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    _tenant_id: u64,
+    name: &str,
+    _purge_lsn: u64,
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
+    engine
+        .fts_state
+        .persist_collection_tombstone(&*engine.storage, name, permit)
+        .await?;
     let prefix = format!("collection/{name}");
     let pairs = engine
         .storage
@@ -134,6 +167,48 @@ pub async fn handle_rename_collection<S: StorageEngine>(
     old_collection: &str,
     new_collection: &str,
 ) -> Result<QueryResult, LiteError> {
+    handle_rename_collection_coordinated(engine, None, _tenant_id, old_collection, new_collection)
+        .await
+}
+
+pub(crate) async fn handle_rename_collection_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    _tenant_id: u64,
+    old_collection: &str,
+    new_collection: &str,
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return handle_rename_collection_admitted(
+            engine,
+            permit,
+            _tenant_id,
+            old_collection,
+            new_collection,
+        )
+        .await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result = handle_rename_collection_admitted(
+        engine,
+        guard.permit(),
+        _tenant_id,
+        old_collection,
+        new_collection,
+    )
+    .await;
+    guard.finish(result)
+}
+
+pub(crate) async fn handle_rename_collection_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    _tenant_id: u64,
+    old_collection: &str,
+    new_collection: &str,
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
+    crate::engine::fts::checkpoint::persist_checkpoint_incomplete(&*engine.storage).await?;
     let old_prefix = format!("collection/{old_collection}");
     let pairs = engine
         .storage
@@ -177,6 +252,47 @@ pub async fn handle_convert_collection<S: StorageEngine>(
     target_type: &str,
     schema_json: &str,
 ) -> Result<QueryResult, LiteError> {
+    handle_convert_collection_coordinated(engine, None, collection, target_type, schema_json).await
+}
+
+pub(crate) async fn handle_convert_collection_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: &str,
+    target_type: &str,
+    schema_json: &str,
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return handle_convert_collection_admitted(
+            engine,
+            permit,
+            collection,
+            target_type,
+            schema_json,
+        )
+        .await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result = handle_convert_collection_admitted(
+        engine,
+        guard.permit(),
+        collection,
+        target_type,
+        schema_json,
+    )
+    .await;
+    guard.finish(result)
+}
+
+pub(crate) async fn handle_convert_collection_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    collection: &str,
+    target_type: &str,
+    schema_json: &str,
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
+    crate::engine::fts::checkpoint::persist_checkpoint_incomplete(&*engine.storage).await?;
     let target_schema = if schema_json.is_empty() {
         default_convert_schema()
     } else {
@@ -192,9 +308,21 @@ pub async fn handle_convert_collection<S: StorageEngine>(
         }
     };
     match target_type {
-        "document_strict" | "strict" => engine.convert_to_strict(collection, target_schema).await,
-        "document_schemaless" | "document" => engine.convert_to_document(collection).await,
-        "columnar" => engine.convert_to_columnar(collection, target_schema).await,
+        "document_strict" | "strict" => {
+            engine
+                .convert_to_strict_admitted(permit, collection, target_schema)
+                .await
+        }
+        "document_schemaless" | "document" => {
+            engine
+                .convert_to_document_admitted(permit, collection)
+                .await
+        }
+        "columnar" => {
+            engine
+                .convert_to_columnar_admitted(permit, collection, target_schema)
+                .await
+        }
         other => Err(LiteError::BadRequest {
             detail: format!(
                 "ConvertCollection: unsupported target_type '{other}'; \

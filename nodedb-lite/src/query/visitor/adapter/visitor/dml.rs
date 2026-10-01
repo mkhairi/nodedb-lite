@@ -22,61 +22,52 @@ use super::LiteFut;
 
 pub(super) fn insert<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     args: InsertVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
-    let InsertVisitArgs {
-        collection,
-        engine: engine_type,
-        route,
-        rows,
-        if_absent,
-        column_schema: _column_schema,
-        primary_key,
-    } = args;
-    lower_insert(
-        engine,
-        collection,
-        engine_type,
-        route,
-        rows,
-        if_absent,
-        primary_key,
-    )
+    lower_insert(engine, permit, args)
 }
 
 pub(super) fn upsert<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     args: UpsertVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
-    let UpsertVisitArgs {
-        collection,
-        engine: engine_type,
-        route,
-        rows,
-        on_conflict_updates: _on_conflict_updates,
-        column_schema: _column_schema,
-        primary_key,
-    } = args;
     lower_insert(
         engine,
-        collection,
-        engine_type,
-        route,
-        rows,
-        true,
-        primary_key,
+        permit,
+        InsertVisitArgs {
+            collection: args.collection,
+            engine: args.engine,
+            route: args.route,
+            rows: args.rows,
+            if_absent: true,
+            column_schema: args.column_schema,
+            primary_key: args.primary_key,
+        },
     )
+}
+
+pub(super) struct UpdateRequest<'a> {
+    pub collection: &'a str,
+    pub engine_type: EngineType,
+    pub assignments: &'a [(String, SqlExpr)],
+    pub filters: &'a [Filter],
+    pub target_keys: &'a [SqlValue],
 }
 
 pub(super) fn update<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
-    collection: &str,
-    engine_type: EngineType,
-    assignments: &[(String, SqlExpr)],
-    filters: &[Filter],
-    target_keys: &[SqlValue],
-    _returning: bool,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
+    request: UpdateRequest<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
+    let UpdateRequest {
+        collection,
+        engine_type,
+        assignments,
+        filters,
+        target_keys,
+    } = request;
     match engine_type {
         EngineType::KeyValue => {
             lower_kv_update(engine, collection, assignments, filters, target_keys)
@@ -88,6 +79,7 @@ pub(super) fn update<'a, S: StorageEngine + 'a>(
         | EngineType::Spatial
         | EngineType::Array => lower_update(
             engine,
+            permit,
             collection,
             engine_type,
             assignments,
@@ -99,6 +91,7 @@ pub(super) fn update<'a, S: StorageEngine + 'a>(
 
 pub(super) fn delete<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     collection: &str,
     engine_type: EngineType,
     filters: &[Filter],
@@ -111,22 +104,31 @@ pub(super) fn delete<'a, S: StorageEngine + 'a>(
         | EngineType::Columnar
         | EngineType::Timeseries
         | EngineType::Spatial
-        | EngineType::Array => lower_delete(engine, collection, engine_type, filters, target_keys),
+        | EngineType::Array => lower_delete(
+            engine,
+            permit,
+            collection,
+            engine_type,
+            filters,
+            target_keys,
+        ),
     }
 }
 
 pub(super) fn insert_select<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     target: &str,
     source: &nodedb_sql::types::SqlPlan,
     limit: usize,
     column_map: &[(String, SqlExpr)],
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_insert_select(engine, target, source, limit, column_map)
+    lower_insert_select(engine, permit, target, source, limit, column_map)
 }
 
 pub(super) fn update_from<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     args: UpdateFromVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
     let UpdateFromVisitArgs {
@@ -141,6 +143,7 @@ pub(super) fn update_from<'a, S: StorageEngine + 'a>(
     } = args;
     lower_update_from(
         engine,
+        permit,
         collection,
         engine_type,
         source,
@@ -154,6 +157,7 @@ pub(super) fn update_from<'a, S: StorageEngine + 'a>(
 
 pub(super) fn merge<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     args: MergeVisitArgs<'_>,
 ) -> Result<LiteFut<'a>, LiteError> {
     let MergeVisitArgs {
@@ -168,6 +172,7 @@ pub(super) fn merge<'a, S: StorageEngine + 'a>(
     } = args;
     lower_merge(
         engine,
+        permit,
         target,
         engine_type,
         source,
@@ -181,8 +186,9 @@ pub(super) fn merge<'a, S: StorageEngine + 'a>(
 
 pub(super) fn timeseries_ingest<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     collection: &str,
     rows: &[Vec<(String, SqlValue)>],
 ) -> Result<LiteFut<'a>, LiteError> {
-    lower_timeseries_ingest(engine, collection, rows)
+    lower_timeseries_ingest(engine, permit, collection, rows)
 }

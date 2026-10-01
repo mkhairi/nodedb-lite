@@ -60,7 +60,7 @@ pub(crate) fn lower_create_array<'a, S: StorageEngine + 'a>(
         audit_retain_ms,
         minimum_audit_retain_ms,
     };
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.array(&op)?;
     Ok(Box::pin(fut))
 }
@@ -94,7 +94,7 @@ pub(crate) fn lower_drop_array<'a, S: StorageEngine + 'a>(
         }
         let aid = ArrayId::new(LITE_TENANT, &name_owned);
         let op = ArrayOp::DropArray { array_id: aid };
-        let mut phys = LiteDataPlaneVisitor { engine };
+        let mut phys = LiteDataPlaneVisitor::new(engine);
         phys.array(&op)?.await
     }))
 }

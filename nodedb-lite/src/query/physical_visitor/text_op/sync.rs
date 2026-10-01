@@ -25,6 +25,7 @@ fn affected(rows_affected: u64) -> QueryResult {
 /// `TextOp::FtsIndexDoc`: index `text` into the whole-document index.
 pub(super) fn fts_index_doc<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     collection: &str,
     surrogate: Surrogate,
     text: &str,
@@ -35,6 +36,12 @@ pub(super) fn fts_index_doc<'a, S: StorageEngine + 'a>(
     #[cfg(not(target_arch = "wasm32"))]
     let fts_outbound = engine.fts_outbound.as_ref().map(Arc::clone);
     Box::pin(async move {
+        let guard = if permit.is_none() {
+            Some(fts_state.admit_mutation().await)
+        } else {
+            None
+        };
+        let result = async {
         // On Lite the surrogate space is internal to FtsCollectionManager.
         // We use `text` as the string doc_id (stable across frames for the
         // same document). We also register the Origin surrogate → Lite doc_id
@@ -43,6 +50,12 @@ pub(super) fn fts_index_doc<'a, S: StorageEngine + 'a>(
             .manager
             .lock()
             .map_err(|_| LiteError::LockPoisoned)?;
+        if mgr.declaration_for(&collection).is_some() {
+            return Err(LiteError::Unsupported {
+                detail: format!("unstructured text mutation on '{collection}' retains an active SEARCH INDEX: use source document writes or DROP SEARCH INDEX first"),
+            });
+        }
+
         mgr.index_document(&collection, &text, &text)?;
         mgr.register_origin_surrogate(surrogate, &text);
         drop(mgr);
@@ -52,12 +65,19 @@ pub(super) fn fts_index_doc<'a, S: StorageEngine + 'a>(
             q.stage_index(&collection, &text, text.clone());
         }
         Ok(affected(1))
+
+        }.await;
+        match guard {
+            Some(guard) => guard.finish(result),
+            None => result,
+        }
     })
 }
 
 /// `TextOp::FtsDeleteDoc`: remove the document an Origin surrogate names.
 pub(super) fn fts_delete_doc<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     collection: &str,
     surrogate: Surrogate,
 ) -> LitePhysicalFut<'a> {
@@ -66,10 +86,22 @@ pub(super) fn fts_delete_doc<'a, S: StorageEngine + 'a>(
     #[cfg(not(target_arch = "wasm32"))]
     let fts_outbound = engine.fts_outbound.as_ref().map(Arc::clone);
     Box::pin(async move {
+        let guard = if permit.is_none() {
+            Some(fts_state.admit_mutation().await)
+        } else {
+            None
+        };
+        let result = async {
         let mut mgr = fts_state
             .manager
             .lock()
             .map_err(|_| LiteError::LockPoisoned)?;
+        if mgr.declaration_for(&collection).is_some() {
+            return Err(LiteError::Unsupported {
+                detail: format!("unstructured text mutation on '{collection}' retains an active SEARCH INDEX: use source document writes or DROP SEARCH INDEX first"),
+            });
+        }
+
         let removed_doc_id = mgr.remove_by_origin_surrogate(&collection, surrogate)?;
         drop(mgr);
         // Stage delete for durable sync outbound (SQL path — no await needed).
@@ -78,5 +110,11 @@ pub(super) fn fts_delete_doc<'a, S: StorageEngine + 'a>(
             q.stage_delete(&collection, doc_id);
         }
         Ok(affected(u64::from(removed_doc_id.is_some())))
+
+        }.await;
+        match guard {
+            Some(guard) => guard.finish(result),
+            None => result,
+        }
     })
 }

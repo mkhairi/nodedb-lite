@@ -68,15 +68,25 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// The collection must be supplied by the caller: each collection has its
     /// own document, and the update bytes alone do not identify which one.
     pub fn import_remote_deltas(&self, collection: &str, data: &[u8]) -> NodeDbResult<()> {
-        let imported = self
-            .crdt
-            .lock_or_recover()
-            .import_remote(collection, data)
-            .map_err(NodeDbError::storage)?;
-        // Re-index the rows the delta changed. They came from a peer, so
-        // nothing is staged back.
-        self.reindex_documents_local(collection, imported.changed_rows.iter().map(String::as_str))?;
-        Ok(())
+        let guard = self
+            .fts_state
+            .try_admit_mutation("import_remote_deltas")
+            .map_err(NodeDbError::from)?;
+        let result = (|| {
+            let imported = self
+                .crdt
+                .lock_or_recover()
+                .import_remote(collection, data)
+                .map_err(NodeDbError::storage)?;
+            // Re-index the rows the delta changed. They came from a peer, so
+            // nothing is staged back.
+            self.reindex_documents_local(
+                collection,
+                imported.changed_rows.iter().map(String::as_str),
+            )?;
+            Ok(())
+        })();
+        guard.finish(result)
     }
 
     /// Apply a server-originated row post-image from Origin.
@@ -101,12 +111,17 @@ impl<S: StorageEngine> NodeDbLite<S> {
         payload: &[u8],
         delete: bool,
     ) -> NodeDbResult<()> {
-        if self.is_kv_collection(collection).await? {
-            return self
-                .kv_apply_remote_row(collection, document_id, payload, delete)
-                .await;
+        let guard = self.fts_state.admit_mutation().await;
+        let result = async {
+            if self.is_kv_collection(collection).await? {
+                return self
+                    .kv_apply_remote_row(collection, document_id, payload, delete)
+                    .await;
+            }
+            self.apply_remote_document_row(collection, document_id, payload, delete)
         }
-        self.apply_remote_document_row(collection, document_id, payload, delete)
+        .await;
+        guard.finish(result)
     }
 
     /// Apply a remote row post-image to `collection`'s Loro document.
@@ -161,9 +176,20 @@ impl<S: StorageEngine> NodeDbLite<S> {
 
     /// Reject a specific delta (rollback optimistic local state).
     pub fn reject_delta(&self, mutation_id: u64) -> NodeDbResult<()> {
-        let mut crdt = self.crdt.lock_or_recover();
-        crdt.reject_delta(mutation_id);
-        Ok(())
+        let guard = self
+            .fts_state
+            .try_admit_mutation("reject_delta")
+            .map_err(NodeDbError::from)?;
+        let result = (|| {
+            let mut crdt = self.crdt.lock_or_recover();
+            let rejected = crdt.reject_delta(mutation_id);
+            drop(crdt);
+            if let Some(delta) = rejected {
+                self.reindex_documents_local(&delta.collection, [delta.document_id.as_str()])?;
+            }
+            Ok(())
+        })();
+        guard.finish(result)
     }
 
     /// Start background sync to Origin.

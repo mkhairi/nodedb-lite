@@ -71,201 +71,206 @@ impl<S: StorageEngine> NodeDbLite<S> {
         &self,
         items: &[BatchItem<'_>],
     ) -> NodeDbResult<Vec<String>> {
-        if items.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Reject the whole batch up front under critical memory pressure, matching
-        // the single-item `document_put_impl` / `vector_insert_impl` guard. A batch
-        // can ingest many documents plus embeddings at once, so the early gate is
-        // even more important here than on the single-item path.
-        if self.governor.worst_engine_pressure() == nodedb_mem::PressureLevel::Emergency {
-            return Err(NodeDbError::storage(
-                crate::error::LiteError::Backpressure {
-                    detail: "batch ingest rejected: memory governor is at Emergency pressure"
-                        .into(),
-                },
-            ));
-        }
-
-        // Every embedding must fit its loaded index, or the first embedding
-        // bound for the same index when none is loaded. A refusal writes
-        // nothing: the check runs before the CRDT upsert and the durable rows.
-        let mut widths_by_index: std::collections::HashMap<&str, Vec<usize>> =
-            std::collections::HashMap::new();
-        for item in items {
-            if let Some(emb) = item.embedding
-                && !emb.is_empty()
-            {
-                widths_by_index
-                    .entry(item.vector_collection)
-                    .or_default()
-                    .push(emb.len());
+        let guard = self.fts_state.admit_mutation().await;
+        let result = async {
+            if items.is_empty() {
+                return Ok(Vec::new());
             }
-        }
-        for (index_key, widths) in &widths_by_index {
-            check_insert_widths(&self.vector_state, index_key, widths.iter().copied())
-                .await
-                .map_err(NodeDbError::from)?;
-        }
 
-        // A batch may write bitemporal collections: hold off any index build
-        // reading history until every item's history version is written.
-        let _index_build = self.hold_bitemporal_build(true).await;
-
-        // Pre-compute doc IDs and field vecs before taking the lock.
-        let mut resolved: Vec<ResolvedBatchItem<'_>> = Vec::with_capacity(items.len());
-
-        for item in items {
-            let doc_id = if item.doc.id.is_empty() {
-                nodedb_types::id_gen::uuid_v7()
-            } else {
-                item.doc.id.clone()
-            };
-
-            let doc_fields: Vec<(&str, loro::LoroValue)> = item
-                .doc
-                .fields
-                .iter()
-                .map(|(k, v)| (k.as_str(), value_to_loro(v)))
-                .collect();
-
-            let vec_fields: Vec<(&str, loro::LoroValue)> = match item.embedding {
-                Some(emb) if !emb.is_empty() => {
-                    vec![(EMBEDDING_DIM_FIELD, loro::LoroValue::I64(emb.len() as i64))]
-                }
-                _ => vec![],
-            };
-
-            resolved.push((doc_id, doc_fields, vec_fields));
-        }
-
-        // A written document is live again, even one deleted in history.
-        for (item, (doc_id, _, _)) in items.iter().zip(&resolved) {
-            self.query_engine
-                .indexes
-                .revive(item.doc_collection, doc_id);
-        }
-
-        // Build the ops slice for batch_write — one CRDT lock hold, one
-        // exported delta per row. Documents replace their row; vector
-        // metadata merges into its row.
-        {
-            let mut crdt = self.crdt.lock_or_recover();
-
-            let mut ops: Vec<CrdtRowOp<'_>> = Vec::with_capacity(items.len() * 2);
-            for (item, (doc_id, doc_fields, vec_fields)) in items.iter().zip(&resolved) {
-                ops.push((
-                    CrdtRowWrite::Upsert,
-                    item.doc_collection,
-                    doc_id.as_str(),
-                    doc_fields.as_slice(),
+            // Reject the whole batch up front under critical memory pressure, matching
+            // the single-item `document_put_impl` / `vector_insert_impl` guard. A batch
+            // can ingest many documents plus embeddings at once, so the early gate is
+            // even more important here than on the single-item path.
+            if self.governor.worst_engine_pressure() == nodedb_mem::PressureLevel::Emergency {
+                return Err(NodeDbError::storage(
+                    crate::error::LiteError::Backpressure {
+                        detail: "batch ingest rejected: memory governor is at Emergency pressure"
+                            .into(),
+                    },
                 ));
-                if !vec_fields.is_empty() {
-                    ops.push((
-                        CrdtRowWrite::SetFields,
-                        item.vector_collection,
-                        item.id,
-                        vec_fields.as_slice(),
-                    ));
+            }
+
+            // Every embedding must fit its loaded index, or the first embedding
+            // bound for the same index when none is loaded. A refusal writes
+            // nothing: the check runs before the CRDT upsert and the durable rows.
+            let mut widths_by_index: std::collections::HashMap<&str, Vec<usize>> =
+                std::collections::HashMap::new();
+            for item in items {
+                if let Some(emb) = item.embedding
+                    && !emb.is_empty()
+                {
+                    widths_by_index
+                        .entry(item.vector_collection)
+                        .or_default()
+                        .push(emb.len());
                 }
             }
-
-            crdt.batch_write(&ops).map_err(NodeDbError::from)?;
-        }
-
-        // Post-lock work: bitemporal history + FTS + HNSW (matches single-item ordering).
-        let now_ms = now_millis_i64();
-
-        for (i, item) in items.iter().enumerate() {
-            let (ref doc_id, _, _) = resolved[i];
-
-            if is_bitemporal(&*self.storage, item.doc_collection)
-                .await
-                .map_err(NodeDbError::storage)?
-            {
-                let body = document_to_msgpack(&item.doc);
-                versioned_put(
-                    &*self.storage,
-                    item.doc_collection,
-                    doc_id,
-                    &body,
-                    now_ms,
-                    None,
-                    None,
-                )
-                .await
-                .map_err(NodeDbError::storage)?;
-            }
-            // Same durability contract as the single-document path: the
-            // vector is persisted in the same write that makes the document
-            // durable, so the in-memory HNSW below is a derived index rather
-            // than the only copy.
-            if let Some(embedding) = item.embedding
-                && !embedding.is_empty()
-            {
-                let op = crate::engine::vector::durable::put_op(
-                    item.vector_collection,
-                    item.id,
-                    embedding,
-                );
-                self.storage
-                    .batch_write(std::slice::from_ref(&op))
+            for (index_key, widths) in &widths_by_index {
+                check_insert_widths(&self.vector_state, index_key, widths.iter().copied())
                     .await
-                    .map_err(NodeDbError::storage)?;
+                    .map_err(NodeDbError::from)?;
             }
 
-            self.index_document_text(item.doc_collection, doc_id, &item.doc.fields)?;
-            self.index_document_sparse(item.doc_collection, doc_id, &item.doc.fields);
+            // A batch may write bitemporal collections: hold off any index build
+            // reading history until every item's history version is written.
+            let _index_build = self.hold_bitemporal_build(true).await;
 
-            if let Some(embedding) = item.embedding
-                && !embedding.is_empty()
+            // Pre-compute doc IDs and field vecs before taking the lock.
+            let mut resolved: Vec<ResolvedBatchItem<'_>> = Vec::with_capacity(items.len());
+
+            for item in items {
+                let doc_id = if item.doc.id.is_empty() {
+                    nodedb_types::id_gen::uuid_v7()
+                } else {
+                    item.doc.id.clone()
+                };
+
+                let doc_fields: Vec<(&str, loro::LoroValue)> = item
+                    .doc
+                    .fields
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), value_to_loro(v)))
+                    .collect();
+
+                let vec_fields: Vec<(&str, loro::LoroValue)> = match item.embedding {
+                    Some(emb) if !emb.is_empty() => {
+                        vec![(EMBEDDING_DIM_FIELD, loro::LoroValue::I64(emb.len() as i64))]
+                    }
+                    _ => vec![],
+                };
+
+                resolved.push((doc_id, doc_fields, vec_fields));
+            }
+
+            // A written document is live again, even one deleted in history.
+            for (item, (doc_id, _, _)) in items.iter().zip(&resolved) {
+                self.query_engine
+                    .indexes
+                    .revive(item.doc_collection, doc_id);
+            }
+
+            // Build the ops slice for batch_write — one CRDT lock hold, one
+            // exported delta per row. Documents replace their row; vector
+            // metadata merges into its row.
             {
-                // Replaces the node the id held before, including one bound
-                // earlier in this batch, so the id stays one node.
-                let internal_id = upsert_node(
-                    &self.vector_state,
-                    item.vector_collection,
-                    item.id,
-                    embedding,
-                )
-                .await
-                .map_err(NodeDbError::from)?;
-                encode_sidecar(
-                    &self.vector_state,
-                    item.vector_collection,
-                    internal_id,
-                    embedding,
-                )
-                .map_err(|e| NodeDbError::bad_request(e.to_string()))?;
+                let mut crdt = self.crdt.lock_or_recover();
 
-                #[cfg(not(target_arch = "wasm32"))]
-                if let Some(q) = &self.vector_outbound {
-                    crate::sync::reconcile_outbound_enqueue(
-                        q.enqueue_insert(
+                let mut ops: Vec<CrdtRowOp<'_>> = Vec::with_capacity(items.len() * 2);
+                for (item, (doc_id, doc_fields, vec_fields)) in items.iter().zip(&resolved) {
+                    ops.push((
+                        CrdtRowWrite::Upsert,
+                        item.doc_collection,
+                        doc_id.as_str(),
+                        doc_fields.as_slice(),
+                    ));
+                    if !vec_fields.is_empty() {
+                        ops.push((
+                            CrdtRowWrite::SetFields,
                             item.vector_collection,
                             item.id,
-                            embedding.to_vec(),
-                            embedding.len(),
-                            "",
-                        )
-                        .await,
-                        "vector insert (batch)",
+                            vec_fields.as_slice(),
+                        ));
+                    }
+                }
+
+                crdt.batch_write(&ops).map_err(NodeDbError::from)?;
+            }
+
+            // Post-lock work: bitemporal history + FTS + HNSW (matches single-item ordering).
+            let now_ms = now_millis_i64();
+
+            for (i, item) in items.iter().enumerate() {
+                let (ref doc_id, _, _) = resolved[i];
+
+                if is_bitemporal(&*self.storage, item.doc_collection)
+                    .await
+                    .map_err(NodeDbError::storage)?
+                {
+                    let body = document_to_msgpack(&item.doc);
+                    versioned_put(
+                        &*self.storage,
+                        item.doc_collection,
+                        doc_id,
+                        &body,
+                        now_ms,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(NodeDbError::storage)?;
+                }
+                // Same durability contract as the single-document path: the
+                // vector is persisted in the same write that makes the document
+                // durable, so the in-memory HNSW below is a derived index rather
+                // than the only copy.
+                if let Some(embedding) = item.embedding
+                    && !embedding.is_empty()
+                {
+                    let op = crate::engine::vector::durable::put_op(
                         item.vector_collection,
                         item.id,
+                        embedding,
+                    );
+                    self.storage
+                        .batch_write(std::slice::from_ref(&op))
+                        .await
+                        .map_err(NodeDbError::storage)?;
+                }
+
+                self.index_document_text(item.doc_collection, doc_id, &item.doc.fields)?;
+                self.index_document_sparse(item.doc_collection, doc_id, &item.doc.fields);
+
+                if let Some(embedding) = item.embedding
+                    && !embedding.is_empty()
+                {
+                    // Replaces the node the id held before, including one bound
+                    // earlier in this batch, so the id stays one node.
+                    let internal_id = upsert_node(
+                        &self.vector_state,
+                        item.vector_collection,
+                        item.id,
+                        embedding,
                     )
-                    .map_err(nodedb_types::error::NodeDbError::storage)?;
+                    .await
+                    .map_err(NodeDbError::from)?;
+                    encode_sidecar(
+                        &self.vector_state,
+                        item.vector_collection,
+                        internal_id,
+                        embedding,
+                    )
+                    .map_err(|e| NodeDbError::bad_request(e.to_string()))?;
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(q) = &self.vector_outbound {
+                        crate::sync::reconcile_outbound_enqueue(
+                            q.enqueue_insert(
+                                item.vector_collection,
+                                item.id,
+                                embedding.to_vec(),
+                                embedding.len(),
+                                "",
+                            )
+                            .await,
+                            "vector insert (batch)",
+                            item.vector_collection,
+                            item.id,
+                        )
+                        .map_err(nodedb_types::error::NodeDbError::storage)?;
+                    }
                 }
             }
-        }
 
-        if items
-            .iter()
-            .any(|it| it.embedding.is_some_and(|e| !e.is_empty()))
-        {
-            self.update_memory_stats();
-        }
+            if items
+                .iter()
+                .any(|it| it.embedding.is_some_and(|e| !e.is_empty()))
+            {
+                self.update_memory_stats();
+            }
 
-        Ok(resolved.into_iter().map(|(id, _, _)| id).collect())
+            Ok(resolved.into_iter().map(|(id, _, _)| id).collect())
+        }
+        .await;
+        guard.finish(result)
     }
 }

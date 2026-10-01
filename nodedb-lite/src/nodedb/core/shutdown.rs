@@ -17,12 +17,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// Each task is signalled first and leaves its loop at a point it chose.
     /// One that ignores the signal past
     /// [`TASK_STOP_TIMEOUT`](crate::tasks::TASK_STOP_TIMEOUT) is aborted, so
-    /// this returns within roughly that bound.
+    /// Background task shutdown uses that bound. Admitted search DDL completes before this returns.
     ///
     /// Idempotent, and safe on a database that started no tasks. It does not
     /// flush: what is in memory at shutdown is still in memory, so call
     /// [`flush`](Self::flush) first when the data must be durable.
     pub async fn shutdown(&self) {
         self.tasks.shutdown().await;
+        let _permit = self.fts_state.admit_exclusive().await;
     }
 }

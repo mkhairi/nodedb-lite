@@ -40,6 +40,56 @@ pub async fn handle_doc_upsert<S: StorageEngine>(
     verb: CrdtWriteVerb,
     returning: Option<&ReturningSpec>,
 ) -> Result<QueryResult, LiteError> {
+    handle_doc_upsert_coordinated(
+        engine,
+        None,
+        DocUpsertRequest {
+            collection,
+            document_id,
+            fields_json,
+            partial,
+            verb,
+            returning,
+        },
+    )
+    .await
+}
+
+pub(crate) struct DocUpsertRequest<'a> {
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub fields_json: &'a str,
+    pub partial: bool,
+    pub verb: CrdtWriteVerb,
+    pub returning: Option<&'a ReturningSpec>,
+}
+
+pub(crate) async fn handle_doc_upsert_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    request: DocUpsertRequest<'_>,
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return handle_doc_upsert_admitted(engine, permit, request).await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result = handle_doc_upsert_admitted(engine, guard.permit(), request).await;
+    guard.finish(result)
+}
+
+pub(crate) async fn handle_doc_upsert_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    _permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    request: DocUpsertRequest<'_>,
+) -> Result<QueryResult, LiteError> {
+    let DocUpsertRequest {
+        collection,
+        document_id,
+        fields_json,
+        partial,
+        verb,
+        returning,
+    } = request;
     let fields = parse_fields(fields_json)?;
     let field_refs: Vec<(&str, LoroValue)> = fields
         .iter()
@@ -69,6 +119,35 @@ pub async fn handle_doc_delete<S: StorageEngine>(
     document_id: &str,
     returning: Option<&ReturningSpec>,
 ) -> Result<QueryResult, LiteError> {
+    handle_doc_delete_coordinated(engine, None, collection, document_id, returning).await
+}
+
+pub(crate) async fn handle_doc_delete_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: &str,
+    document_id: &str,
+    returning: Option<&ReturningSpec>,
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return handle_doc_delete_admitted(engine, permit, collection, document_id, returning)
+            .await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result =
+        handle_doc_delete_admitted(engine, guard.permit(), collection, document_id, returning)
+            .await;
+    guard.finish(result)
+}
+
+pub(crate) async fn handle_doc_delete_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    collection: &str,
+    document_id: &str,
+    returning: Option<&ReturningSpec>,
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
     let pre_delete = if returning.is_some() {
         let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
         crdt.read(collection, document_id)

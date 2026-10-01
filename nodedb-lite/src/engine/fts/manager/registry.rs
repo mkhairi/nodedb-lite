@@ -111,6 +111,9 @@ pub(in crate::engine::fts) fn read_err(collection: &str, e: impl Display) -> Lit
 /// The bare `"{collection}"` key holds whole-document text (all string
 /// fields concatenated), searched when a caller names no field.
 pub struct FtsCollectionManager {
+    pub(super) retained: HashMap<String, super::retained::RetainedIndex>,
+    pub(super) declarations:
+        std::collections::BTreeMap<String, crate::engine::fts::catalog::SearchDeclarationRecord>,
     /// Key: `"{collection}:{field}"` → FTS index.
     /// Whole-document index uses the bare key `"{collection}"`.
     pub(in crate::engine::fts) indices: HashMap<String, FtsIndex<MemoryBackend>>,
@@ -152,6 +155,8 @@ pub struct FtsCollectionManager {
 impl FtsCollectionManager {
     pub fn new(governor: Arc<MemoryGovernor>) -> Self {
         Self {
+            retained: HashMap::new(),
+            declarations: std::collections::BTreeMap::new(),
             indices: HashMap::new(),
             id_to_surrogate: HashMap::new(),
             surrogate_to_id: HashMap::new(),
@@ -246,8 +251,7 @@ impl FtsCollectionManager {
 
     /// Drop all FTS indexes for a collection (called on collection drop/truncate).
     pub fn drop_collection(&mut self, collection: &str) {
-        self.indices
-            .retain(|k, _| !key_of_collection(k, collection));
+        self.remove_collection_postings(collection);
     }
 
     // ── Checkpoint helpers (used by core.rs flush/restore) ────────────────────
@@ -273,6 +277,20 @@ impl FtsCollectionManager {
         surrogate_to_id: HashMap<u32, String>,
         next_surrogate: u32,
     ) {
+        self.retained = indices
+            .iter()
+            .map(|(key, index)| {
+                (
+                    key.clone(),
+                    super::retained::RetainedIndex::restored(
+                        Arc::clone(&self.governor),
+                        key,
+                        index,
+                        next_surrogate,
+                    ),
+                )
+            })
+            .collect();
         self.indices = indices;
         self.id_to_surrogate = id_to_surrogate;
         self.surrogate_to_id = surrogate_to_id;

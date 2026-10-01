@@ -6,11 +6,15 @@
 //! and `LiteQueryEngine` (PhysicalPlan executor) so the physical visitor
 //! can run text ops without re-architecting the engine boundary.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use nodedb_mem::MemoryGovernor;
 
 use super::manager::FtsCollectionManager;
+
+/// Type alias for Lite's persistent FTS index (serialized to KV store on flush).
+pub type LiteFtsIndex = super::FtsIndex<super::MemoryBackend>;
 
 /// Arc-shareable wrapper around the per-collection FTS manager.
 ///
@@ -18,6 +22,8 @@ use super::manager::FtsCollectionManager;
 /// independent of `S`. No generic parameter is needed here.
 pub struct FtsState {
     pub(crate) manager: Mutex<FtsCollectionManager>,
+    pub(super) mutation_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(super) checkpoint_trusted: AtomicBool,
 }
 
 impl FtsState {
@@ -25,6 +31,8 @@ impl FtsState {
     pub fn new(governor: Arc<MemoryGovernor>) -> Self {
         Self {
             manager: Mutex::new(FtsCollectionManager::new(governor)),
+            mutation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            checkpoint_trusted: AtomicBool::new(false),
         }
     }
 
@@ -32,6 +40,8 @@ impl FtsState {
     pub fn from_restored(manager: FtsCollectionManager) -> Self {
         Self {
             manager: Mutex::new(manager),
+            mutation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            checkpoint_trusted: AtomicBool::new(false),
         }
     }
 }

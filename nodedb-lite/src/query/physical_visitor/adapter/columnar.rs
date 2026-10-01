@@ -13,6 +13,34 @@ use super::policy::deny_policy;
 
 pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
+    op: &ColumnarOp,
+) -> Result<LitePhysicalFut<'a>, LiteError> {
+    if permit.is_some()
+        || !matches!(
+            op,
+            ColumnarOp::Insert { .. }
+                | ColumnarOp::Update { .. }
+                | ColumnarOp::Delete { .. }
+                | ColumnarOp::Truncate { .. }
+        )
+    {
+        return dispatch_admitted(engine, permit, op);
+    }
+    let op = op.clone();
+    Ok(Box::pin(async move {
+        let guard = engine.fts_state.admit_mutation().await;
+        let result = match dispatch_admitted(engine, Some(guard.permit()), &op) {
+            Ok(future) => future.await,
+            Err(error) => Err(error),
+        };
+        guard.finish(result)
+    }))
+}
+
+pub(super) fn dispatch_admitted<'a, S: StorageEngine + 'a>(
+    engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
     op: &ColumnarOp,
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
     match op {
@@ -165,7 +193,9 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let col = collection.clone();
             let restart = *restart_identity;
             Ok(Box::pin(async move {
-                let result = columnar_ops::writes::truncate(engine, col.as_str()).await?;
+                let result =
+                    columnar_ops::writes::truncate_coordinated(engine, permit, col.as_str())
+                        .await?;
                 crate::query::truncate::restart_identity(engine, col.as_str(), restart);
                 Ok(result)
             }))

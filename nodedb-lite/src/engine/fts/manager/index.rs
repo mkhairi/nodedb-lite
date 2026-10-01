@@ -15,14 +15,7 @@ use crate::error::LiteError;
 /// Every top-level string field of a document, joined by spaces: the text
 /// of the whole-document index.
 pub fn whole_document_text(fields: &HashMap<String, Value>) -> String {
-    fields
-        .values()
-        .filter_map(|v| match v {
-            Value::String(s) => Some(s.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    super::fields::joined_text(&super::fields::selected_texts(fields, None))
 }
 
 impl FtsCollectionManager {
@@ -44,23 +37,23 @@ impl FtsCollectionManager {
         doc_id: &str,
         fields: &HashMap<String, Value>,
     ) -> Result<String, LiteError> {
-        let text = whole_document_text(fields);
+        let texts = super::fields::selected_texts(fields, self.declaration_for(collection));
+        let text = super::fields::joined_text(&texts);
         self.index_document(collection, doc_id, &text)?;
 
         let whole = index_key(collection, "");
         let mut indexed: HashSet<String> = HashSet::new();
-        for (field, value) in fields {
+        for (field, value) in texts {
             if field.is_empty() {
                 continue;
             }
-            if let Value::String(s) = value {
-                self.index_field(collection, field, doc_id, s)?;
-                indexed.insert(index_key(collection, field));
-            }
+            self.index_field(collection, field, doc_id, value)?;
+            indexed.insert(index_key(collection, field));
         }
 
+        let system = index_key(collection, "_geohash");
         for key in self.collection_keys(collection) {
-            if key != whole && !indexed.contains(&key) {
+            if key != whole && key != system && !indexed.contains(&key) {
                 self.retract(collection, &key, doc_id)?;
             }
         }
@@ -144,15 +137,38 @@ impl FtsCollectionManager {
         }
         let surrogate = self.surrogate_for(collection, doc_id)?;
         if !self.indices.contains_key(key) {
+            let mut retained = super::retained::RetainedIndex::default();
+            retained.reserve_base(std::sync::Arc::clone(&self.governor), key)?;
             let fresh = self.new_index_for(collection, key)?;
             self.indices.insert(key.to_owned(), fresh);
+            self.retained.insert(key.to_owned(), retained);
         }
+        let tokens = self
+            .indices
+            .get(key)
+            .ok_or_else(|| {
+                fts_err(
+                    collection,
+                    format!("index '{key}' vanished before analysis"),
+                )
+            })?
+            .analyze_for_collection(0, 0, key, text)
+            .map_err(|error| fts_err(collection, error))?;
+        self.retained
+            .get_mut(key)
+            .ok_or_else(|| fts_err(collection, format!("index lease '{key}' is absent")))?
+            .reserve_write(
+                std::sync::Arc::clone(&self.governor),
+                key,
+                surrogate,
+                &tokens,
+            )?;
         self.retract(collection, key, doc_id)?;
         let idx = self
             .indices
             .get(key)
             .ok_or_else(|| fts_err(collection, format!("index '{key}' vanished mid-write")))?;
-        idx.index_document(0, 0, key, surrogate, text)
+        idx.index_analyzed_document(0, 0, key, surrogate, &tokens)
             .map_err(|e| fts_err(collection, e))
     }
 

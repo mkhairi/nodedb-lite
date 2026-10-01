@@ -10,6 +10,7 @@ pub mod engine_meta;
 pub mod htap;
 pub mod kv;
 pub mod parser;
+pub(crate) mod search_index;
 pub mod strict;
 #[cfg(test)]
 mod tests;

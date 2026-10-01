@@ -2,8 +2,8 @@
 
 //! `LiteVisitor` / `PlanVisitor` split by statement family.
 //!
-//! - `trait_impl`    — `LiteVisitor` struct, `LiteFut` alias, and the
-//!   `PlanVisitor` trait impl (one-line delegations only).
+//! - `types`         — `LiteVisitor` admission context and `LiteFut` alias.
+//! - `trait_impl`    — `PlanVisitor` trait implementation with one-line delegations.
 //! - `dml`           — insert/upsert/update/delete/insert_select/merge/
 //!   update_from/timeseries_ingest.
 //! - `reads_scan`    — constant_result/scan/point_get/document_index_lookup/
@@ -29,6 +29,7 @@ mod reads_combine;
 mod reads_scan;
 mod reads_search;
 mod trait_impl;
+mod types;
 mod vector;
 
-pub(crate) use trait_impl::{LiteFut, LiteVisitor};
+pub(crate) use types::{LiteFut, LiteVisitor};

@@ -9,4 +9,4 @@ mod hybrid;
 mod search;
 mod sync;
 
-pub(crate) use dispatch::{execute_text_op, execute_text_op_on_field};
+pub(crate) use dispatch::{execute_text_op, execute_text_op_admitted, execute_text_op_on_field};

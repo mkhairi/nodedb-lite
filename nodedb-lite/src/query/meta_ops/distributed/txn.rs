@@ -31,7 +31,7 @@ pub async fn execute_plans_in_order<S: StorageEngine>(
 ) -> Result<QueryResult, LiteError> {
     let mut last = QueryResult::empty();
     for plan in plans {
-        let mut visitor = LiteDataPlaneVisitor { engine };
+        let mut visitor = LiteDataPlaneVisitor::new(engine);
         let fut = nodedb_physical::dispatch(&mut visitor, plan)?;
         last = fut.await?;
     }

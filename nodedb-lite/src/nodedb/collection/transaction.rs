@@ -45,109 +45,116 @@ impl<S: StorageEngine> NodeDbLite<S> {
     ///
     /// Returns the number of operations applied.
     pub fn transaction(&self, ops: &[TransactionOp]) -> NodeDbResult<u64> {
-        if ops.is_empty() {
-            return Ok(0);
-        }
+        let guard = self
+            .fts_state
+            .try_admit_mutation("transaction")
+            .map_err(NodeDbError::from)?;
+        let result = (|| {
+            if ops.is_empty() {
+                return Ok(0);
+            }
 
-        // Phase 1: Validate all operations.
-        // - Put: validate doc_id is non-empty, fields are non-empty.
-        // - Delete: validate doc_id is non-empty.
-        for (i, op) in ops.iter().enumerate() {
-            match op {
-                TransactionOp::Put {
-                    collection,
-                    doc_id,
-                    fields,
-                } => {
-                    if doc_id.is_empty() {
-                        return Err(NodeDbError::bad_request(format!(
-                            "transaction op {i}: Put requires non-empty doc_id"
-                        )));
+            // Phase 1: Validate all operations.
+            // - Put: validate doc_id is non-empty, fields are non-empty.
+            // - Delete: validate doc_id is non-empty.
+            for (i, op) in ops.iter().enumerate() {
+                match op {
+                    TransactionOp::Put {
+                        collection,
+                        doc_id,
+                        fields,
+                    } => {
+                        if doc_id.is_empty() {
+                            return Err(NodeDbError::bad_request(format!(
+                                "transaction op {i}: Put requires non-empty doc_id"
+                            )));
+                        }
+                        if collection.is_empty() {
+                            return Err(NodeDbError::bad_request(format!(
+                                "transaction op {i}: Put requires non-empty collection"
+                            )));
+                        }
+                        if fields.is_empty() {
+                            return Err(NodeDbError::bad_request(format!(
+                                "transaction op {i}: Put requires at least one field"
+                            )));
+                        }
                     }
-                    if collection.is_empty() {
-                        return Err(NodeDbError::bad_request(format!(
-                            "transaction op {i}: Put requires non-empty collection"
-                        )));
-                    }
-                    if fields.is_empty() {
-                        return Err(NodeDbError::bad_request(format!(
-                            "transaction op {i}: Put requires at least one field"
-                        )));
-                    }
-                }
-                TransactionOp::Delete { collection, doc_id } => {
-                    if doc_id.is_empty() || collection.is_empty() {
-                        return Err(NodeDbError::bad_request(format!(
-                            "transaction op {i}: Delete requires non-empty collection and doc_id"
-                        )));
+                    TransactionOp::Delete { collection, doc_id } => {
+                        if doc_id.is_empty() || collection.is_empty() {
+                            return Err(NodeDbError::bad_request(format!(
+                                "transaction op {i}: Delete requires non-empty collection and doc_id"
+                            )));
+                        }
                     }
                 }
             }
-        }
 
-        // Phase 2: Separate puts and deletes.
-        let mut put_ops: Vec<(&str, &str, Vec<CrdtField<'_>>)> = Vec::new();
-        let mut delete_ops: Vec<(&str, &str)> = Vec::new();
+            // Phase 2: Separate puts and deletes.
+            let mut put_ops: Vec<(&str, &str, Vec<CrdtField<'_>>)> = Vec::new();
+            let mut delete_ops: Vec<(&str, &str)> = Vec::new();
 
-        for op in ops {
-            match op {
-                TransactionOp::Put {
-                    collection,
-                    doc_id,
-                    fields,
-                } => {
-                    let loro_fields: Vec<CrdtField<'_>> = fields
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), value_to_loro(v)))
-                        .collect();
-                    put_ops.push((collection.as_str(), doc_id.as_str(), loro_fields));
-                }
-                TransactionOp::Delete { collection, doc_id } => {
-                    delete_ops.push((collection.as_str(), doc_id.as_str()));
+            for op in ops {
+                match op {
+                    TransactionOp::Put {
+                        collection,
+                        doc_id,
+                        fields,
+                    } => {
+                        let loro_fields: Vec<CrdtField<'_>> = fields
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), value_to_loro(v)))
+                            .collect();
+                        put_ops.push((collection.as_str(), doc_id.as_str(), loro_fields));
+                    }
+                    TransactionOp::Delete { collection, doc_id } => {
+                        delete_ops.push((collection.as_str(), doc_id.as_str()));
+                    }
                 }
             }
-        }
 
-        // Phase 3: Apply all operations under one CRDT lock hold.
-        // One delta export per row, not one for the transaction.
-        let mut crdt = self.crdt.lock_or_recover();
+            // Phase 3: Apply all operations under one CRDT lock hold.
+            // One delta export per row, not one for the transaction.
+            let mut crdt = self.crdt.lock_or_recover();
 
-        // Build batch ops with borrowed field slices.
-        let batch_refs: Vec<CrdtBatchOp<'_>> = put_ops
-            .iter()
-            .map(|(coll, id, fields)| (*coll, *id, fields.as_slice()))
-            .collect();
+            // Build batch ops with borrowed field slices.
+            let batch_refs: Vec<CrdtBatchOp<'_>> = put_ops
+                .iter()
+                .map(|(coll, id, fields)| (*coll, *id, fields.as_slice()))
+                .collect();
 
-        if !batch_refs.is_empty() {
-            crdt.batch_upsert(&batch_refs).map_err(NodeDbError::from)?;
-        }
-
-        // Deletes are applied individually but within the same lock hold;
-        // each one exports its own delta, like every upsert above.
-        for &(collection, doc_id) in &delete_ops {
-            crdt.delete(collection, doc_id)
-                .map_err(NodeDbError::storage)?;
-        }
-
-        let count = (put_ops.len() + delete_ops.len()) as u64;
-        drop(crdt);
-
-        // Phase 4: Update text indices for all affected documents.
-        for (collection, doc_id, _) in &put_ops {
-            let crdt = self.crdt.lock_or_recover();
-            if let Some(loro_val) = crdt.read(collection, doc_id) {
-                let doc = crate::nodedb::convert::loro_value_to_document(doc_id, &loro_val);
-                drop(crdt);
-                self.index_document_text(collection, doc_id, &doc.fields)?;
-                self.index_document_sparse(collection, doc_id, &doc.fields);
+            if !batch_refs.is_empty() {
+                crdt.batch_upsert(&batch_refs).map_err(NodeDbError::from)?;
             }
-        }
-        for &(collection, doc_id) in &delete_ops {
-            self.remove_document_text(collection, doc_id)?;
-            self.remove_document_sparse(collection, doc_id);
-        }
 
-        Ok(count)
+            // Deletes are applied individually but within the same lock hold;
+            // each one exports its own delta, like every upsert above.
+            for &(collection, doc_id) in &delete_ops {
+                crdt.delete(collection, doc_id)
+                    .map_err(NodeDbError::storage)?;
+            }
+
+            let count = (put_ops.len() + delete_ops.len()) as u64;
+            drop(crdt);
+
+            // Phase 4: Update text indices for all affected documents.
+            for (collection, doc_id, _) in &put_ops {
+                let crdt = self.crdt.lock_or_recover();
+                if let Some(loro_val) = crdt.read(collection, doc_id) {
+                    let doc = crate::nodedb::convert::loro_value_to_document(doc_id, &loro_val);
+                    drop(crdt);
+                    self.index_document_text(collection, doc_id, &doc.fields)?;
+                    self.index_document_sparse(collection, doc_id, &doc.fields);
+                }
+            }
+            for &(collection, doc_id) in &delete_ops {
+                self.remove_document_text(collection, doc_id)?;
+                self.remove_document_sparse(collection, doc_id);
+            }
+
+            Ok(count)
+        })();
+        guard.finish(result)
     }
 
     /// Set conflict resolution policy for a collection.

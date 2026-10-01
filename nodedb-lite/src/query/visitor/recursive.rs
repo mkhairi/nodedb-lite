@@ -60,7 +60,7 @@ pub(super) fn lower_recursive_scan<'a, S: StorageEngine + 'a>(
         limit,
     };
 
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.query(&op)?;
     Ok(Box::pin(fut))
 }
@@ -89,7 +89,7 @@ pub(super) fn lower_recursive_value<'a, S: StorageEngine + 'a>(
         distinct,
     };
 
-    let mut phys = LiteDataPlaneVisitor { engine };
+    let mut phys = LiteDataPlaneVisitor::new(engine);
     let fut = phys.query(&op)?;
     Ok(Box::pin(fut))
 }

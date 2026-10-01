@@ -15,14 +15,20 @@ use super::LiteFut;
 /// resolved, then apply `RESTART IDENTITY`.
 pub(super) fn truncate<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
+    permit: &'a crate::engine::fts::coordinator::TextMutationPermit,
     collection: &str,
     engine_type: EngineType,
     restart_identity: bool,
 ) -> Result<LiteFut<'a>, LiteError> {
     let collection = collection.to_string();
     Ok(Box::pin(async move {
-        let result =
-            crate::query::truncate::truncate_engine(engine, &collection, engine_type).await?;
+        let result = crate::query::truncate::truncate_engine_coordinated(
+            engine,
+            Some(permit),
+            &collection,
+            engine_type,
+        )
+        .await?;
         crate::query::truncate::restart_identity(engine, &collection, restart_identity);
         Ok(result)
     }))

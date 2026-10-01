@@ -47,6 +47,19 @@ impl<S: StorageEngine> NodeDbLite<S> {
         name: &str,
         fields: &[(String, String)],
     ) -> NodeDbResult<()> {
+        let guard = self.fts_state.admit_mutation().await;
+        let result = self
+            .create_collection_admitted(guard.permit(), name, fields)
+            .await;
+        guard.finish(result)
+    }
+
+    pub(crate) async fn create_collection_admitted(
+        &self,
+        _permit: &crate::engine::fts::coordinator::TextMutationPermit,
+        name: &str,
+        fields: &[(String, String)],
+    ) -> NodeDbResult<()> {
         let meta = CollectionMeta {
             name: name.to_string(),
             collection_type: "document".to_string(),
@@ -71,6 +84,19 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// KV engine can reconstruct the schema on startup.
     pub async fn create_kv_collection(
         &self,
+        name: &str,
+        config: &nodedb_types::KvConfig,
+    ) -> NodeDbResult<()> {
+        let guard = self.fts_state.admit_mutation().await;
+        let result = self
+            .create_kv_collection_admitted(guard.permit(), name, config)
+            .await;
+        guard.finish(result)
+    }
+
+    pub(crate) async fn create_kv_collection_admitted(
+        &self,
+        _permit: &crate::engine::fts::coordinator::TextMutationPermit,
         name: &str,
         config: &nodedb_types::KvConfig,
     ) -> NodeDbResult<()> {
@@ -141,29 +167,38 @@ impl<S: StorageEngine> NodeDbLite<S> {
     /// for all document removals). Also removes the secondary and text
     /// indexes.
     pub async fn drop_collection(&self, name: &str) -> NodeDbResult<()> {
-        // Batch-delete all documents in one delta.
-        {
-            let mut crdt = self.crdt.lock_or_recover();
-            crdt.clear_collection(name).map_err(NodeDbError::storage)?;
-        }
-        self.query_engine
-            .indexes
-            .drop_collection(&*self.storage, name)
-            .await
-            .map_err(NodeDbError::storage)?;
+        let guard = self.fts_state.admit_mutation().await;
+        let result = async {
+            self.fts_state
+                .persist_collection_tombstone(&*self.storage, name, guard.permit())
+                .await
+                .map_err(NodeDbError::from)?;
+            // Batch-delete all documents in one delta.
+            {
+                let mut crdt = self.crdt.lock_or_recover();
+                crdt.clear_collection(name).map_err(NodeDbError::storage)?;
+            }
+            self.query_engine
+                .indexes
+                .drop_collection(&*self.storage, name)
+                .await
+                .map_err(NodeDbError::storage)?;
 
-        // Remove text index for this collection.
-        {
-            let mut fts = self.fts_state.manager.lock_or_recover();
-            fts.drop_collection(name);
-        }
+            // Remove text index for this collection.
+            {
+                let mut fts = self.fts_state.manager.lock_or_recover();
+                fts.drop_collection(name);
+            }
 
-        // Delete collection metadata from the KV store.
-        let key = format!("collection:{name}");
-        self.storage
-            .delete(nodedb_types::Namespace::Meta, key.as_bytes())
-            .await?;
-        Ok(())
+            // Delete collection metadata from the KV store.
+            let key = format!("collection:{name}");
+            self.storage
+                .delete(nodedb_types::Namespace::Meta, key.as_bytes())
+                .await?;
+            Ok(())
+        }
+        .await;
+        guard.finish(result)
     }
 
     /// Whether `name` is a collection any engine or the catalog knows: a

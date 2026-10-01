@@ -34,18 +34,43 @@ pub(in crate::query::physical_visitor) fn vector_direct_truncate<'a, S>(
 where
     S: StorageEngine + 'a,
 {
+    vector_direct_truncate_coordinated(engine, None, collection, field)
+}
+
+pub(in crate::query::physical_visitor) fn vector_direct_truncate_coordinated<'a, S>(
+    engine: &'a LiteQueryEngine<S>,
+    permit: Option<&'a crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: String,
+    field: String,
+) -> LitePhysicalFut<'a>
+where
+    S: StorageEngine + 'a,
+{
     let key = index_key(&collection, &field);
     let vector_state = Arc::clone(&engine.vector_state);
     let crdt = Arc::clone(&engine.crdt);
     Box::pin(async move {
-        for (doc_id, _) in read_all_rows(&crdt, &collection) {
-            remove_live_node(&vector_state, &key, &doc_id).await?;
-            remove_durable(&vector_state, &key, &doc_id, "DirectTruncate").await?;
-            delete_row(&crdt, &collection, &doc_id, "DirectTruncate")?;
-            reindex_documents(engine, &collection, [doc_id.as_str()])?;
+        let guard = if permit.is_none() {
+            Some(engine.fts_state.admit_mutation().await)
+        } else {
+            None
+        };
+        let result = async {
+            crate::engine::fts::checkpoint::persist_checkpoint_incomplete(&*engine.storage).await?;
+            for (doc_id, _) in read_all_rows(&crdt, &collection) {
+                remove_live_node(&vector_state, &key, &doc_id).await?;
+                remove_durable(&vector_state, &key, &doc_id, "DirectTruncate").await?;
+                delete_row(&crdt, &collection, &doc_id, "DirectTruncate")?;
+                reindex_documents(engine, &collection, [doc_id.as_str()])?;
+            }
+            clear_index(&vector_state, &key).await?;
+            Ok(truncated())
         }
-        clear_index(&vector_state, &key).await?;
-        Ok(truncated())
+        .await;
+        match guard {
+            Some(guard) => guard.finish(result),
+            None => result,
+        }
     })
 }
 

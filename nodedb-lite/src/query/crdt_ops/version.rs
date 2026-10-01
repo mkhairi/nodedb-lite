@@ -139,6 +139,53 @@ pub async fn handle_restore_to_version<S: StorageEngine>(
     document_id: &str,
     target_version_json: &str,
 ) -> Result<QueryResult, LiteError> {
+    handle_restore_to_version_coordinated(
+        engine,
+        None,
+        collection,
+        document_id,
+        target_version_json,
+    )
+    .await
+}
+
+pub(crate) async fn handle_restore_to_version_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: &str,
+    document_id: &str,
+    target_version_json: &str,
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return handle_restore_to_version_admitted(
+            engine,
+            permit,
+            collection,
+            document_id,
+            target_version_json,
+        )
+        .await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result = handle_restore_to_version_admitted(
+        engine,
+        guard.permit(),
+        collection,
+        document_id,
+        target_version_json,
+    )
+    .await;
+    guard.finish(result)
+}
+
+pub(crate) async fn handle_restore_to_version_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    collection: &str,
+    document_id: &str,
+    target_version_json: &str,
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
     let vv = parse_version_vector(target_version_json)?;
 
     let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
@@ -165,6 +212,33 @@ pub async fn handle_compact_at_version<S: StorageEngine>(
     collection: &str,
     target_version_json: &str,
 ) -> Result<QueryResult, LiteError> {
+    handle_compact_at_version_coordinated(engine, None, collection, target_version_json).await
+}
+
+pub(crate) async fn handle_compact_at_version_coordinated<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: Option<&crate::engine::fts::coordinator::TextMutationPermit>,
+    collection: &str,
+    target_version_json: &str,
+) -> Result<QueryResult, LiteError> {
+    if let Some(permit) = permit {
+        return handle_compact_at_version_admitted(engine, permit, collection, target_version_json)
+            .await;
+    }
+    let guard = engine.fts_state.admit_mutation().await;
+    let result =
+        handle_compact_at_version_admitted(engine, guard.permit(), collection, target_version_json)
+            .await;
+    guard.finish(result)
+}
+
+pub(crate) async fn handle_compact_at_version_admitted<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    permit: &crate::engine::fts::coordinator::TextMutationPermit,
+    collection: &str,
+    target_version_json: &str,
+) -> Result<QueryResult, LiteError> {
+    let _permit = permit;
     let vv = parse_version_vector(target_version_json)?;
 
     let mut crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
