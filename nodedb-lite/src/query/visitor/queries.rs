@@ -273,10 +273,25 @@ pub(super) fn lower_document_index_lookup<'a, S: StorageEngine + 'a>(
         ..
     } = args;
     let collection = collection.to_string();
-    let field = field.to_string();
     // The planner already lowercased the value for a case-insensitive index.
     let probe = sql_value_to_value(value)?;
-    let filters = filters.to_vec();
+    let mut filters = filters.to_vec();
+    // The scan's equality coerces: `'1'` matches `1`, `'01'` and `true`, and
+    // `= NULL` matches a missing field. The index holds neither NULL nor every
+    // stored form a number coerces from, so such a probe is answered by the
+    // scan with the equality as a filter, as on a collection with no index.
+    // Adding an index then never changes which rows a query returns.
+    let scan_probe = scan_answers_probe(value);
+    if scan_probe {
+        filters.push(Filter {
+            expr: nodedb_sql::types::filter::FilterExpr::Comparison {
+                field: field.strip_prefix("$.").unwrap_or(field).to_string(),
+                op: nodedb_sql::types::filter::CompareOp::Eq,
+                value: value.clone(),
+            },
+        });
+    }
+    let field = field.to_string();
     let sort_keys = sort_keys.to_vec();
     let window_functions = window_functions.to_vec();
     let projection = projection.to_vec();
@@ -284,15 +299,19 @@ pub(super) fn lower_document_index_lookup<'a, S: StorageEngine + 'a>(
     // The fetch returns every indexed match in full: residual filters,
     // ORDER BY, projection, OFFSET and LIMIT all run in post-processing.
     Ok(Box::pin(async move {
-        let raw = crate::query::document_ops::index_reads::indexed_fetch(
-            engine,
-            &collection,
-            &field,
-            &probe,
-            usize::MAX,
-            0,
-        )
-        .await?;
+        let raw = if scan_probe {
+            engine.execute_scan(&collection, &engine_type).await?
+        } else {
+            crate::query::document_ops::index_reads::indexed_fetch(
+                engine,
+                &collection,
+                &field,
+                &probe,
+                usize::MAX,
+                0,
+            )
+            .await?
+        };
         apply_scan_post_processing(
             raw,
             ScanPostArgs {
@@ -307,6 +326,21 @@ pub(super) fn lower_document_index_lookup<'a, S: StorageEngine + 'a>(
             },
         )
     }))
+}
+
+/// Whether an equality probe needs the scan's coercing equality, which the
+/// index cannot reproduce: NULL, a number, a bool, or a string that reads as
+/// a number.
+fn scan_answers_probe(value: &SqlValue) -> bool {
+    match value {
+        SqlValue::Null
+        | SqlValue::Int(_)
+        | SqlValue::Float(_)
+        | SqlValue::Decimal(_)
+        | SqlValue::Bool(_) => true,
+        SqlValue::String(s) => s.trim().parse::<f64>().is_ok(),
+        _ => false,
+    }
 }
 
 // ── RangeScan ────────────────────────────────────────────────────────────────

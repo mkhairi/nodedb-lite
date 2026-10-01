@@ -3,6 +3,8 @@
 mod field_index_tests;
 pub mod index_reads;
 #[cfg(test)]
+mod index_select_tests;
+#[cfg(test)]
 mod index_spec_tests;
 pub mod indexes;
 pub mod reads;
