@@ -31,17 +31,23 @@ pub(crate) struct FtsOutbound<S>(std::convert::Infallible, std::marker::PhantomD
 
 #[cfg(target_arch = "wasm32")]
 impl<S> FtsOutbound<S> {
-    fn stage_index(&self, _collection: &str, _doc_id: &str, _text: String) {
+    fn stage_index(
+        &self,
+        _collection: &str,
+        _doc_id: &str,
+        _text: String,
+    ) -> Result<(), LiteError> {
         match self.0 {}
     }
 
-    fn stage_delete(&self, _collection: &str, _doc_id: &str) {
+    fn stage_delete(&self, _collection: &str, _doc_id: &str) -> Result<(), LiteError> {
         match self.0 {}
     }
 }
 
 /// Index a schemaless document whole and per string field, replacing what
 /// it held before, and stage its whole-document text on `outbound`.
+/// Source and local index changes precede outbound Backpressure. Errors do not roll them back.
 pub(crate) fn index_document<S: StorageEngine>(
     fts: &FtsState,
     outbound: Option<&FtsOutbound<S>>,
@@ -54,13 +60,14 @@ pub(crate) fn index_document<S: StorageEngine>(
         .lock_or_recover()
         .index_document_fields(collection, doc_id, fields)?;
     if let Some(q) = outbound {
-        q.stage_index(collection, doc_id, text);
+        q.stage_index(collection, doc_id, text)?;
     }
     Ok(())
 }
 
 /// Remove a document from every text index of its collection, and stage the
 /// removal on `outbound`.
+/// Source and local index changes precede outbound Backpressure. Errors do not roll them back.
 pub(crate) fn remove_document<S: StorageEngine>(
     fts: &FtsState,
     outbound: Option<&FtsOutbound<S>>,
@@ -71,7 +78,7 @@ pub(crate) fn remove_document<S: StorageEngine>(
         .lock_or_recover()
         .remove_document_fields(collection, doc_id)?;
     if let Some(q) = outbound {
-        q.stage_delete(collection, doc_id);
+        q.stage_delete(collection, doc_id)?;
     }
     Ok(())
 }

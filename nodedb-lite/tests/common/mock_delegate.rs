@@ -255,15 +255,15 @@ impl SyncDelegate for MockDelegate {
     async fn ack_vector_delete_in_flight(&self, _batch_id: u64) {}
     async fn acknowledge_vector_delete(&self, _durable_key: Vec<u8>) {}
 
-    async fn pending_fts_indexes(&self) -> Vec<(Vec<u8>, PendingFtsIndex)> {
-        Vec::new()
+    async fn pending_fts_indexes(&self) -> Result<Vec<(Vec<u8>, PendingFtsIndex)>, LiteError> {
+        Ok(Vec::new())
     }
     async fn mark_fts_index_in_flight(&self, _batch_id: u64, _durable_key: Vec<u8>) {}
     async fn ack_fts_index_in_flight(&self, _batch_id: u64) {}
     async fn acknowledge_fts_index(&self, _durable_key: Vec<u8>) {}
 
-    async fn pending_fts_deletes(&self) -> Vec<(Vec<u8>, PendingFtsDelete)> {
-        Vec::new()
+    async fn pending_fts_deletes(&self) -> Result<Vec<(Vec<u8>, PendingFtsDelete)>, LiteError> {
+        Ok(Vec::new())
     }
     async fn mark_fts_delete_in_flight(&self, _batch_id: u64, _durable_key: Vec<u8>) {}
     async fn ack_fts_delete_in_flight(&self, _batch_id: u64) {}

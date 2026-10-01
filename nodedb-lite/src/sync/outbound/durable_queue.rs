@@ -78,7 +78,7 @@ impl<S: StorageEngine> DurableOutboundQueue<S> {
                 None
             }
         });
-        Ok(max.map(|m| m.saturating_add(1)).unwrap_or(1))
+        max.map_or(Ok(1), |id| id.checked_add(1).ok_or_else(Self::exhausted))
     }
 
     /// Enqueue a pre-encoded payload.
@@ -86,9 +86,35 @@ impl<S: StorageEngine> DurableOutboundQueue<S> {
     /// Returns [`LiteError::Backpressure`] when `len() >= cap`.
     pub async fn enqueue(&self, payload: &[u8]) -> Result<(), LiteError> {
         self.ensure_room(1).await?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let key = id.to_be_bytes().to_vec();
+        let key = self.reserve_key()?;
         self.storage.put(self.namespace, &key, payload).await
+    }
+
+    /// Reserve a stable key without awaiting persistence.
+    pub(crate) fn reserve_key(&self) -> Result<[u8; 8], LiteError> {
+        self.next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map(u64::to_be_bytes)
+            .map_err(|_| Self::exhausted())
+    }
+
+    fn exhausted() -> LiteError {
+        LiteError::Backpressure { detail: "outbound key counter exhausted: drain and acknowledge pending entries before reopening the queue".into() }
+    }
+
+    /// Persist a reserved key, preserving any existing payload and assigned seq.
+    /// The caller exclusively owns this namespace and serializes reserved persistence.
+    /// Retry after ambiguous storage completion uses the same key.
+    pub(crate) async fn persist_reserved(
+        &self,
+        key: &[u8; 8],
+        payload: &[u8],
+    ) -> Result<(), LiteError> {
+        if self.storage.get(self.namespace, key).await?.is_some() {
+            return Ok(());
+        }
+        self.ensure_room(1).await?;
+        self.storage.put(self.namespace, key, payload).await
     }
 
     /// Check that `entries` more entries fit under the cap.
@@ -238,10 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_entry_persists_and_re_drain_reuses_payload() {
-        // Models the stable-seq fix: a push assigns a seq, persists it into the
-        // durable entry via update_entry, and a later re-drain (reconnect) must
-        // return the SAME updated payload — so the re-sent frame carries the
-        // same seq and Origin dedups it instead of double-applying.
+        // Assigned stream seq persists across repeated drains under the same durable key.
         let q = make_queue().await;
         q.enqueue(b"seq=0").await.unwrap();
 
@@ -294,5 +317,43 @@ mod tests {
                 b"third".as_slice()
             ]
         );
+    }
+    #[tokio::test]
+    async fn reserved_retry_preserves_payload_at_capacity() {
+        let storage = Arc::new(PagedbStorageMem::open_in_memory().await.unwrap());
+        let queue = DurableOutboundQueue::open_with_cap(storage, Namespace::FtsIndexPending, 1)
+            .await
+            .unwrap();
+        let key = queue.reserve_key().unwrap();
+        queue.persist_reserved(&key, b"seq=7").await.unwrap();
+        queue.persist_reserved(&key, b"seq=0").await.unwrap();
+        assert_eq!(
+            queue.drain_batch(10).await.unwrap(),
+            vec![(key.to_vec(), b"seq=7".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_counter_never_wraps_or_overwrites_existing_keys() {
+        let queue = make_queue().await;
+        queue.next_id.store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(queue.reserve_key().unwrap(), (u64::MAX - 1).to_be_bytes());
+        assert!(matches!(
+            queue.reserve_key(),
+            Err(LiteError::Backpressure { .. })
+        ));
+        assert!(matches!(
+            queue.reserve_key(),
+            Err(LiteError::Backpressure { .. })
+        ));
+        let storage = Arc::new(PagedbStorageMem::open_in_memory().await.unwrap());
+        storage
+            .put(Namespace::ColumnarPending, &u64::MAX.to_be_bytes(), b"last")
+            .await
+            .unwrap();
+        assert!(matches!(
+            DurableOutboundQueue::open(storage, Namespace::ColumnarPending).await,
+            Err(LiteError::Backpressure { .. })
+        ));
     }
 }

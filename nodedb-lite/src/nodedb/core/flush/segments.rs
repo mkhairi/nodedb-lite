@@ -262,7 +262,11 @@ mod tests {
         ] {
             let (db, mode) = open().await;
             if mode_value == FTS_WRITE {
-                db.fts_outbound.as_ref().unwrap().stage_delete("docs", "a");
+                db.fts_outbound
+                    .as_ref()
+                    .unwrap()
+                    .stage_delete("docs", "a")
+                    .unwrap();
             } else {
                 db.spatial_outbound
                     .as_ref()

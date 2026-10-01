@@ -174,7 +174,8 @@ impl<S: StorageEngine> crate::sync::SyncDelegate for NodeDbLite<S> {
 
     async fn pending_fts_indexes(
         &self,
-    ) -> Vec<(Vec<u8>, crate::sync::outbound::fts::PendingFtsIndex)> {
+    ) -> Result<Vec<(Vec<u8>, crate::sync::outbound::fts::PendingFtsIndex)>, crate::error::LiteError>
+    {
         super::fts_handlers::pending_fts_indexes_impl(self).await
     }
 
@@ -192,7 +193,8 @@ impl<S: StorageEngine> crate::sync::SyncDelegate for NodeDbLite<S> {
 
     async fn pending_fts_deletes(
         &self,
-    ) -> Vec<(Vec<u8>, crate::sync::outbound::fts::PendingFtsDelete)> {
+    ) -> Result<Vec<(Vec<u8>, crate::sync::outbound::fts::PendingFtsDelete)>, crate::error::LiteError>
+    {
         super::fts_handlers::pending_fts_deletes_impl(self).await
     }
 

@@ -62,7 +62,7 @@ pub(super) fn fts_index_doc<'a, S: StorageEngine + 'a>(
         // Stage for durable sync outbound (SQL path — no await needed).
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(q) = fts_outbound {
-            q.stage_index(&collection, &text, text.clone());
+            q.stage_index(&collection, &text, text.clone())?;
         }
         Ok(affected(1))
 
@@ -107,7 +107,7 @@ pub(super) fn fts_delete_doc<'a, S: StorageEngine + 'a>(
         // Stage delete for durable sync outbound (SQL path — no await needed).
         #[cfg(not(target_arch = "wasm32"))]
         if let (Some(q), Some(doc_id)) = (fts_outbound, removed_doc_id.as_deref()) {
-            q.stage_delete(&collection, doc_id);
+            q.stage_delete(&collection, doc_id)?;
         }
         Ok(affected(u64::from(removed_doc_id.is_some())))
 

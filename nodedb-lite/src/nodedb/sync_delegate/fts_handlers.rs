@@ -8,13 +8,10 @@ use crate::storage::engine::StorageEngine;
 
 pub(super) async fn pending_fts_indexes_impl<S: StorageEngine>(
     db: &NodeDbLite<S>,
-) -> Vec<(Vec<u8>, crate::sync::outbound::fts::PendingFtsIndex)> {
+) -> Result<Vec<(Vec<u8>, crate::sync::outbound::fts::PendingFtsIndex)>, crate::error::LiteError> {
     match &db.fts_outbound {
-        Some(q) => q
-            .drain_indexes(crate::sync::PUSH_DRAIN_LIMIT)
-            .await
-            .unwrap_or_default(),
-        None => Vec::new(),
+        Some(q) => q.drain_indexes(crate::sync::PUSH_DRAIN_LIMIT).await,
+        None => Ok(Vec::new()),
     }
 }
 
@@ -53,13 +50,10 @@ pub(super) async fn acknowledge_fts_index_impl<S: StorageEngine>(
 
 pub(super) async fn pending_fts_deletes_impl<S: StorageEngine>(
     db: &NodeDbLite<S>,
-) -> Vec<(Vec<u8>, crate::sync::outbound::fts::PendingFtsDelete)> {
+) -> Result<Vec<(Vec<u8>, crate::sync::outbound::fts::PendingFtsDelete)>, crate::error::LiteError> {
     match &db.fts_outbound {
-        Some(q) => q
-            .drain_deletes(crate::sync::PUSH_DRAIN_LIMIT)
-            .await
-            .unwrap_or_default(),
-        None => Vec::new(),
+        Some(q) => q.drain_deletes(crate::sync::PUSH_DRAIN_LIMIT).await,
+        None => Ok(Vec::new()),
     }
 }
 

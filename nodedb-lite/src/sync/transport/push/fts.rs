@@ -30,7 +30,11 @@ where
     let producer_id = client.producer_id().await;
     let epoch = client.accepted_epoch().await;
 
-    for (durable_key, mut entry) in delegate.pending_fts_indexes().await {
+    let entries = match pending_batch(delegate.pending_fts_indexes().await, "index") {
+        ControlFlow::Continue(entries) => entries,
+        ControlFlow::Break(()) => return ControlFlow::Break(()),
+    };
+    for (durable_key, mut entry) in entries {
         // Announce the collection's schema before its first data frame so a
         // lite-only collection is registered on Origin before its FTS docs land.
         if super::control::ensure_collection_announced(client, delegate, sink, &entry.collection)
@@ -83,7 +87,11 @@ where
         );
     }
 
-    for (durable_key, mut entry) in delegate.pending_fts_deletes().await {
+    let entries = match pending_batch(delegate.pending_fts_deletes().await, "delete") {
+        ControlFlow::Continue(entries) => entries,
+        ControlFlow::Break(()) => return ControlFlow::Break(()),
+    };
+    for (durable_key, mut entry) in entries {
         if super::control::ensure_collection_announced(client, delegate, sink, &entry.collection)
             .await
             .is_break()
@@ -133,4 +141,56 @@ where
         );
     }
     ControlFlow::Continue(())
+}
+
+fn pending_batch<T>(
+    result: Result<Vec<T>, crate::error::LiteError>,
+    operation: &str,
+) -> ControlFlow<(), Vec<T>> {
+    match result {
+        Ok(entries) => ControlFlow::Continue(entries),
+        Err(error) => {
+            tracing::warn!(error = ?error, operation, "FTS pending drain error: retain entries and retry");
+            ControlFlow::Break(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pending_batch;
+    use crate::error::LiteError;
+    use std::ops::ControlFlow;
+
+    #[test]
+    fn pending_drain_errors_stop_push_for_retry() {
+        for operation in ["index", "delete"] {
+            let error = LiteError::Backpressure {
+                detail: "outbound capacity exhausted".into(),
+            };
+            assert!(matches!(
+                pending_batch::<u8>(Err(error), operation),
+                ControlFlow::Break(())
+            ));
+            let error = LiteError::Corrupted {
+                detail: "invalid durable entry".into(),
+            };
+            assert!(matches!(
+                pending_batch::<u8>(Err(error), operation),
+                ControlFlow::Break(())
+            ));
+        }
+    }
+
+    #[test]
+    fn successful_pending_batch_preserves_entries() {
+        assert_eq!(
+            pending_batch(Ok(vec![1, 2]), "index"),
+            ControlFlow::Continue(vec![1, 2])
+        );
+        assert_eq!(
+            pending_batch::<u8>(Ok(vec![]), "delete"),
+            ControlFlow::Continue(vec![])
+        );
+    }
 }

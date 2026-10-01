@@ -171,7 +171,9 @@ pub trait SyncDelegate: Send + Sync + 'static {
 
     // ── FTS ──────────────────────────────────────────────────────────────────
     /// Drain up to `PUSH_DRAIN_LIMIT` pending index entries, skipping in-flight.
-    async fn pending_fts_indexes(&self) -> Vec<(Vec<u8>, PendingFtsIndex)>;
+    async fn pending_fts_indexes(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, PendingFtsIndex)>, crate::error::LiteError>;
     /// Record that an FTS index entry has been sent and is awaiting Origin ack.
     async fn mark_fts_index_in_flight(&self, batch_id: u64, durable_key: Vec<u8>);
     /// On Origin ack: remove in-flight record and delete the durable entry.
@@ -180,7 +182,9 @@ pub trait SyncDelegate: Send + Sync + 'static {
     async fn acknowledge_fts_index(&self, durable_key: Vec<u8>);
 
     /// Drain up to `PUSH_DRAIN_LIMIT` pending FTS delete entries, skipping in-flight.
-    async fn pending_fts_deletes(&self) -> Vec<(Vec<u8>, PendingFtsDelete)>;
+    async fn pending_fts_deletes(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, PendingFtsDelete)>, crate::error::LiteError>;
     /// Record that an FTS delete entry has been sent and is awaiting Origin ack.
     async fn mark_fts_delete_in_flight(&self, batch_id: u64, durable_key: Vec<u8>);
     /// On Origin ack: remove in-flight record and delete the durable entry.
