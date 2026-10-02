@@ -249,3 +249,68 @@ fn compacting_an_unflushed_collection_is_deferred() {
         "compacting it once caught up must plan nothing"
     );
 }
+
+/// A collection is compacted again only once it has taken `min_ops`
+/// operations since its last compaction. Below that the pass leaves it whole
+/// and counts it as skipped, so a busy store does not rebuild a large document
+/// on every tick to discard a handful of operations.
+#[test]
+fn compaction_waits_for_min_ops_since_the_last_one() {
+    let mut engine = CrdtEngine::new(1).unwrap();
+    for i in 0..10 {
+        upsert(&mut engine, &format!("i{i}"), i, "row");
+    }
+    flush(&mut engine);
+
+    let first = engine.compact_history_min_ops(1).unwrap();
+    assert_eq!((first.compacted, first.deferred, first.skipped), (1, 0, 0));
+    assert!(first.ops_discarded > 0);
+    let epoch = engine.state_epoch(COLLECTION);
+
+    // Operations are counted from the version vector, not assumed per upsert.
+    let ops = |e: &CrdtEngine| -> u64 {
+        let vv = e.state(COLLECTION).unwrap().oplog_version_vector();
+        vv.values().map(|end| u64::try_from(*end).unwrap()).sum()
+    };
+    let at_compaction = ops(&engine);
+    upsert(&mut engine, "i10", 10, "a");
+    upsert(&mut engine, "i11", 11, "b");
+    flush(&mut engine);
+    let taken = ops(&engine) - at_compaction;
+    let below = engine.compact_history_min_ops(taken + 1).unwrap();
+    assert_eq!((below.compacted, below.deferred, below.skipped), (0, 0, 1));
+    assert_eq!(below.ops_discarded, 0);
+    assert_eq!(
+        engine.state_epoch(COLLECTION),
+        epoch,
+        "a collection below the threshold must not be compacted"
+    );
+
+    // One more write reaches it, counted from the last compaction rather
+    // than from the skipped pass.
+    upsert(&mut engine, "i12", 12, "c");
+    flush(&mut engine);
+    let reached = engine.compact_history_min_ops(taken + 1).unwrap();
+    assert_eq!(
+        (reached.compacted, reached.deferred, reached.skipped),
+        (1, 0, 0)
+    );
+    assert_eq!(reached.ops_discarded, ops(&engine) - at_compaction);
+    assert!(engine.state_epoch(COLLECTION) > epoch);
+}
+
+/// The report counts a collection waiting on a flush as deferred, not
+/// skipped, whatever the threshold.
+#[test]
+fn compaction_report_counts_deferred_collections() {
+    let mut engine = CrdtEngine::new(1).unwrap();
+    upsert(&mut engine, "i0", 0, "row");
+    flush(&mut engine);
+    upsert(&mut engine, "i1", 1, "unflushed");
+
+    let report = engine.compact_history_min_ops(1).unwrap();
+    assert_eq!(
+        (report.compacted, report.deferred, report.skipped),
+        (0, 1, 0)
+    );
+}

@@ -38,5 +38,5 @@ pub use checkpoint::{CrdtPersisted, CrdtWrite, CrdtWriteKind};
 pub use lifecycle::TrackedImport;
 pub use types::{
     CrdtBatchOp, CrdtEngine, CrdtField, CrdtRowOp, CrdtRowWrite, DEFAULT_PENDING_DELTA_WINDOW,
-    PendingDelta,
+    HistoryCompaction, PendingDelta,
 };
