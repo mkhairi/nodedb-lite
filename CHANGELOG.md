@@ -22,6 +22,13 @@ First release. Embedded NodeDB for Linux, macOS, Windows, Android and the browse
 
 ### Added
 
+- `NodeDbLite::compact_crdt_history_min_ops(min_ops)` compacts only the
+  collections that took at least `min_ops` operations since their last
+  compaction, and returns a `HistoryCompaction` report: compacted, deferred
+  and skipped collections, plus the operations discarded. Compaction rebuilds
+  a document and its field indexes at a cost set by its size, so a periodic
+  caller can skip a large collection that took few writes.
+  `CrdtEngine::compact_history` now returns the same report.
 - `diagnostic_dump()` reports `storage_readers`: tracked read transactions,
   the oldest reader's commit id and age, and the non-abortable reader count.
   A long-lived reader pins the free-page reuse floor. The new
