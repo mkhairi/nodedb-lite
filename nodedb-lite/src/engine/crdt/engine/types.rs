@@ -229,6 +229,21 @@ pub(super) struct DeferredOp {
     pub(super) to_counter: i32,
 }
 
+/// What one history compaction pass did, per collection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryCompaction {
+    /// Collections replaced with a shallow snapshot.
+    pub compacted: usize,
+    /// Collections left whole because a write is not yet flushed.
+    pub deferred: usize,
+    /// Collections left whole because they took fewer operations than the
+    /// threshold since their last compaction.
+    pub skipped: usize,
+    /// Operations the compacted collections had taken since their last
+    /// compaction: the history this pass discarded.
+    pub ops_discarded: u64,
+}
+
 /// A pending (unsent) delta waiting to be synced to Origin.
 #[derive(
     Debug,

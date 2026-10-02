@@ -40,6 +40,22 @@ impl<S: StorageEngine> NodeDbLite<S> {
         Ok(())
     }
 
+    /// [`compact_crdt_history`](Self::compact_crdt_history), compacting only
+    /// the collections that took at least `min_ops` operations since their
+    /// last compaction, and reporting what the pass did.
+    ///
+    /// Compaction holds the CRDT lock while it rebuilds each document, at a
+    /// cost set by the collection's size. A periodic caller passes a threshold
+    /// so a large collection taking a few writes per period is not rebuilt on
+    /// every tick.
+    pub fn compact_crdt_history_min_ops(
+        &self,
+        min_ops: u64,
+    ) -> NodeDbResult<crate::engine::crdt::engine::HistoryCompaction> {
+        let mut crdt = self.crdt.lock_or_recover();
+        Ok(crdt.compact_history_min_ops(min_ops)?)
+    }
+
     /// Install a per-document [`SyncGate`]. Documents the gate rejects are kept
     /// local-only (excluded from CRDT delta, FTS, and vector sync channels).
     pub fn set_sync_gate(&self, gate: Arc<dyn SyncGate>) {

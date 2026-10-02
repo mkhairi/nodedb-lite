@@ -12,7 +12,7 @@ use nodedb_crdt::{CrdtState, ImportAdmission};
 
 use crate::error::LiteError;
 
-use super::types::CrdtEngine;
+use super::types::{CrdtEngine, HistoryCompaction};
 
 /// Warn when an import carried operations but contributed none of them.
 ///
@@ -297,31 +297,53 @@ impl CrdtEngine {
     /// that. A kept-marks collection was persisted at its current frontier, so
     /// restore reproduces the pre-compaction state and loses nothing. The next
     /// update or checkpoint reaches disk through the normal flush batch.
-    pub fn compact_history(&mut self) -> Result<(), LiteError> {
-        // Only collections whose frontier has moved since their last
-        // compaction. Compaction discards history behind the frontier, so a
-        // collection that has taken no operations since has none to discard.
-        // Compacting it again is pure cost: the document is rebuilt and the
-        // field indexes with it.
-        //
+    ///
+    /// Compacts every collection that took any operation since its last
+    /// compaction. [`compact_history_min_ops`](Self::compact_history_min_ops)
+    /// raises that bar.
+    pub fn compact_history(&mut self) -> Result<HistoryCompaction, LiteError> {
+        self.compact_history_min_ops(1)
+    }
+
+    /// [`compact_history`](Self::compact_history), compacting only the
+    /// collections that took at least `min_ops` operations since their last
+    /// compaction. The rest are skipped and counted in the report.
+    ///
+    /// Compaction rebuilds the document and its field indexes, at a cost set
+    /// by the collection's size rather than by how much history it discards.
+    /// On a large collection taking a steady trickle of writes, compacting on
+    /// every tick holds the CRDT lock for seconds to discard a few operations.
+    /// A threshold makes it wait until there is history worth discarding.
+    /// A `min_ops` of 0 is treated as 1: a collection with no new operations
+    /// has nothing to discard.
+    pub fn compact_history_min_ops(
+        &mut self,
+        min_ops: u64,
+    ) -> Result<HistoryCompaction, LiteError> {
+        let mut report = HistoryCompaction::default();
         // The flag records whether the disk form is current at this frontier.
-        let due: Vec<(String, bool)> = self
+        let due: Vec<(String, bool, u64)> = self
             .states
             .iter()
             .filter_map(|(collection, state)| {
                 let frontier = state.oplog_version_vector();
-                if self.compacted_versions.get(collection) == Some(&frontier) {
+                let ops = ops_since(&frontier, self.compacted_versions.get(collection));
+                if ops < min_ops.max(1) {
+                    report.skipped += 1;
                     return None;
                 }
                 match self.flushed_versions.get(collection) {
-                    Some(flushed) if *flushed == frontier => Some((collection.clone(), true)),
-                    Some(_) => None,
-                    None => Some((collection.clone(), false)),
+                    Some(flushed) if *flushed == frontier => Some((collection.clone(), true, ops)),
+                    Some(_) => {
+                        report.deferred += 1;
+                        None
+                    }
+                    None => Some((collection.clone(), false, ops)),
                 }
             })
             .collect();
 
-        for (collection, persisted_at_frontier) in &due {
+        for (collection, persisted_at_frontier, ops) in &due {
             let Some(state) = self.states.get_mut(collection) else {
                 continue;
             };
@@ -351,8 +373,10 @@ impl CrdtEngine {
             // only while the persisted frontier is behind, and such a
             // collection is deferred above.
             self.advance_state_epoch(collection);
+            report.compacted += 1;
+            report.ops_discarded += ops;
         }
-        Ok(())
+        Ok(report)
     }
 
     /// Estimated memory usage in bytes across all collections.
@@ -453,4 +477,16 @@ impl CrdtEngine {
             detail: format!("restore_to_version '{collection}': {e}"),
         })
     }
+}
+
+/// Operations in `frontier` that `base` does not cover. With no base, every
+/// operation the document has ever taken.
+fn ops_since(frontier: &loro::VersionVector, base: Option<&loro::VersionVector>) -> u64 {
+    frontier
+        .iter()
+        .map(|(peer, end)| {
+            let start = base.and_then(|b| b.get(peer)).copied().unwrap_or(0);
+            u64::try_from(end - start).unwrap_or(0)
+        })
+        .sum()
 }
