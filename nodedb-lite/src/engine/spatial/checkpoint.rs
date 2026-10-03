@@ -263,6 +263,19 @@ where
 ///
 /// Returns `(checkpoints, doc_to_entry, next_id)`.
 /// Returns an empty state if no checkpoint is found.
+/// Whether the last flush recorded an empty spatial catalog, meaning the store
+/// had no spatial index when it last wrote one.
+///
+/// Every flushing handle writes `spatial:_collections` once, even when empty,
+/// so this tells "nothing to index" apart from "never checkpointed". A missing
+/// or undecodable key reads as `false`.
+pub(crate) async fn catalog_records_no_index<S: StorageEngine>(storage: &S) -> NodeDbResult<bool> {
+    let Some(bytes) = storage.get(Namespace::Spatial, COLLECTIONS_KEY).await? else {
+        return Ok(false);
+    };
+    Ok(zerompk::from_msgpack::<Vec<(String, String)>>(&bytes).is_ok_and(|keys| keys.is_empty()))
+}
+
 pub(crate) async fn restore_spatial<S>(
     storage: &S,
 ) -> NodeDbResult<(

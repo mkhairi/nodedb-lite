@@ -349,10 +349,22 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // Rebuild spatial indices if restore produced empty trees.
         // The R-tree checkpoint only stores bounding boxes, not doc IDs.
         // A full rebuild from CRDT documents ensures doc_to_entry is correct.
+        //
+        // Skipped when the last flush recorded an empty catalog. The rebuild
+        // reads every row of every collection, which makes the CRDT engine
+        // decode and keep each document's state: on a store with no geometry
+        // that cost every open hundreds of MB and found nothing. A non-empty
+        // catalog is already trusted without a rebuild. This extends the same
+        // trust to an empty one. A read error falls back to the rebuild.
         {
-            let spatial = db.spatial.lock_or_recover();
-            if spatial.is_empty() {
-                drop(spatial);
+            let spatial_empty = db.spatial.lock_or_recover().is_empty();
+            if spatial_empty
+                && !crate::engine::spatial::checkpoint::catalog_records_no_index(
+                    db.storage.as_ref(),
+                )
+                .await
+                .unwrap_or(false)
+            {
                 db.rebuild_spatial_indices();
             }
         }

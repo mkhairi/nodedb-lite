@@ -334,3 +334,67 @@ async fn upsert_and_delete_after_restart() {
         );
     }
 }
+
+// ── Test: cold rebuild runs only when no empty catalog was flushed ───────────
+
+/// Write a schemaless document whose field holds a GeoJSON string, flush, and
+/// optionally drop the spatial catalog key. Returns the bbox hits on reopen.
+///
+/// Nothing indexes the string at write time, so a hit on reopen means the
+/// cold rebuild scanned the collection.
+async fn reopen_hits_after_geojson_write(drop_catalog: bool) -> usize {
+    use nodedb_client::NodeDb;
+    use nodedb_types::Namespace;
+    use nodedb_types::document::Document;
+    use nodedb_types::value::Value;
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("spatial_rebuild.db");
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .expect("open storage");
+        let db = NodeDbLite::open(storage).await.expect("open NodeDbLite");
+        let geojson = sonic_rs::to_string(&Geometry::point(-0.1278, 51.5074)).unwrap();
+        let mut doc = Document::new("london".to_string());
+        doc.set(FIELD, Value::String(geojson));
+        db.document_put(COLLECTION, doc)
+            .await
+            .expect("document_put");
+        db.flush().await.expect("flush");
+    }
+    if drop_catalog {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .expect("open storage");
+        storage
+            .delete(Namespace::Spatial, b"spatial:_collections")
+            .await
+            .expect("delete catalog");
+    }
+    let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+        .await
+        .expect("reopen storage");
+    let db = NodeDbLite::open(storage).await.expect("reopen NodeDbLite");
+    db.spatial_search_bbox(
+        COLLECTION,
+        FIELD,
+        &BoundingBox::new(-180.0, -90.0, 180.0, 90.0),
+    )
+    .len()
+}
+
+/// A flush records the spatial catalog even when it is empty. Reopening such
+/// a store must not scan every document for geometry: the store had no
+/// spatial index when it last flushed.
+#[tokio::test]
+async fn reopen_skips_rebuild_when_flushed_catalog_is_empty() {
+    assert_eq!(reopen_hits_after_geojson_write(false).await, 0);
+}
+
+/// With no catalog on disk — a store never flushed by a handle that writes
+/// one — the cold rebuild still runs and finds the geometry.
+#[tokio::test]
+async fn reopen_rebuilds_when_no_catalog_was_flushed() {
+    assert_eq!(reopen_hits_after_geojson_write(true).await, 1);
+}

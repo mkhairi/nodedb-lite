@@ -83,6 +83,13 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Opening a store with no spatial index no longer scans every document for
+  geometry. The cold-open spatial rebuild ran whenever the restored R-trees
+  were empty, which a store with no geometry always restores. Its read of
+  every row made the CRDT engine decode and keep each document's state, so
+  the scan cost memory and open time on every open and found nothing. The
+  rebuild now runs only when no flush has recorded the spatial catalog. A
+  flushed empty catalog is trusted, as a non-empty one already was.
 - `compact_crdt_history()` no longer forces a full snapshot rewrite of every
   compacted collection. It used to drop each collection's persistence marks,
   so the next flush wrote every compacted collection as a full Loro snapshot
