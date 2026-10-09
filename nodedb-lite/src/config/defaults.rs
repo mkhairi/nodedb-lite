@@ -15,6 +15,10 @@ pub(crate) fn default_outbound_queue_cap() -> usize {
     100_000
 }
 
+pub(crate) fn default_crdt_pending_delta_window() -> usize {
+    crate::engine::crdt::engine::DEFAULT_PENDING_DELTA_WINDOW
+}
+
 pub(crate) fn default_kv_cache_capacity() -> usize {
     10_000
 }

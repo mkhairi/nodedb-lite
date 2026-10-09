@@ -25,8 +25,12 @@ mod pending;
 mod persist;
 mod read;
 mod rotate;
+mod spill;
 pub mod types;
 
 pub use checkpoint::{CrdtPersisted, CrdtWrite, CrdtWriteKind};
 pub use lifecycle::TrackedImport;
-pub use types::{CrdtBatchOp, CrdtEngine, CrdtField, CrdtRowOp, CrdtRowWrite, PendingDelta};
+pub use types::{
+    CrdtBatchOp, CrdtEngine, CrdtField, CrdtRowOp, CrdtRowWrite, DEFAULT_PENDING_DELTA_WINDOW,
+    PendingDelta,
+};
