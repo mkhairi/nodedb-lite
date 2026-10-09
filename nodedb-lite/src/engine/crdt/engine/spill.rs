@@ -76,7 +76,9 @@ impl SpillIndex {
     /// double-counts an id.
     pub fn insert(&mut self, mutation_id: u64) -> bool {
         // Position of the first run starting after `mutation_id`.
-        let at = self.runs.partition_point(|&(start, _)| start <= mutation_id);
+        let at = self
+            .runs
+            .partition_point(|&(start, _)| start <= mutation_id);
 
         if at > 0 {
             let (_, end) = self.runs[at - 1];
