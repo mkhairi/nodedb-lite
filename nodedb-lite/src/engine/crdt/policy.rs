@@ -189,6 +189,8 @@ impl CrdtEngine {
                 self.delete_local_row(&collection, &doc_id);
                 self.sync_indexes(&collection, [doc_id.as_str()]);
                 self.pending_deltas.remove(pos);
+                self.blocked_deltas.remove(&mutation_id);
+                self.dropped_writes = self.dropped_writes.saturating_add(1);
                 return Some(PolicyResolution::Escalate {
                     violations: violation_from_hint(hint),
                 });
@@ -202,6 +204,8 @@ impl CrdtEngine {
             PolicyResolution::Escalate { .. } => {
                 self.delete_local_row(&collection, &doc_id);
                 self.pending_deltas.remove(pos);
+                self.blocked_deltas.remove(&mutation_id);
+                self.dropped_writes = self.dropped_writes.saturating_add(1);
             }
             PolicyResolution::AutoResolved(_) => {
                 self.pending_deltas.remove(pos);

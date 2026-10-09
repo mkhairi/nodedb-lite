@@ -98,6 +98,8 @@ impl CrdtEngine {
             delta_writes: 0,
             snapshot_exports: AtomicU64::new(0),
             indexes: None,
+            blocked_deltas: std::collections::HashSet::new(),
+            dropped_writes: 0,
         })
     }
 

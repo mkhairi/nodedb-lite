@@ -73,6 +73,7 @@ pub(super) async fn handle_columnar_insert_ack(
                 "ColumnarInsertAck: Origin permanently rejected this batch; \
                  dropping it — the write is LOST and will not retry"
             );
+            delegate.record_dropped_write();
             delegate.ack_columnar_batch_in_flight(ack.batch_id).await;
         }
     }
@@ -136,6 +137,7 @@ pub(super) async fn handle_vector_insert_ack(
                 "VectorInsertAck: Origin permanently rejected this insert; \
                  dropping it — the write is LOST and will not retry"
             );
+            delegate.record_dropped_write();
             delegate.ack_vector_insert_in_flight(ack.batch_id).await;
         }
     }
@@ -207,6 +209,7 @@ pub(super) async fn handle_vector_delete_ack(
                 "VectorDeleteAck: Origin permanently rejected this delete; \
                  dropping it — the write is LOST and will not retry"
             );
+            delegate.record_dropped_write();
             delegate.ack_vector_delete_in_flight(ack.batch_id).await;
         }
     }
@@ -270,6 +273,7 @@ pub(super) async fn handle_fts_index_ack(
                 "FtsIndexAck: Origin permanently rejected this index op; \
                  dropping it — the write is LOST and will not retry"
             );
+            delegate.record_dropped_write();
             delegate.ack_fts_index_in_flight(ack.batch_id).await;
         }
     }
@@ -333,6 +337,7 @@ pub(super) async fn handle_fts_delete_ack(
                 "FtsDeleteAck: Origin permanently rejected this delete op; \
                  dropping it — the write is LOST and will not retry"
             );
+            delegate.record_dropped_write();
             delegate.ack_fts_delete_in_flight(ack.batch_id).await;
         }
     }
@@ -397,6 +402,7 @@ pub(super) async fn handle_spatial_insert_ack(
                 "SpatialInsertAck: Origin permanently rejected this insert; \
                  dropping it — the write is LOST and will not retry"
             );
+            delegate.record_dropped_write();
             delegate.ack_spatial_insert_in_flight(ack.batch_id).await;
         }
     }
@@ -461,6 +467,7 @@ pub(super) async fn handle_spatial_delete_ack(
                 "SpatialDeleteAck: Origin permanently rejected this delete; \
                  dropping it — the write is LOST and will not retry"
             );
+            delegate.record_dropped_write();
             delegate.ack_spatial_delete_in_flight(ack.batch_id).await;
         }
     }
@@ -532,6 +539,7 @@ pub(super) async fn handle_timeseries_ack(
                 "TimeseriesAck: Origin permanently rejected this batch; \
                  dropping it — the write is LOST and will not retry"
             );
+            delegate.record_dropped_write();
             delegate.ack_timeseries_batch_by_id(ack.batch_id).await;
         }
     }

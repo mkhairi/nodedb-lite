@@ -32,6 +32,8 @@ pub struct MockDelegate {
     kv_retired: std::sync::Mutex<Vec<u64>>,
     stream_acks: std::sync::Mutex<Vec<(u64, u64)>>,
     in_flight_clears: AtomicU64,
+    dropped_writes: AtomicU64,
+    blocked_clears: AtomicU64,
 }
 
 impl Default for MockDelegate {
@@ -63,6 +65,8 @@ impl MockDelegate {
             kv_retired: std::sync::Mutex::new(Vec::new()),
             stream_acks: std::sync::Mutex::new(Vec::new()),
             in_flight_clears: AtomicU64::new(0),
+            dropped_writes: AtomicU64::new(0),
+            blocked_clears: AtomicU64::new(0),
         }
     }
 
@@ -104,6 +108,16 @@ impl MockDelegate {
     /// How many times `regenerate_identity` was invoked.
     pub fn identity_changes(&self) -> u64 {
         self.identity_changes.load(Ordering::Relaxed)
+    }
+
+    /// How many writes were retired without applying (`record_dropped_write`).
+    pub fn dropped_writes(&self) -> u64 {
+        self.dropped_writes.load(Ordering::Relaxed)
+    }
+
+    /// How many times `clear_blocked_deltas` was invoked.
+    pub fn blocked_clears(&self) -> u64 {
+        self.blocked_clears.load(Ordering::Relaxed)
     }
 
     /// Highest mutation id passed to `acknowledge`, or 0 if none.
@@ -185,6 +199,12 @@ impl SyncDelegate for MockDelegate {
             .lock()
             .expect("rejected lock")
             .push(mutation_id);
+    }
+    fn record_dropped_write(&self) {
+        self.dropped_writes.fetch_add(1, Ordering::Relaxed);
+    }
+    fn clear_blocked_deltas(&self) {
+        self.blocked_clears.fetch_add(1, Ordering::Relaxed);
     }
     async fn apply_remote_row(
         &self,
