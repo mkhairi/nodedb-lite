@@ -31,6 +31,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         storage: &Arc<S>,
         policy: crate::storage::corruption::CorruptionPolicy,
         pending_delta_window: usize,
+        sync_enabled: bool,
     ) -> NodeDbResult<(CrdtEngine, crate::identity::LiteIdentity, ReplayedRows)> {
         // ── Load or create Lite identity (lite_id + epoch + peer id) ──
         //
@@ -59,11 +60,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // set is recovered with a single prefix scan. A collection whose
         // snapshot fails its CRC32C check is dropped individually — the other
         // collections stay intact instead of the whole engine resetting.
-        let mut crdt = CrdtEngine::new_with_pending_window(
-            lite_identity.peer_id,
-            pending_delta_window,
-        )
-        .map_err(|e| NodeDbError::storage(format!("CRDT init failed: {e}")))?;
+        let mut crdt =
+            CrdtEngine::new_with_options(lite_identity.peer_id, pending_delta_window, sync_enabled)
+                .map_err(|e| NodeDbError::storage(format!("CRDT init failed: {e}")))?;
         let snapshot_entries = storage
             .scan_prefix(Namespace::LoroState, CrdtEngine::snapshot_key_prefix())
             .await?;
@@ -270,8 +269,16 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // the resident window straight back. The engine keeps the first window
         // of each ordered chunk and records the rest by id alone, so peak
         // occupancy is the window plus one chunk.
+        //
+        // Skipped entirely when sync is off: nothing stages deltas in that
+        // mode, so any `delta:` keys on disk are residue from a period when it
+        // was on. They are left untouched rather than loaded or deleted, so
+        // turning sync back on is not a destructive decision made here.
         const DELTA_RESTORE_CHUNK: usize = 4_096;
         let mut restored_any = false;
+        if !sync_enabled {
+            return Ok((crdt, lite_identity, replayed));
+        }
         let mut start = b"delta:".to_vec();
         loop {
             let chunk = storage
