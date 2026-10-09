@@ -46,6 +46,33 @@ impl LiteConfig {
             }
         }
 
+        if let Ok(val) = std::env::var("NODEDB_LITE_CRDT_DELTA_WINDOW") {
+            match val.trim().parse::<usize>() {
+                Ok(window) if window > 0 => {
+                    tracing::info!(
+                        env_var = "NODEDB_LITE_CRDT_DELTA_WINDOW",
+                        value = window,
+                        "environment variable override applied"
+                    );
+                    cfg.crdt_pending_delta_window = window;
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        env_var = "NODEDB_LITE_CRDT_DELTA_WINDOW",
+                        "value must be > 0; using default 10_000"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        env_var = "NODEDB_LITE_CRDT_DELTA_WINDOW",
+                        value = %val,
+                        "ignoring malformed environment variable (expected unsigned integer), \
+                         using default 10_000"
+                    );
+                }
+            }
+        }
+
         if let Ok(val) = std::env::var("NODEDB_LITE_OUTBOUND_QUEUE_CAP") {
             match val.trim().parse::<usize>() {
                 Ok(cap) if cap > 0 => {
