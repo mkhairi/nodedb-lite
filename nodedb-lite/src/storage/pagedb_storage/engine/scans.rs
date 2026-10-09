@@ -57,13 +57,20 @@ impl<V: Vfs + Clone> PagedbStorage<V> {
         let start_key = prefix_key(ns, start);
         let end_key = ns_end(ns);
         let txn = self.db.begin_read().await.map_err(LiteError::from)?;
+        // `scan` materialises every record from `start` to the end of the
+        // namespace before the caller sees any of them, so taking `limit`
+        // afterwards read the whole tree anyway. Paging through a namespace was
+        // quadratic: a 1.08M-record `delta:` namespace took over 20 minutes at
+        // open, against ~90 s for one unbounded scan. `scan_from` pushes the
+        // bound into the B+ tree walk. It has no end key, so the namespace
+        // boundary is enforced here.
         let raw = txn
-            .scan(&start_key, &end_key)
+            .scan_from(&start_key, limit)
             .await
             .map_err(LiteError::from)?;
         Ok(raw
             .into_iter()
-            .take(limit)
+            .take_while(|(k, _)| k.as_ref() < end_key.as_slice())
             .map(|(k, v)| (strip_prefix(&k).to_vec(), v.to_vec()))
             .collect())
     }
@@ -373,5 +380,48 @@ mod tests {
             "Graph scan leaked into another namespace"
         );
         assert!(graph_results.iter().all(|(_, v)| v == b"graph"));
+    }
+
+    /// `scan_range` must page: successive bounded calls walk the namespace in
+    /// order, return at most `limit`, and stop at the namespace boundary.
+    ///
+    /// The boundary half is the risk in bounding the walk. The underlying pagedb
+    /// `scan_from` takes a count and no end key, so without an explicit stop a
+    /// page near the end of one namespace would spill into the next one's records.
+    #[tokio::test]
+    async fn scan_range_pages_in_order_and_stops_at_the_namespace_boundary() {
+        let s = make_storage().await;
+        for i in 0..10u32 {
+            s.put(Namespace::Crdt, format!("delta:{i:04}").as_bytes(), b"x")
+                .await
+                .unwrap();
+        }
+        // A record in the namespace that sorts right after `Crdt`: a page that
+        // ran past the end would return this one.
+        s.put(Namespace::LoroState, b"aaaa", b"other")
+            .await
+            .unwrap();
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut start = b"delta:".to_vec();
+        loop {
+            let chunk = s.scan_range(Namespace::Crdt, &start, 4).await.unwrap();
+            assert!(chunk.len() <= 4, "scan_range returned more than the limit");
+            if chunk.is_empty() {
+                break;
+            }
+            let last = chunk[chunk.len() - 1].0.clone();
+            for (k, _) in chunk {
+                seen.push(String::from_utf8(k).unwrap());
+            }
+            start = last;
+            start.push(0);
+        }
+
+        let expected: Vec<String> = (0..10u32).map(|i| format!("delta:{i:04}")).collect();
+        assert_eq!(
+            seen, expected,
+            "paging must yield every record once, in order"
+        );
     }
 }
