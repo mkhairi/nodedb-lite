@@ -86,6 +86,16 @@ impl<S: StorageEngine> NodeDbLite<S> {
             .map_err(NodeDbError::storage)
     }
 
+    /// Every durable vector row in `collection` as `(doc_id, vector)`.
+    ///
+    /// The same rows a rebuild restores the index from, decoded. Meant for
+    /// copying a store to another backend; it reads the whole collection.
+    pub async fn vector_rows(&self, collection: &str) -> NodeDbResult<Vec<(String, Vec<f32>)>> {
+        crate::engine::vector::durable::load_collection(&*self.storage, collection)
+            .await
+            .map_err(NodeDbError::storage)
+    }
+
     /// Insert a single embedding into the collection's default HNSW index and
     /// merge its metadata (including the embedding dimension) into the CRDT
     /// row with the same id. Other row fields are kept. Re-inserting an id
