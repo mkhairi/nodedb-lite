@@ -25,6 +25,24 @@ use crate::runtime::now_millis_i64;
 use crate::storage::engine::StorageEngine;
 
 impl<S: StorageEngine> NodeDbLite<S> {
+    /// Every live edge in `collection` as `(src, dst, label)`, read from its
+    /// CRDT edge rows. Meant for copying a store to another backend.
+    pub fn graph_edge_rows(&self, collection: &str) -> Vec<(String, String, String)> {
+        let edge_coll = edge_crdt_collection(collection);
+        let crdt = self.crdt.lock_or_recover();
+        crdt.list_ids(&edge_coll)
+            .iter()
+            .filter_map(|key| {
+                let doc = loro_value_to_document(key, &crdt.read(&edge_coll, key)?);
+                let text = |f: &str| match doc.get(f) {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                Some((text("src")?, text("dst")?, text("label")?))
+            })
+            .collect()
+    }
+
     /// Insert an edge into the collection-scoped CSR adjacency index and persist
     /// a corresponding CRDT document holding `src`, `dst`, `label`, and any
     /// user-supplied properties. Edges are stored under a per-collection CRDT
