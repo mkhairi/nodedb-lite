@@ -20,11 +20,10 @@ use nodedb_array::tile::sparse_tile::SparseTile;
 use nodedb_array::types::TileId;
 use nodedb_array::types::coord::value::CoordValue;
 use nodedb_array::{TilePayload, tile_id_for_cell};
-use nodedb_types::Surrogate;
 
 use crate::engine::array::catalog::{ArrayCatalog, ArrayCatalogEntry, hash_schema};
 use crate::engine::array::manifest::{ArrayManifest, SegmentRef, load_manifest, save_manifest};
-use crate::engine::array::memtable::{ArrayMemtable, PutCellArgs};
+use crate::engine::array::memtable::{ArrayMemtable, PutCellArgs, cell_surrogate};
 use crate::engine::array::segments::write_segment;
 use crate::error::LiteError;
 use crate::storage::engine::StorageEngine;
@@ -181,12 +180,13 @@ impl ArrayEngineState {
                 detail: format!("array '{name}' not found"),
             })?;
 
+        let surrogate = cell_surrogate(name, &coord)?;
         state.memtable.put_cell(
             &state.schema,
             PutCellArgs {
                 coord,
                 attrs,
-                surrogate: Surrogate::ZERO,
+                surrogate,
                 system_from_ms,
                 valid_from_ms,
                 valid_until_ms,

@@ -17,13 +17,13 @@ type TermPositions = HashMap<Surrogate, Vec<u32>>;
 
 /// Postings of `term` in the resolved index, as document → positions.
 ///
-/// The memtable key scope is `{database_id}:{tenant}:{collection}:{term}`;
-/// Lite is single-database/single-tenant, so both ids are 0.
+/// The memtable scope is `(database_id, tenant, index)`. Lite is
+/// single-database/single-tenant, so both ids are 0.
 fn term_positions(index: &Resolved<'_>, term: &str) -> TermPositions {
     index
         .idx
         .memtable()
-        .get_postings(&format!("0:0:{}:{term}", index.key))
+        .get_postings(0, 0, index.key.as_str().into(), term)
         .into_iter()
         .map(|p| (p.doc_id, p.positions))
         .collect()

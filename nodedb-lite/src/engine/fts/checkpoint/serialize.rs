@@ -14,7 +14,8 @@ use nodedb_types::error::{NodeDbError, NodeDbResult};
 
 use super::format::{
     COLLECTIONS_KEY, DB, FtsSurrogateState, LAYOUT_KEY, LAYOUT_PER_FIELD, META_SUBKEYS,
-    PostingsBlob, SURROGATES_KEY, TID, compact_to_ser, doclens_key, meta_key,
+    PostingsBlob, SURROGATES_KEY, TID, compact_to_ser, doclens_key, index_scope, meta_key,
+    scoped_term,
 };
 use crate::storage::engine::WriteOp;
 
@@ -33,17 +34,27 @@ fn to_msgpack<T: zerompk::ToMessagePack>(value: &T) -> NodeDbResult<Vec<u8>> {
 /// Serialize all term postings of `idx` into one msgpack blob.
 ///
 /// Returns `None` if the memtable has no terms (empty index — nothing to write).
-fn serialize_postings_blob(idx: &FtsIndex<MemoryBackend>) -> NodeDbResult<Option<Vec<u8>>> {
-    let mt = idx.memtable();
-    let mut entries: PostingsBlob = Vec::new();
-
-    for scoped_term in mt.terms() {
-        let postings = mt.get_postings(&scoped_term);
-        if postings.is_empty() {
-            continue;
-        }
-        entries.push((scoped_term, postings.iter().map(compact_to_ser).collect()));
-    }
+fn serialize_postings_blob(
+    index_key: &str,
+    idx: &FtsIndex<MemoryBackend>,
+) -> NodeDbResult<Option<Vec<u8>>> {
+    let mut entries: PostingsBlob = idx
+        .memtable()
+        .with_scope_postings(DB, TID, index_scope(index_key), |postings| {
+            postings
+                .iter()
+                .filter(|(_, list)| !list.is_empty())
+                .map(|(term, list)| {
+                    (
+                        scoped_term(index_key, term),
+                        list.iter().map(compact_to_ser).collect(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // A deterministic order keeps an unchanged index byte-identical.
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     if entries.is_empty() {
         return Ok(None);
@@ -57,14 +68,18 @@ fn metadata_ops_for_index(
     idx: &FtsIndex<MemoryBackend>,
     ops: &mut Vec<WriteOp>,
 ) -> NodeDbResult<()> {
-    let mt = idx.memtable();
+    let scope = index_scope(index_key);
 
     // ── Doc lengths (per-doc lengths needed by BM25 scoring) ─────────────────
-    let mut surrogates: Vec<u32> = mt
-        .terms()
-        .iter()
-        .flat_map(|t| mt.get_postings(t).into_iter().map(|p| p.doc_id.0))
-        .collect();
+    let mut surrogates: Vec<u32> = idx
+        .memtable()
+        .with_scope_postings(DB, TID, scope, |postings| {
+            postings
+                .values()
+                .flat_map(|list| list.iter().map(|p| p.doc_id.0))
+                .collect()
+        })
+        .unwrap_or_default();
     surrogates.sort_unstable();
     surrogates.dedup();
 
@@ -72,7 +87,7 @@ fn metadata_ops_for_index(
     for &s in &surrogates {
         if let Some(len) = idx
             .backend()
-            .read_doc_length(DB, TID, index_key, Surrogate(s))
+            .read_doc_length(DB, TID, scope, Surrogate(s))
             .map_err(|e| NodeDbError::storage(format!("fts doc_len: {e}")))?
         {
             doclens.push((s, len));
@@ -89,7 +104,7 @@ fn metadata_ops_for_index(
     for &subkey in META_SUBKEYS {
         if let Some(data) = idx
             .backend()
-            .read_meta(DB, TID, index_key, subkey)
+            .read_meta(DB, TID, scope, subkey)
             .map_err(|e| NodeDbError::storage(format!("fts meta read: {e}")))?
         {
             ops.push(put(meta_key(index_key, subkey).into_bytes(), data));
@@ -133,7 +148,7 @@ pub(crate) fn serialize_fts(
         // Collect posting data: dispatched to pagedb segments or unpacked
         // into per-term KV entries at write time. Indices with no terms
         // produce no segment write.
-        if let Some(blob) = serialize_postings_blob(idx)? {
+        if let Some(blob) = serialize_postings_blob(key, idx)? {
             segment_writes.push((key.clone(), blob));
         }
     }

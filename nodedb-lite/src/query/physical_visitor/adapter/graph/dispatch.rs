@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use nodedb_physical::physical_plan::GraphOp;
+use nodedb_physical::physical_plan::graph::rag_stage::RagStage;
 use nodedb_types::result::QueryResult;
 
 use crate::error::LiteError;
@@ -26,6 +27,17 @@ pub(in super::super) type GraphFut<'a> =
 #[cfg(target_arch = "wasm32")]
 pub(in super::super) type GraphFut<'a> =
     Pin<Box<dyn Future<Output = Result<QueryResult, LiteError>> + 'a>>;
+
+/// The variant name of a cluster-only `GraphOp`.
+fn graph_op_name(op: &GraphOp) -> &'static str {
+    match op {
+        GraphOp::NodeEdgeGuard { .. } => "NodeEdgeGuard",
+        GraphOp::NodePresenceGuard { .. } => "NodePresenceGuard",
+        GraphOp::TruncateEdges { .. } => "TruncateEdges",
+        GraphOp::NodePresenceRead { .. } => "NodePresenceRead",
+        _ => "GraphOp",
+    }
+}
 
 /// Dispatch a `GraphOp` to the correct Lite handler.
 pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
@@ -61,7 +73,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
 
         GraphOp::Hop {
             start_nodes,
-            edge_label,
+            edge_labels,
             direction,
             depth,
             options,
@@ -72,7 +84,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             engine,
             start_nodes,
             traversal::HopArgs {
-                edge_label: edge_label.as_deref(),
+                edge_labels,
                 direction: *direction,
                 depth: *depth,
                 options,
@@ -83,21 +95,15 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
 
         GraphOp::Neighbors {
             node_id,
-            edge_label,
+            edge_labels,
             direction,
             rls_filters,
             ..
-        } => traversal::neighbors(
-            engine,
-            node_id,
-            edge_label.as_deref(),
-            *direction,
-            rls_filters,
-        )?,
+        } => traversal::neighbors(engine, node_id, edge_labels, *direction, rls_filters)?,
 
         GraphOp::NeighborsMulti {
             node_ids,
-            edge_label,
+            edge_labels,
             direction,
             max_results,
             rls_filters,
@@ -105,7 +111,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
         } => traversal::neighbors_multi(
             engine,
             node_ids,
-            edge_label.as_deref(),
+            edge_labels,
             *direction,
             *max_results,
             rls_filters,
@@ -114,7 +120,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
         GraphOp::Path {
             src,
             dst,
-            edge_label,
+            edge_labels,
             max_depth,
             options,
             frontier_bitmap,
@@ -125,7 +131,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             src,
             dst,
             traversal::PathArgs {
-                edge_label: edge_label.as_deref(),
+                edge_labels,
                 max_depth: *max_depth,
                 options,
                 frontier_bitmap: frontier_bitmap.as_ref(),
@@ -135,7 +141,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
 
         GraphOp::Subgraph {
             start_nodes,
-            edge_label,
+            edge_labels,
             depth,
             options,
             rls_filters,
@@ -143,7 +149,7 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
         } => traversal::subgraph(
             engine,
             start_nodes,
-            edge_label.as_deref(),
+            edge_labels,
             *depth,
             options,
             rls_filters,
@@ -207,7 +213,8 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             options: _,
             bm25_query,
             bm25_field,
-        } => fusion_match::rag_fusion(
+            stage,
+        } if *stage == RagStage::Local => fusion_match::rag_fusion(
             engine,
             collection.as_str(),
             fusion_match::RagFusionArgs {
@@ -230,6 +237,22 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
         // coordinator round-trip partial state across owning shards. Lite is
         // single-node — there are no shards to resume on or stitch together
         // — so these have no local execution path.
+        // The leg export and binding stages serve a cluster coordinator.
+        GraphOp::RagFusion { stage, .. } => {
+            let stage = format!("{stage:?}");
+            Box::pin(async move { Err(unsupported::rag_fusion_stage(&stage)) })
+        }
+
+        // Calvin guards and per-vShard edge truncation coordinate a cluster
+        // transaction across shards. Lite runs one engine with no sequencer.
+        GraphOp::NodeEdgeGuard { .. }
+        | GraphOp::NodePresenceGuard { .. }
+        | GraphOp::TruncateEdges { .. }
+        | GraphOp::NodePresenceRead { .. } => {
+            let op = graph_op_name(op);
+            Box::pin(async move { Err(unsupported::calvin_graph_op(op)) })
+        }
+
         GraphOp::MatchContinuation { .. } => {
             Box::pin(async move { Err(unsupported::match_continuation()) })
         }

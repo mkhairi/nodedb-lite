@@ -52,26 +52,6 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
                 meta_ops::handle_unregister_materialized_view(engine, tid, &n).await
             }))
         }
-        MetaOp::RenameCollection {
-            tenant_id,
-            old_collection,
-            new_collection,
-            ..
-        } => {
-            let tid = *tenant_id;
-            let old = old_collection.clone();
-            let new = new_collection.clone();
-            Ok(Box::pin(async move {
-                meta_ops::lifecycle::handle_rename_collection_coordinated(
-                    engine,
-                    permit,
-                    tid,
-                    old.as_str(),
-                    new.as_str(),
-                )
-                .await
-            }))
-        }
         // Lite's convert probes its own per-engine stores (CRDT, strict) and
         // decodes each with that store's schema, so the plan-level source
         // mode carries nothing Lite acts on.
@@ -295,9 +275,13 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         // ── Origin-only ops that Lite's plan converter never emits ───────────
         // A Lite write has its final outcome once it commits, so a
         // consistent cut needs no wait here.
+        // Lite's snapshot copies every key of the tenant, array cells
+        // included, so `arrays` changes nothing and no cut is captured.
         MetaOp::CreateTenantSnapshot {
             tenant_id,
             cut_watermark: _,
+            cut_capture: _,
+            arrays: _,
         } => {
             let tid = *tenant_id;
             let storage = engine.storage.clone();
@@ -384,6 +368,24 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             detail: "RecordCalvinWriteVersions maintains the cluster write-version registry; \
                      unsupported on the single-node Lite engine"
                 .into(),
+        }),
+        MetaOp::RestoreRedo(_) => Err(LiteError::Unsupported {
+            detail: "RestoreRedo installs a RESTORE batch inside a Calvin transaction; \
+                     unsupported on the single-node Lite engine"
+                .into(),
+        }),
+        MetaOp::HomeVersions { .. } => Err(LiteError::Unsupported {
+            detail: "HomeVersions reports cross-shard home versions to a read-only \
+                     transaction's commit; unsupported on the single-node Lite engine"
+                .into(),
+        }),
+
+        // Lite has no HASH_CHAIN collection, so there is no chain to walk.
+        MetaOp::VerifyHashChain { collection } => Err(LiteError::Unsupported {
+            detail: format!(
+                "VerifyHashChain on '{}': NodeDB-Lite has no HASH_CHAIN collections",
+                collection.as_str()
+            ),
         }),
     }
 }

@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use nodedb_physical::physical_plan::{ScoreScanBound, TextScoreSpec};
 use nodedb_types::filter::MetadataFilter;
 use nodedb_types::result::{QueryResult, SearchResult};
 use nodedb_types::text_search::{QueryMode, TextSearchParams};
@@ -70,19 +71,71 @@ fn id_score_result(score_column: String, rows: Vec<(String, f64)>) -> QueryResul
     }
 }
 
+/// Refuse residual `ScanFilter` predicates on a text op.
+///
+/// Lite's planner carries WHERE predicates as an RLS `MetadataFilter` and
+/// applies the rest after the scan, so it never fills `filters`. An op that
+/// arrives with them would otherwise rank rows they exclude.
+pub(super) fn refuse_scan_filters(op: &str, filters: &[u8]) -> Result<(), LiteError> {
+    if filters.is_empty() {
+        return Ok(());
+    }
+    Err(LiteError::Unsupported {
+        detail: format!(
+            "{op} with residual ScanFilter predicates: NodeDB-Lite applies WHERE after the \
+             text scan, so the planner must not push them into the op"
+        ),
+    })
+}
+
+/// The output column of a search's score.
+///
+/// `score`, unless a `bm25_score(...)` column names the same field and query
+/// as the match: the score then lands under that column's alias. A score of
+/// another field or query has no Lite execution path.
+pub(super) fn match_score_column(
+    field: &str,
+    query: &str,
+    scores: &[TextScoreSpec],
+) -> Result<String, LiteError> {
+    match scores {
+        [] => Ok("score".to_string()),
+        [score] if score.field.as_deref().unwrap_or("") == field && score.query == query => {
+            Ok(score.alias.clone())
+        }
+        _ => Err(LiteError::Unsupported {
+            detail: "bm25_score(...) of a field or query other than the text_match: \
+                     NodeDB-Lite scores only the matched index and query"
+                .to_string(),
+        }),
+    }
+}
+
+/// `TextOp::Search` inputs.
+pub(super) struct TextSearchArgs<'o> {
+    pub collection: &'o str,
+    /// Field index the query reads. Empty reads the whole-document index.
+    pub field: String,
+    pub query: &'o str,
+    pub top_k: usize,
+    pub fuzzy: bool,
+    pub rls_filters: &'o [u8],
+    /// Output column the score lands in.
+    pub score_column: String,
+}
+
 /// `TextOp::Search`: ranked BM25 hits, RLS-filtered.
 pub(super) fn text_search<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
-    collection: &str,
-    field: String,
-    query: &str,
-    top_k: usize,
-    fuzzy: bool,
-    rls_filters: &[u8],
+    args: TextSearchArgs<'_>,
 ) -> Result<LitePhysicalFut<'a>, LiteError> {
-    let metadata_filter = decode_rls_filter(rls_filters)?;
-    let collection = collection.to_owned();
-    let query = query.to_owned();
+    let metadata_filter = decode_rls_filter(args.rls_filters)?;
+    let collection = args.collection.to_owned();
+    let field = args.field;
+    let query = args.query.to_owned();
+    let top_k = args.top_k;
+    let fuzzy = args.fuzzy;
+    let score_column = args.score_column;
     let fts_state = Arc::clone(&engine.fts_state);
     let crdt = Arc::clone(&engine.crdt);
     Ok(Box::pin(async move {
@@ -103,7 +156,7 @@ pub(super) fn text_search<'a, S: StorageEngine + 'a>(
             results = retain_matching(results, &filter)?;
         }
         Ok(id_score_result(
-            "score".to_string(),
+            score_column,
             results
                 .into_iter()
                 .map(|r| (r.id, (1.0 - r.distance) as f64))
@@ -112,18 +165,39 @@ pub(super) fn text_search<'a, S: StorageEngine + 'a>(
     }))
 }
 
+/// `TextOp::BM25ScoreScan` inputs.
+pub(super) struct ScoreScanArgs<'o> {
+    pub collection: &'o str,
+    /// Field index the score reads. Empty reads the whole-document index.
+    pub field: String,
+    pub query: &'o str,
+    pub score_alias: &'o str,
+    pub fuzzy: bool,
+    pub bound: Option<ScoreScanBound>,
+}
+
+/// Keep the first `bound.rows` rows, in the bound's order when it has one.
+fn apply_bound(rows: &mut Vec<(String, f64)>, bound: &ScoreScanBound) {
+    if let Some(order) = &bound.order {
+        rows.sort_by(|a, b| {
+            let ord = a.1.total_cmp(&b.1);
+            if order.ascending { ord } else { ord.reverse() }
+        });
+    }
+    rows.truncate(bound.rows);
+}
+
 /// `TextOp::BM25ScoreScan`: every indexed document with its BM25 score.
 pub(super) fn bm25_score_scan<'a, S: StorageEngine + 'a>(
     engine: &'a LiteQueryEngine<S>,
-    collection: &str,
-    field: String,
-    query: &str,
-    score_alias: &str,
-    fuzzy: bool,
+    args: ScoreScanArgs<'_>,
 ) -> LitePhysicalFut<'a> {
-    let collection = collection.to_owned();
-    let query = query.to_owned();
-    let score_alias = score_alias.to_owned();
+    let collection = args.collection.to_owned();
+    let field = args.field;
+    let query = args.query.to_owned();
+    let score_alias = args.score_alias.to_owned();
+    let fuzzy = args.fuzzy;
+    let bound = args.bound;
     let fts_state = Arc::clone(&engine.fts_state);
     Box::pin(async move {
         let scored = fts_state
@@ -131,13 +205,14 @@ pub(super) fn bm25_score_scan<'a, S: StorageEngine + 'a>(
             .lock()
             .map_err(|_| LiteError::LockPoisoned)?
             .scan_all_with_scores(&collection, &field, &query, &or_params(fuzzy))?;
-        Ok(id_score_result(
-            score_alias,
-            scored
-                .into_iter()
-                .map(|(doc_id, score)| (doc_id, score as f64))
-                .collect(),
-        ))
+        let mut rows: Vec<(String, f64)> = scored
+            .into_iter()
+            .map(|(doc_id, score)| (doc_id, score as f64))
+            .collect();
+        if let Some(bound) = &bound {
+            apply_bound(&mut rows, bound);
+        }
+        Ok(id_score_result(score_alias, rows))
     })
 }
 

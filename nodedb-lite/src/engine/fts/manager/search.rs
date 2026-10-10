@@ -190,7 +190,12 @@ impl FtsCollectionManager {
             let held = index
                 .idx
                 .backend()
-                .read_doc_length(0, 0, &index.key, nodedb_types::Surrogate(sur))
+                .read_doc_length(
+                    0,
+                    0,
+                    index.key.as_str().into(),
+                    nodedb_types::Surrogate(sur),
+                )
                 .map_err(|e| read_err(collection, e))?
                 .is_some();
             if held {

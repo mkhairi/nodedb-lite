@@ -25,6 +25,9 @@ pub(super) struct HybridArgs<'o> {
     pub collection: &'o str,
     /// Field the text leg searches. Empty searches every string field.
     pub field: String,
+    /// Vector column the vector leg searches. Empty searches the raw
+    /// (field-less) index.
+    pub vector_field: &'o str,
     pub query_vector: &'o [f32],
     pub query_text: &'o str,
     pub top_k: usize,
@@ -39,6 +42,9 @@ pub(super) struct HybridTripleArgs<'o> {
     pub collection: &'o str,
     /// Field the text leg searches. Empty searches every string field.
     pub field: String,
+    /// Vector column the vector leg searches. Empty searches the raw
+    /// (field-less) index.
+    pub vector_field: &'o str,
     pub query_vector: &'o [f32],
     pub query_text: &'o str,
     pub graph_seed_id: &'o str,
@@ -49,6 +55,16 @@ pub(super) struct HybridTripleArgs<'o> {
     pub rrf_k: (f64, f64, f64),
     pub rls_filters: &'o [u8],
     pub score_alias: Option<&'o str>,
+}
+
+/// The vector index a vector leg reads: `collection` for the raw index, else
+/// `"{collection}:{field}"`, the key a field-backed index is stored under.
+fn vector_index_key(collection: &str, field: &str) -> String {
+    if field.is_empty() {
+        collection.to_owned()
+    } else {
+        format!("{collection}:{field}")
+    }
 }
 
 /// Rank search results in their returned order under `source`.
@@ -89,6 +105,7 @@ pub(super) fn hybrid_search<'a, S: StorageEngine + 'a>(
     let metadata_filter = decode_rls_filter(args.rls_filters)?;
     let collection = args.collection.to_owned();
     let field = args.field;
+    let vector_index = vector_index_key(args.collection, args.vector_field);
     let query_vector = args.query_vector.to_vec();
     let query_text = args.query_text.to_owned();
     let top_k = args.top_k;
@@ -115,7 +132,7 @@ pub(super) fn hybrid_search<'a, S: StorageEngine + 'a>(
         let vector_results = run_vector_search(
             &vector_state,
             &crdt,
-            &collection,
+            &vector_index,
             &collection,
             &query_vector,
             top_k * 3,
@@ -153,6 +170,7 @@ pub(super) fn hybrid_search_triple<'a, S: StorageEngine + 'a>(
     let metadata_filter = decode_rls_filter(args.rls_filters)?;
     let collection = args.collection.to_owned();
     let field = args.field;
+    let vector_index = vector_index_key(args.collection, args.vector_field);
     let query_vector = args.query_vector.to_vec();
     let query_text = args.query_text.to_owned();
     let graph_seed_id = args.graph_seed_id.to_owned();
@@ -186,7 +204,7 @@ pub(super) fn hybrid_search_triple<'a, S: StorageEngine + 'a>(
         let vector_results = run_vector_search(
             &vector_state,
             &crdt,
-            &collection,
+            &vector_index,
             &collection,
             &query_vector,
             top_k * 3,
@@ -213,7 +231,7 @@ pub(super) fn hybrid_search_triple<'a, S: StorageEngine + 'a>(
                         .traverse_bfs(
                             nodedb_graph::BfsParams {
                                 start_nodes: &[graph_seed_id.as_str()],
-                                label_filter: graph_edge_label.as_deref(),
+                                label_filter: graph_edge_label.as_deref().as_slice(),
                                 direction: Direction::Out,
                                 max_depth: graph_depth,
                                 max_visited: max_vis,

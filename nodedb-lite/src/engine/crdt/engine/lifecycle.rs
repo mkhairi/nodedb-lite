@@ -148,20 +148,13 @@ impl CrdtEngine {
         collection: &str,
         data: &[u8],
     ) -> Result<TrackedImport, LiteError> {
-        let result = (|| {
-            let state = self.state_mut(collection)?;
-            let before = state.state_frontiers();
-            let admission = state.import(data).map_err(|e| LiteError::Storage {
+        let result = self.state_mut(collection).and_then(|state| {
+            let tracked = state.import_tracked(collection, data);
+            let admission = tracked.outcome.map_err(|e| LiteError::Storage {
                 detail: format!("remote delta import for '{collection}' failed: {e}"),
             })?;
-            let changed_rows =
-                state
-                    .changed_rows_since(collection, &before)
-                    .map_err(|e| LiteError::Storage {
-                        detail: format!("rows changed by remote delta for '{collection}': {e}"),
-                    })?;
-            Ok((admission, changed_rows))
-        })();
+            Ok((admission, tracked.changed_rows))
+        });
         let (admission, changed_rows) = match result {
             Ok(result) => result,
             Err(error) => {
@@ -223,20 +216,13 @@ impl CrdtEngine {
         collection: &str,
         bytes: &[u8],
     ) -> Result<TrackedImport, LiteError> {
-        let result = (|| {
-            let state = self.state_mut(collection)?;
-            let before = state.state_frontiers();
-            let admission = state.import_local(bytes).map_err(|e| LiteError::Storage {
+        let result = self.state_mut(collection).and_then(|state| {
+            let tracked = state.import_local_tracked(collection, bytes);
+            let admission = tracked.outcome.map_err(|e| LiteError::Storage {
                 detail: format!("update import for '{collection}' failed: {e}"),
             })?;
-            let changed_rows =
-                state
-                    .changed_rows_since(collection, &before)
-                    .map_err(|e| LiteError::Storage {
-                        detail: format!("rows changed by update for '{collection}': {e}"),
-                    })?;
-            Ok((admission, changed_rows))
-        })();
+            Ok((admission, tracked.changed_rows))
+        });
         let (admission, changed_rows) = match result {
             Ok(result) => result,
             Err(error) => {
@@ -405,5 +391,58 @@ mod tests {
             imported.changed_rows.contains("i1"),
             "the import must report the row it created"
         );
+    }
+
+    /// A delta that edits one row and deletes another reports exactly those
+    /// two rows, through both the remote and the local import. A row the
+    /// delta leaves alone is not reported, so derived indexes re-index only
+    /// what moved.
+    #[test]
+    fn tracked_imports_report_only_the_rows_a_delta_changed() {
+        let mut source = CrdtEngine::new(1).unwrap();
+        for id in ["a", "b", "c"] {
+            source
+                .upsert("docs", id, &[("body", LoroValue::String(id.into()))])
+                .unwrap();
+        }
+        let snapshot = source.export_snapshot("docs").unwrap();
+        let mut remote = CrdtEngine::new(2).unwrap();
+        remote.import_remote("docs", &snapshot).unwrap();
+        let mut local = CrdtEngine::from_snapshot(3, "docs", &snapshot).unwrap();
+
+        let before = source.pending_count();
+        source
+            .upsert("docs", "b", &[("body", LoroValue::String("edited".into()))])
+            .unwrap();
+        source.delete("docs", "a").unwrap();
+        let deltas: Vec<Vec<u8>> = source.pending_deltas()[before..]
+            .iter()
+            .map(|d| d.delta_bytes.clone())
+            .collect();
+
+        let mut remote_rows = std::collections::BTreeSet::new();
+        let mut local_rows = std::collections::BTreeSet::new();
+        for delta in &deltas {
+            remote_rows.extend(remote.import_remote("docs", delta).unwrap().changed_rows);
+            local_rows.extend(
+                local
+                    .import_local_tracked("docs", delta)
+                    .unwrap()
+                    .changed_rows,
+            );
+        }
+        let expected: std::collections::BTreeSet<String> =
+            ["a", "b"].into_iter().map(String::from).collect();
+        assert_eq!(remote_rows, expected);
+        assert_eq!(local_rows, expected);
+        assert!(!remote.exists("docs", "a"));
+        assert_eq!(
+            remote.read_field("docs", "b", "body"),
+            Some(LoroValue::String("edited".into()))
+        );
+
+        // A replayed delta changes nothing, so it reports no rows.
+        let replay = remote.import_remote("docs", &deltas[0]).unwrap();
+        assert!(replay.changed_rows.is_empty());
     }
 }

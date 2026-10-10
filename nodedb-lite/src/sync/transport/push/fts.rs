@@ -56,7 +56,9 @@ where
             lite_id: lite_id.clone(),
             collection: entry.collection,
             doc_id: entry.doc_id,
-            text: entry.text,
+            // The durable entry holds one joined text. An empty field name
+            // feeds only Origin's whole-document index, as `text` did.
+            fields: vec![(String::new(), entry.text)],
             batch_id: entry.batch_id,
             producer_id,
             epoch,

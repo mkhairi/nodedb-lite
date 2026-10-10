@@ -28,6 +28,26 @@ fn encode_coord(coord: &[CoordValue]) -> Result<Vec<u8>, LiteError> {
     })
 }
 
+/// The surrogate a live cell of `array` at `coord` binds.
+///
+/// nodedb main refuses a live cell without a bound, non-zero surrogate.
+/// Lite has no catalog allocator, so it derives one from the array name and
+/// the encoded coordinate (32-bit FNV-1a). Every version of a cell shares
+/// its coordinate, so it keeps one surrogate, across restarts too. Two
+/// coordinates can share a surrogate: a surrogate bitmap then over-admits,
+/// never under-admits. Zero maps to 1, since zero names no row.
+pub(crate) fn cell_surrogate(array: &str, coord: &[CoordValue]) -> Result<Surrogate, LiteError> {
+    const OFFSET: u32 = 0x811c_9dc5;
+    const PRIME: u32 = 0x0100_0193;
+    let key = encode_coord(coord)?;
+    let mut hash = OFFSET;
+    for &byte in array.as_bytes().iter().chain(&[0u8]).chain(&key) {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    Ok(Surrogate::new(hash.max(1)))
+}
+
 fn decode_coord(key: &[u8]) -> Result<Vec<CoordValue>, LiteError> {
     zerompk::from_msgpack(key).map_err(|e| LiteError::Serialization {
         detail: format!("decode coord: {e}"),
@@ -65,7 +85,7 @@ impl TileBuffer {
                 b.push_row(SparseRow {
                     coord: &coord,
                     attrs: &[],
-                    surrogate: Surrogate::ZERO,
+                    surrogate: None,
                     valid_from_ms: 0,
                     valid_until_ms: OPEN_UPPER,
                     kind: RowKind::Tombstone,
@@ -77,7 +97,7 @@ impl TileBuffer {
                 b.push_row(SparseRow {
                     coord: &coord,
                     attrs: &[],
-                    surrogate: Surrogate::ZERO,
+                    surrogate: None,
                     valid_from_ms: 0,
                     valid_until_ms: OPEN_UPPER,
                     kind: RowKind::GdprErased,
@@ -92,7 +112,7 @@ impl TileBuffer {
                 b.push_row(SparseRow {
                     coord: &coord,
                     attrs: &payload.attrs,
-                    surrogate: payload.surrogate,
+                    surrogate: Some(payload.surrogate),
                     valid_from_ms: payload.valid_from_ms,
                     valid_until_ms: payload.valid_until_ms,
                     kind: RowKind::Live,
@@ -304,7 +324,7 @@ mod tests {
             PutCellArgs {
                 coord: vec![CoordValue::Int64(1)],
                 attrs: vec![CellValue::Int64(10)],
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 system_from_ms: 100,
                 valid_from_ms: 0,
                 valid_until_ms: OPEN_UPPER,
@@ -323,7 +343,7 @@ mod tests {
             PutCellArgs {
                 coord: vec![CoordValue::Int64(1)],
                 attrs: vec![CellValue::Int64(1)],
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 system_from_ms: 100,
                 valid_from_ms: 0,
                 valid_until_ms: OPEN_UPPER,
@@ -344,7 +364,7 @@ mod tests {
             PutCellArgs {
                 coord: vec![CoordValue::Int64(2)],
                 attrs: vec![CellValue::Int64(99)],
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 system_from_ms: 10,
                 valid_from_ms: 0,
                 valid_until_ms: OPEN_UPPER,
@@ -364,7 +384,7 @@ mod tests {
             PutCellArgs {
                 coord: vec![CoordValue::Int64(3)],
                 attrs: vec![CellValue::Int64(7)],
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 system_from_ms: 1,
                 valid_from_ms: 0,
                 valid_until_ms: OPEN_UPPER,
@@ -387,7 +407,7 @@ mod tests {
                 PutCellArgs {
                     coord: coord.clone(),
                     attrs: vec![CellValue::Int64(sys)],
-                    surrogate: Surrogate::ZERO,
+                    surrogate: Surrogate::new(1),
                     system_from_ms: sys,
                     valid_from_ms: 0,
                     valid_until_ms: OPEN_UPPER,

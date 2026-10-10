@@ -185,7 +185,7 @@ impl FtsCollectionManager {
         };
         let held = idx
             .backend()
-            .read_doc_length(0, 0, key, surrogate)
+            .read_doc_length(0, 0, key.into(), surrogate)
             .map_err(|e| fts_err(collection, e))?
             .is_some();
         if held {

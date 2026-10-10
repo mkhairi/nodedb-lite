@@ -114,3 +114,26 @@ pub(super) fn meta_key(index_key: &str, subkey: &str) -> String {
 pub(super) fn postings_prefix(index_key: &str) -> String {
     format!("fts:{index_key}:mt:")
 }
+
+/// The memtable scope of `index_key`. Each Lite index is its own
+/// [`nodedb_fts::FtsIndex`] holding one whole-document scope named by the key.
+pub(crate) fn index_scope(index_key: &str) -> nodedb_fts::IndexScope<'_> {
+    nodedb_fts::IndexScope::document(index_key)
+}
+
+/// The persisted name of `term` in `index_key`: `"{DB}:{TID}:{index_key}:{term}"`.
+///
+/// Checkpoints written before nodedb main's per-scope memtable stored its
+/// flat memtable keys verbatim. The format keeps that shape, so a
+/// checkpoint reads the same across the upgrade in either direction.
+pub(super) fn scoped_term(index_key: &str, term: &str) -> String {
+    format!("{DB}:{TID}:{index_key}:{term}")
+}
+
+/// The bare term of a persisted `scoped_term`. `None` when the name belongs
+/// to another index.
+pub(super) fn bare_term<'t>(index_key: &str, scoped: &'t str) -> Option<&'t str> {
+    scoped
+        .strip_prefix(&format!("{DB}:{TID}:{index_key}:"))
+        .filter(|t| !t.is_empty())
+}

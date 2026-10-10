@@ -279,7 +279,9 @@ pub(crate) fn dispatch<'a, S: StorageEngine + 'a>(
             source_key,
             dest_key,
             field,
-            *amount,
+            // Lite's KV transfer adds and subtracts f64. A DECIMAL amount
+            // converts to the nearest f64, as Lite stored it before.
+            amount.to_f64(),
             rls_write_check,
         ),
 

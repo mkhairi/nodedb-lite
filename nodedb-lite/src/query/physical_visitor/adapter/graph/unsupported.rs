@@ -40,3 +40,21 @@ pub(super) fn wcc_superstep() -> LiteError {
             .into(),
     }
 }
+
+pub(super) fn rag_fusion_stage(stage: &str) -> LiteError {
+    LiteError::Unsupported {
+        detail: format!(
+            "RagFusion stage {stage} is a cluster coordinator stage; \
+             the single-node Lite engine runs only RagStage::Local"
+        ),
+    }
+}
+
+pub(super) fn calvin_graph_op(op: &str) -> LiteError {
+    LiteError::Unsupported {
+        detail: format!(
+            "{op} is a Calvin cross-shard graph primitive; \
+             unsupported on the single-node Lite engine"
+        ),
+    }
+}

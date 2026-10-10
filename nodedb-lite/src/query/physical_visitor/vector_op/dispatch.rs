@@ -153,9 +153,13 @@ where
             *vector_id,
         )),
 
+        // No bound surrogate names no vector: the delete removes nothing.
+        VectorOp::DeleteBySurrogate {
+            surrogate: None, ..
+        } => Ok(Box::pin(async { Ok(QueryResult::empty()) })),
         VectorOp::DeleteBySurrogate {
             collection,
-            surrogate,
+            surrogate: Some(surrogate),
             field_name,
             provenance: _,
         } => Ok(vector_delete_by_surrogate(

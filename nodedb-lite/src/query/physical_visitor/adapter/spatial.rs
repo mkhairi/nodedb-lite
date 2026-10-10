@@ -3,6 +3,7 @@
 
 use nodedb_physical::physical_plan::SpatialOp;
 use nodedb_types::RlsWriteCheck;
+use nodedb_types::result::QueryResult;
 
 use crate::error::LiteError;
 use crate::query::engine::LiteQueryEngine;
@@ -43,7 +44,13 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             let fld = field.clone();
             let sur = *surrogate;
             Ok(Box::pin(async move {
-                spatial_ops::writes::spatial_delete(engine, col.as_str(), &fld, sur)
+                // No bound surrogate names no geometry: nothing to remove.
+                match sur {
+                    Some(sur) => {
+                        spatial_ops::writes::spatial_delete(engine, col.as_str(), &fld, sur)
+                    }
+                    None => Ok(QueryResult::empty()),
+                }
             }))
         }
 

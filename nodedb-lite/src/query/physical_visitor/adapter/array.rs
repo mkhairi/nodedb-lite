@@ -233,28 +233,28 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
             }))
         }
 
-        // Origin stages `DROP ARRAY` reversibly — the store is closed and its
-        // directory renamed to a tombstone — and then compensates across cores
-        // with these two ops. Lite's `DropArray` deletes the manifest and
-        // catalog entry outright, so there is no tombstone here to restore or
-        // to purge, and no planner in this process emits either op.
+        // Origin purges a dropped array's tombstone across cores with this
+        // op. Lite's `DropArray` deletes the manifest and catalog entry
+        // outright, so there is no tombstone here to purge, and no planner in
+        // this process emits the op.
         //
-        // Answering `Ok` would report a compensation that did not happen: a
-        // restore would claim recovered data that is gone. If Lite ever gains a
-        // reversible drop, these arms are where it gets wired in.
-        ArrayOp::RestoreArrayDrop { array_id } => Err(LiteError::BadRequest {
-            detail: format!(
-                "restore of a staged array drop is not supported in NodeDB-Lite \
-                 (array '{}'): a Lite drop is immediate and cannot be undone",
-                array_id.name
-            ),
-        }),
-
+        // Answering `Ok` would report a purge that did not happen. If Lite
+        // ever gains a reversible drop, this arm is where it gets wired in.
         ArrayOp::PurgeArrayDrop { array_id } => Err(LiteError::BadRequest {
             detail: format!(
                 "purge of a staged array drop is not supported in NodeDB-Lite \
                  (array '{}'): a Lite drop leaves no tombstone to purge",
                 array_id.name
+            ),
+        }),
+
+        // MOVE TENANT sends this to every core of a multi-tenant Origin.
+        // Lite holds one tenant, so no store has another tenant to move to.
+        ArrayOp::RekeyArray { array_id, target } => Err(LiteError::BadRequest {
+            detail: format!(
+                "rekey of array '{}' to tenant {:?} is not supported in NodeDB-Lite: \
+                 a Lite store holds one tenant",
+                array_id.name, target.tenant_id
             ),
         }),
 

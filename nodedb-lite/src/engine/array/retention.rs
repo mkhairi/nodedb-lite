@@ -163,8 +163,15 @@ mod tests {
 
     fn make_tile(s: &ArraySchema, x: i64, v: i64) -> SparseTile {
         let mut b = SparseTileBuilder::new(s);
-        b.push(&[CoordValue::Int64(x)], &[CellValue::Int64(v)])
-            .unwrap();
+        // A stored live row binds a surrogate; `push` builds a derived row.
+        b.push_row(nodedb_array::tile::sparse_tile::SparseRow::live(
+            &[CoordValue::Int64(x)],
+            &[CellValue::Int64(v)],
+            nodedb_types::Surrogate::new(1),
+            0,
+            nodedb_types::OPEN_UPPER,
+        ))
+        .unwrap();
         b.build()
     }
 

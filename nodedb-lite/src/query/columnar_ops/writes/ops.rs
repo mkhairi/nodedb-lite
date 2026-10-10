@@ -2,6 +2,7 @@
 //! Columnar write operations: insert (by intent), update, delete.
 
 use nodedb_physical::physical_plan::columnar::ColumnarInsertIntent;
+use nodedb_physical::physical_plan::document::UpdateValue;
 use nodedb_query::scan_filter::ScanFilter;
 use nodedb_types::columnar::ColumnarSchema;
 use nodedb_types::result::QueryResult;
@@ -176,7 +177,7 @@ pub async fn update<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
     collection: &str,
     filters_bytes: &[u8],
-    updates: &[(String, Vec<u8>)],
+    updates: &[(String, UpdateValue)],
 ) -> Result<QueryResult, LiteError> {
     let schema = engine
         .columnar
@@ -198,15 +199,6 @@ pub async fn update<S: StorageEngine>(
         })?
     };
 
-    // Parse update value bytes (each value is msgpack-encoded).
-    let parsed_updates: Vec<(String, Value)> = updates
-        .iter()
-        .map(|(field, bytes)| {
-            let v: Value = zerompk::from_msgpack(bytes).unwrap_or(Value::Null);
-            (field.clone(), v)
-        })
-        .collect();
-
     // Read current rows, apply filters, build modified rows.
     // collect PKs and new rows first, then mutate (borrow separation).
     let all_rows = engine.columnar.list_rows(collection).await?;
@@ -222,13 +214,21 @@ pub async fn update<S: StorageEngine>(
 
         let pk = row.get(pk_idx).cloned().unwrap_or(Value::Null);
 
-        // Build new_values: copy current row then apply updates.
+        // Build new_values: copy current row then apply updates. A literal
+        // is msgpack-encoded. An expression (`n + 1`) reads the row before
+        // the update.
         let mut new_values = row;
-        for (field, new_val) in &parsed_updates {
+        for (field, update) in updates {
+            let new_val = match update {
+                UpdateValue::Literal(bytes) => zerompk::from_msgpack(bytes).unwrap_or(Value::Null),
+                UpdateValue::Expr(expr) => expr.eval(&doc).map_err(|e| LiteError::BadRequest {
+                    detail: format!("UPDATE {collection} SET {field}: {e}"),
+                })?,
+            };
             if let Some(col_idx) = col_names.iter().position(|n| n == field)
                 && col_idx < new_values.len()
             {
-                new_values[col_idx] = new_val.clone();
+                new_values[col_idx] = new_val;
             }
         }
 

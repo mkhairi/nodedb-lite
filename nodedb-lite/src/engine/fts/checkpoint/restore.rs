@@ -15,7 +15,8 @@ use nodedb_types::error::{NodeDbError, NodeDbResult};
 
 use super::format::{
     COLLECTIONS_KEY, DB, FtsSurrogateState, LAYOUT_KEY, LAYOUT_PER_FIELD, META_SUBKEYS,
-    SURROGATES_KEY, SerPosting, TID, doclens_key, meta_key, postings_prefix, ser_to_compact,
+    SURROGATES_KEY, SerPosting, TID, bare_term, doclens_key, index_scope, meta_key,
+    postings_prefix, ser_to_compact,
 };
 use crate::engine::fts::manager::resident_index;
 use crate::storage::engine::StorageEngine;
@@ -58,8 +59,15 @@ async fn restore_postings<S: StorageEngine>(
         let entries = zerompk::from_msgpack::<super::format::PostingsBlob>(&blob)
             .map_err(|e| decode_err(&format!("segment of '{index_key}'"), e))?;
         for (scoped_term, postings) in entries {
+            let term = bare_term(index_key, &scoped_term).ok_or_else(|| {
+                decode_err(
+                    &format!("segment of '{index_key}'"),
+                    format!("term '{scoped_term}' belongs to another index"),
+                )
+            })?;
             for sp in postings {
-                idx.memtable().insert(&scoped_term, ser_to_compact(sp));
+                idx.memtable()
+                    .insert(DB, TID, index_scope(index_key), term, ser_to_compact(sp));
             }
         }
         return Ok(());
@@ -69,7 +77,6 @@ async fn restore_postings<S: StorageEngine>(
     // index whose name extends this one (`"{key}:mt…"`) share the prefix and
     // are skipped.
     let prefix = postings_prefix(index_key);
-    let term_scope = format!("{DB}:{TID}:{index_key}:");
     for (raw_key, value) in storage
         .scan_prefix(Namespace::Fts, prefix.as_bytes())
         .await?
@@ -84,13 +91,14 @@ async fn restore_postings<S: StorageEngine>(
                     "not a UTF-8 term key",
                 )
             })?;
-        if !scoped_term.starts_with(&term_scope) {
+        let Some(term) = bare_term(index_key, scoped_term) else {
             continue;
-        }
+        };
         let postings = zerompk::from_msgpack::<Vec<SerPosting>>(&value)
             .map_err(|e| decode_err(&format!("postings of '{scoped_term}'"), e))?;
         for sp in postings {
-            idx.memtable().insert(scoped_term, ser_to_compact(sp));
+            idx.memtable()
+                .insert(DB, TID, index_scope(index_key), term, ser_to_compact(sp));
         }
     }
     Ok(())
@@ -165,10 +173,10 @@ where
                 .map_err(|e| decode_err(&format!("doc lengths of '{index_key}'"), e))?;
             for (s, len) in pairs {
                 idx.backend()
-                    .write_doc_length(DB, TID, index_key, Surrogate(s), len)
+                    .write_doc_length(DB, TID, index_scope(index_key), Surrogate(s), len)
                     .map_err(|e| backend_err(index_key, e))?;
                 idx.backend()
-                    .increment_stats(DB, TID, index_key, len)
+                    .increment_stats(DB, TID, index_scope(index_key), len)
                     .map_err(|e| backend_err(index_key, e))?;
             }
         }
@@ -180,7 +188,7 @@ where
                 .await?
             {
                 idx.backend()
-                    .write_meta(DB, TID, index_key, subkey, &data)
+                    .write_meta(DB, TID, index_scope(index_key), subkey, &data)
                     .map_err(|e| backend_err(index_key, e))?;
             }
         }

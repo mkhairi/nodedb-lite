@@ -120,21 +120,24 @@ impl RetainedIndex {
         let mut row_estimated_bytes: HashMap<u32, usize> = HashMap::new();
         let prefix = format!("0:0:{key}:");
         let per_token = prefix.len().saturating_mul(2).saturating_add(320);
-        for term in index.memtable().terms() {
-            let normalized = term.strip_prefix(&prefix).unwrap_or(&term);
-            for posting in index.memtable().get_postings(&term) {
-                let occurrences = if posting.positions.is_empty() {
-                    posting.term_freq as usize
-                } else {
-                    posting.positions.len()
-                };
-                let cost = per_token
-                    .saturating_add(normalized.len().saturating_mul(4))
-                    .saturating_mul(occurrences);
-                let row = row_estimated_bytes.entry(posting.doc_id.0).or_default();
-                *row = row.saturating_add(cost);
-            }
-        }
+        index
+            .memtable()
+            .with_scope_postings(0, 0, key.into(), |postings| {
+                for (normalized, list) in postings {
+                    for posting in list {
+                        let occurrences = if posting.positions.is_empty() {
+                            posting.term_freq as usize
+                        } else {
+                            posting.positions.len()
+                        };
+                        let cost = per_token
+                            .saturating_add(normalized.len().saturating_mul(4))
+                            .saturating_mul(occurrences);
+                        let row = row_estimated_bytes.entry(posting.doc_id.0).or_default();
+                        *row = row.saturating_add(cost);
+                    }
+                }
+            });
         for row in row_estimated_bytes.values() {
             bytes = bytes.saturating_add(*row).saturating_add(128);
         }
