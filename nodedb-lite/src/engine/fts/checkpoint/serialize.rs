@@ -43,7 +43,6 @@ fn serialize_postings_blob(
         .memtable()
         .with_scope_postings(DB, TID, index_scope(index_key), |postings| {
             postings
-                .iter()
                 .filter(|(_, list)| !list.is_empty())
                 .map(|(term, list)| {
                     (
@@ -76,8 +75,7 @@ fn metadata_ops_for_index(
         .memtable()
         .with_scope_postings(DB, TID, scope, |postings| {
             postings
-                .values()
-                .flat_map(|list| list.iter().map(|p| p.doc_id.0))
+                .flat_map(|(_, list)| list.iter().map(|p| p.doc_id.0))
                 .collect()
         })
         .unwrap_or_default();
