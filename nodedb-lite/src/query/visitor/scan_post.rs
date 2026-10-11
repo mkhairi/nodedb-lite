@@ -153,7 +153,7 @@ pub(crate) fn filter_mask(
     let columns = &result.columns;
     let mut keep = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
-        keep.push(row_passes(&lf, &columns, row)?);
+        keep.push(row_passes(&lf, columns, row)?);
     }
     Ok(keep)
 }
