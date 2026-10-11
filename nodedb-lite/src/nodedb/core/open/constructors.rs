@@ -365,6 +365,14 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 db.rebuild_text_indices().await?;
             }
             db.rebuild_authoritative_text_indices().await?;
+            let replayed: usize = replayed_rows.values().map(|rows| rows.len()).sum();
+            if replayed > 0 {
+                tracing::info!(
+                    rows = replayed,
+                    collections = replayed_rows.len(),
+                    "re-indexing CRDT rows replayed at open"
+                );
+            }
             for (collection, rows) in &replayed_rows {
                 if db.strict.schema(collection).is_some()
                     || crate::engine::document::history::ops::is_bitemporal(

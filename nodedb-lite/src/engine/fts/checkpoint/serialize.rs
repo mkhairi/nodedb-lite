@@ -39,21 +39,24 @@ fn serialize_postings_blob(
     index_key: &str,
     idx: &FtsIndex<MemoryBackend>,
 ) -> NodeDbResult<Option<Vec<u8>>> {
-    let mt = idx.memtable();
     let scope = IndexScope::document(index_key);
     let prefix = scoped_term_prefix(index_key);
-    let mut entries: PostingsBlob = Vec::new();
-
-    for term in mt.terms(DB, TID, scope) {
-        let postings = mt.get_postings(DB, TID, scope, &term);
-        if postings.is_empty() {
-            continue;
-        }
-        entries.push((
-            format!("{prefix}{term}"),
-            postings.iter().map(compact_to_ser).collect(),
-        ));
-    }
+    let mut entries: PostingsBlob = idx
+        .memtable()
+        .with_scope_postings(DB, TID, scope, |postings| {
+            postings
+                .filter(|(_, list)| !list.is_empty())
+                .map(|(term, list)| {
+                    (
+                        format!("{prefix}{term}"),
+                        list.iter().map(compact_to_ser).collect(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // A deterministic order keeps an unchanged index byte-identical.
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     if entries.is_empty() {
         return Ok(None);
@@ -72,14 +75,12 @@ fn metadata_ops_for_index(
 
     // ── Doc lengths (per-doc lengths needed by BM25 scoring) ─────────────────
     let mut surrogates: Vec<u32> = mt
-        .terms(DB, TID, scope)
-        .iter()
-        .flat_map(|t| {
-            mt.get_postings(DB, TID, scope, t)
-                .into_iter()
-                .map(|p| p.doc_id.0)
+        .with_scope_postings(DB, TID, scope, |postings| {
+            postings
+                .flat_map(|(_, list)| list.iter().map(|p| p.doc_id.0))
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     surrogates.sort_unstable();
     surrogates.dedup();
 
