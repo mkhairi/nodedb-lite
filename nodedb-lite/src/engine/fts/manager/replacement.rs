@@ -250,13 +250,76 @@ mod tests {
             .allocated
     }
 
+    /// The memtable charges the governor for the postings it holds, so the FTS
+    /// engine's total must track them. A second, estimated lease on the same
+    /// postings double-counts them.
     #[test]
-    fn candidate_leases_release_on_drop_and_move_into_resident_indices() {
+    fn fts_charge_tracks_resident_postings_without_a_second_lease() {
+        let governor = test_governor();
+        let mut manager = FtsCollectionManager::new(Arc::clone(&governor));
+        for i in 0..20_000 {
+            manager
+                .index_document(
+                    "docs",
+                    &format!("d{i}"),
+                    &format!("alpha beta gamma delta epsilon zeta eta theta word{i}"),
+                )
+                .unwrap();
+        }
+        let resident: usize = manager
+            .indices
+            .values()
+            .map(|index| index.memtable().resident_bytes())
+            .sum();
+        // The memtable moves its charge in 1 MiB steps, once per index.
+        let slack = (manager.indices.len() + 1) << 20;
+        assert!(
+            allocated(&governor) <= resident + slack,
+            "FTS charged {} B for {} B of resident postings",
+            allocated(&governor),
+            resident
+        );
+    }
+
+    /// Postings leave the memtable when their document is removed, and so
+    /// must their charge. A lease that survives removal keeps it forever.
+    #[test]
+    fn removing_every_document_releases_its_fts_charge() {
+        let governor = test_governor();
+        let mut manager = FtsCollectionManager::new(Arc::clone(&governor));
+        manager.index_document("docs", "seed", "seed").unwrap();
+        let base = allocated(&governor);
+        for i in 0..20_000 {
+            manager
+                .index_document(
+                    "docs",
+                    &format!("d{i}"),
+                    &format!("alpha beta gamma delta epsilon zeta eta theta word{i}"),
+                )
+                .unwrap();
+        }
+        let full = allocated(&governor);
+        assert!(full > base);
+        for i in 0..20_000 {
+            manager.remove_document("docs", &format!("d{i}")).unwrap();
+        }
+        let after = allocated(&governor);
+        assert!(
+            after.saturating_sub(base) < (full - base) / 10,
+            "charge after removing every document: {after} B (base {base} B, full {full} B)"
+        );
+    }
+
+    #[test]
+    fn candidate_charge_releases_on_drop_and_moves_into_resident_indices() {
         let governor = test_governor();
         let mut manager = FtsCollectionManager::new(Arc::clone(&governor));
         manager.index_document("docs", "id", "alpha").unwrap();
         let prior = allocated(&governor);
-        let fields = HashMap::from([("title".into(), Value::String("beta".into()))]);
+        // The memtable charges in 1 MiB steps, so the title carries enough
+        // distinct terms to move the charge.
+        let title: Vec<String> = (0..40_000).map(|i| format!("w{i}")).collect();
+        let fields = HashMap::from([("title".into(), Value::String(title.join(" ")))]);
         let mut candidate = manager
             .begin_replacement("docs", manager.current_declaration_record("docs"))
             .unwrap();
