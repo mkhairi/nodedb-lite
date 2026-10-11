@@ -349,11 +349,6 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         // Calvin deterministic-scheduling ops. Calvin sequences transactions
         // across a replicated log; Lite has no sequencer, Raft group, or
         // cross-core write-version registry, so these are unreachable here.
-        MetaOp::CalvinFlush { .. } => Err(LiteError::Unsupported {
-            detail: "CalvinFlush is a deterministic-scheduler op; \
-                     unsupported on the single-node Lite engine"
-                .into(),
-        }),
         MetaOp::CalvinResolve { .. } => Err(LiteError::Unsupported {
             detail: "CalvinResolve is a deterministic-scheduler op; \
                      unsupported on the single-node Lite engine"
@@ -361,11 +356,6 @@ pub(super) fn dispatch<'a, S: StorageEngine + 'a>(
         }),
         MetaOp::CalvinDrop { .. } => Err(LiteError::Unsupported {
             detail: "CalvinDrop is a deterministic-scheduler op; \
-                     unsupported on the single-node Lite engine"
-                .into(),
-        }),
-        MetaOp::RecordCalvinWriteVersions { .. } => Err(LiteError::Unsupported {
-            detail: "RecordCalvinWriteVersions maintains the cluster write-version registry; \
                      unsupported on the single-node Lite engine"
                 .into(),
         }),
