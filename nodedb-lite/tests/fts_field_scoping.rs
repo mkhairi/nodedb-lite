@@ -228,6 +228,58 @@ async fn field_text_index_survives_reopen() {
     assert_eq!(search_ids(&*db, "title", "fresh").await, vec!["d3"]);
 }
 
+/// Several rows changed after the last base snapshot are replayed from their
+/// stored updates at open and re-indexed together. Each must end matching
+/// its current text only.
+#[tokio::test]
+async fn rows_replayed_at_open_are_reindexed_together() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fts_replay.db");
+
+    {
+        let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+            .await
+            .expect("open storage");
+        let db = NodeDbLite::open(storage).await.expect("open NodeDbLite");
+        for (id, word) in [("d1", "alpha"), ("d2", "beta"), ("d3", "gamma")] {
+            db.document_put(
+                COLLECTION,
+                make_doc(id, &[("title", &format!("shared {word}"))]),
+            )
+            .await
+            .expect("put");
+        }
+        db.flush().await.expect("first flush");
+
+        // Stored as updates on top of the snapshot the first flush wrote.
+        db.document_put(COLLECTION, make_doc("d1", &[("title", "shared fresh")]))
+            .await
+            .expect("overwrite d1");
+        db.document_delete(COLLECTION, "d2")
+            .await
+            .expect("delete d2");
+        db.document_put(COLLECTION, make_doc("d4", &[("title", "shared delta")]))
+            .await
+            .expect("put d4");
+        db.flush().await.expect("second flush");
+    }
+
+    let storage = PagedbStorageDefault::open(&path, Encryption::Plaintext)
+        .await
+        .expect("reopen storage");
+    let db = NodeDbLite::open(storage).await.expect("reopen NodeDbLite");
+
+    assert_eq!(
+        search_ids(&*db, "title", "shared").await,
+        vec!["d1", "d3", "d4"]
+    );
+    assert_eq!(search_ids(&*db, "", "shared").await, vec!["d1", "d3", "d4"]);
+    assert_eq!(search_ids(&*db, "title", "fresh").await, vec!["d1"]);
+    assert_eq!(search_ids(&*db, "title", "delta").await, vec!["d4"]);
+    assert!(search_ids(&*db, "title", "alpha").await.is_empty());
+    assert!(search_ids(&*db, "", "beta").await.is_empty());
+}
+
 #[tokio::test]
 async fn sql_text_match_is_scoped_to_named_field() {
     let db = open_test_db().await;
