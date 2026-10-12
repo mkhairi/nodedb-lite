@@ -63,8 +63,25 @@ impl FtsCollectionManager {
     /// Remove a document from every index of `collection`: the
     /// whole-document index and each per-field index.
     pub fn remove_document_fields(&self, collection: &str, doc_id: &str) -> Result<(), LiteError> {
+        self.remove_documents_fields(collection, &[doc_id])
+    }
+
+    /// Remove several documents from every index of `collection`. Each index
+    /// visits a term the documents share once, not once per document.
+    pub fn remove_documents_fields(
+        &self,
+        collection: &str,
+        doc_ids: &[&str],
+    ) -> Result<(), LiteError> {
+        let surrogates: Vec<Surrogate> = doc_ids
+            .iter()
+            .filter_map(|id| self.lookup_surrogate(id))
+            .collect();
+        if surrogates.is_empty() {
+            return Ok(());
+        }
         for key in self.collection_keys(collection) {
-            self.retract(collection, &key, doc_id)?;
+            self.retract_surrogates(collection, &key, &surrogates)?;
         }
         Ok(())
     }
@@ -184,19 +201,34 @@ impl FtsCollectionManager {
         let Some(surrogate) = self.lookup_surrogate(doc_id) else {
             return Ok(());
         };
+        self.retract_surrogates(collection, key, &[surrogate])
+    }
+
+    fn retract_surrogates(
+        &self,
+        collection: &str,
+        key: &str,
+        surrogates: &[Surrogate],
+    ) -> Result<(), LiteError> {
         let Some(idx) = self.indices.get(key) else {
             return Ok(());
         };
-        let held = idx
-            .backend()
-            .read_doc_length(0, 0, key.into(), surrogate)
-            .map_err(|e| fts_err(collection, e))?
-            .is_some();
-        if held {
+        let mut held = Vec::new();
+        for &surrogate in surrogates {
+            if idx
+                .backend()
+                .read_doc_length(0, 0, key.into(), surrogate)
+                .map_err(|e| fts_err(collection, e))?
+                .is_some()
+            {
+                held.push(surrogate);
+            }
+        }
+        if !held.is_empty() {
             // Marked before the removal: one that fails partway still left
             // the index changed.
             self.mark_index(key);
-            idx.remove_document(0, 0, key, surrogate)
+            idx.remove_documents(0, 0, key, &held)
                 .map_err(|e| fts_err(collection, e))?;
         }
         Ok(())

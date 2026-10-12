@@ -99,6 +99,14 @@ pub(crate) fn reindex_crdt_documents<'a, S: StorageEngine>(
     if collection.starts_with("__") {
         return Ok(());
     }
+    // Removed together first: one at a time, each removal scans the whole
+    // posting list of every term the document shares with most others.
+    let doc_ids: Vec<&str> = doc_ids.into_iter().collect();
+    if doc_ids.len() > 1 {
+        fts.manager
+            .lock_or_recover()
+            .remove_documents_fields(collection, &doc_ids)?;
+    }
     for doc_id in doc_ids {
         let current = crdt
             .lock_or_recover()
