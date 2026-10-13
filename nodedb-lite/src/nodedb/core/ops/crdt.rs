@@ -56,6 +56,18 @@ impl<S: StorageEngine> NodeDbLite<S> {
         Ok(crdt.compact_history_min_ops(min_ops)?)
     }
 
+    /// [`compact_crdt_history_min_ops`](Self::compact_crdt_history_min_ops),
+    /// and the next flush rewrites each compacted collection's disk form as a
+    /// checkpoint of its state. Run once per process, at open: see
+    /// `CrdtEngine::compact_history_and_rebase`.
+    pub fn compact_crdt_history_and_rebase(
+        &self,
+        min_ops: u64,
+    ) -> NodeDbResult<crate::engine::crdt::engine::HistoryCompaction> {
+        let mut crdt = self.crdt.lock_or_recover();
+        Ok(crdt.compact_history_and_rebase(min_ops)?)
+    }
+
     /// Live documents in a CRDT-backed collection, read from the tracked row
     /// IDs. An unknown collection counts 0.
     ///

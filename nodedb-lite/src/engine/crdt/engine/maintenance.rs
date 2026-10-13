@@ -62,6 +62,34 @@ impl CrdtEngine {
         &mut self,
         min_ops: u64,
     ) -> Result<HistoryCompaction, LiteError> {
+        self.compact_history_inner(min_ops, false)
+    }
+
+    /// [`compact_history_min_ops`](Self::compact_history_min_ops), and the
+    /// next flush rewrites each compacted collection as a checkpoint of its
+    /// shallow state, deleting the updates it supersedes.
+    ///
+    /// The plain pass keeps a persisted collection's disk form, so disk keeps
+    /// every operation its base and updates hold. Each open replays them all
+    /// before a compaction discards them again: 19M operations per open on a
+    /// 111k-document store. One rebasing pass trims disk to state, and the
+    /// next open finds little to discard.
+    ///
+    /// The cost is one checkpoint write per compacted collection. Run it once
+    /// per process, at open, never on a timer: forcing checkpoints on every
+    /// periodic pass rewrote 250-500 MB per run.
+    pub fn compact_history_and_rebase(
+        &mut self,
+        min_ops: u64,
+    ) -> Result<HistoryCompaction, LiteError> {
+        self.compact_history_inner(min_ops, true)
+    }
+
+    fn compact_history_inner(
+        &mut self,
+        min_ops: u64,
+        rebase: bool,
+    ) -> Result<HistoryCompaction, LiteError> {
         let mut report = HistoryCompaction::default();
         // The flag records whether the disk form is current at this frontier.
         let due: Vec<(String, bool, u64)> = self
@@ -99,7 +127,7 @@ impl CrdtEngine {
             // already. Its marks are absent, and removing all three keeps them
             // in step. `next_delta_seq` stays: it is the count of updates that
             // checkpoint has to delete.
-            if !persisted_at_frontier {
+            if rebase || !persisted_at_frontier {
                 self.flushed_versions.remove(collection);
                 self.checkpoint_bytes.remove(collection);
                 self.delta_bytes.remove(collection);
