@@ -22,6 +22,11 @@ impl CrdtEngine {
         self.live_ids.get(collection).map_or(0, BTreeSet::len)
     }
 
+    /// Lowest live row ID in `collection`, from the tracked ID set.
+    pub fn first_live_id(&self, collection: &str) -> Option<String> {
+        self.live_ids.get(collection)?.first().cloned()
+    }
+
     /// Read IDs after `exclusive_after_id`, bounded by count and UTF-8 bytes.
     /// Continue from the last retained ID until an empty page.
     /// A short byte-limited page does not indicate completion.
@@ -303,6 +308,17 @@ mod tests {
         engine.upsert("docs", "a", &fields()).unwrap();
         engine.delete("docs", "b").unwrap();
         assert_eq!(engine.live_row_count("docs"), 1);
+    }
+
+    #[test]
+    fn first_live_id_skips_deleted_rows() {
+        let mut engine = CrdtEngine::new(1).unwrap();
+        assert_eq!(engine.first_live_id("docs"), None);
+        engine.upsert("docs", "b", &fields()).unwrap();
+        engine.upsert("docs", "a", &fields()).unwrap();
+        assert_eq!(engine.first_live_id("docs").as_deref(), Some("a"));
+        engine.delete("docs", "a").unwrap();
+        assert_eq!(engine.first_live_id("docs").as_deref(), Some("b"));
     }
 
     #[test]
