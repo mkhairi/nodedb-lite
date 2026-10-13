@@ -17,6 +17,11 @@ pub(super) enum AffectedRows<'a> {
 }
 
 impl CrdtEngine {
+    /// Live rows in `collection`, from the tracked ID set. Reads no row state.
+    pub fn live_row_count(&self, collection: &str) -> usize {
+        self.live_ids.get(collection).map_or(0, BTreeSet::len)
+    }
+
     /// Read IDs after `exclusive_after_id`, bounded by count and UTF-8 bytes.
     /// Continue from the last retained ID until an empty page.
     /// A short byte-limited page does not indicate completion.
@@ -287,6 +292,17 @@ mod tests {
         restored.reject_delta(mutation);
         assert!(ids(&restored).is_empty());
         assert_eq!(restored.live_id_bytes, 0);
+    }
+
+    #[test]
+    fn live_row_count_follows_upserts_and_deletes() {
+        let mut engine = CrdtEngine::new(1).unwrap();
+        assert_eq!(engine.live_row_count("docs"), 0);
+        engine.upsert("docs", "a", &fields()).unwrap();
+        engine.upsert("docs", "b", &fields()).unwrap();
+        engine.upsert("docs", "a", &fields()).unwrap();
+        engine.delete("docs", "b").unwrap();
+        assert_eq!(engine.live_row_count("docs"), 1);
     }
 
     #[test]
