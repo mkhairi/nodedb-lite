@@ -314,3 +314,48 @@ fn compaction_report_counts_deferred_collections() {
         (0, 1, 0)
     );
 }
+
+/// A rebasing pass makes the next flush write the compacted state as a fresh
+/// checkpoint, superseding the base and every update on disk, and a restore
+/// from that checkpoint alone holds the same rows.
+#[test]
+fn rebasing_compaction_rewrites_a_flushed_collection_as_its_state() {
+    const PEER: u64 = 1;
+    let mut engine = CrdtEngine::new(PEER).unwrap();
+    for i in 0..50 {
+        upsert(&mut engine, &format!("i{i}"), i, "row");
+    }
+    flush(&mut engine);
+    for round in 0..3 {
+        for i in 0..50 {
+            upsert(&mut engine, &format!("i{i}"), i + round * 100, "rewritten");
+        }
+        flush(&mut engine);
+    }
+
+    let report = engine.compact_history_and_rebase(1).unwrap();
+    assert_eq!(report.compacted, 1);
+    let plan = flush(&mut engine);
+    assert_eq!(plan.len(), 1);
+    assert!(
+        matches!(
+            plan[0].kind,
+            CrdtWriteKind::Checkpoint {
+                superseded_deltas: 3
+            }
+        ),
+        "the rebase must supersede the three updates on disk: {:?}",
+        plan[0].kind
+    );
+
+    let restored = CrdtState::new(CrdtEngine::collection_peer_id(PEER, COLLECTION)).unwrap();
+    restored.import_local(&plan[0].bytes).unwrap();
+    assert_eq!(
+        rows(&restored, COLLECTION),
+        rows(engine.state(COLLECTION).unwrap(), COLLECTION)
+    );
+
+    // Nothing new: a second rebasing pass compacts and plans nothing.
+    assert_eq!(engine.compact_history_and_rebase(1).unwrap().compacted, 0);
+    assert!(engine.plan_persistence().unwrap().is_empty());
+}
