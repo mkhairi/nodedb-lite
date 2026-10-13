@@ -103,6 +103,7 @@ mod tests {
             fields: vec!["body".into()],
             analyzer: "standard".into(),
             fuzzy: false,
+            per_field: true,
         };
         {
             let mut manager = db

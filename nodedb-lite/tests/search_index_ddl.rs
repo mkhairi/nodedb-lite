@@ -460,3 +460,56 @@ async fn declarations_and_drop_defaults_survive_reopen_including_empty_collectio
         .expect("reopen automatic");
     assert_eq!(ids(&db, "articles", "body", "python").await, vec!["one"]);
 }
+
+#[tokio::test]
+async fn per_field_false_keeps_whole_document_text_and_refuses_field_search() {
+    let db = open().await;
+    for (id, title, body) in [
+        ("a", "rust", "storage engine"),
+        ("b", "python", "web server"),
+        ("c", "go", "compiler"),
+    ] {
+        db.document_put("shelf", document(id, title, body))
+            .await
+            .expect("put");
+    }
+    assert_eq!(ids(&db, "shelf", "title", "rust").await, vec!["a"]);
+
+    sql(&db, "CREATE SEARCH INDEX ON shelf() PER_FIELD false").await;
+    // `()` keeps every string field in the whole-document text.
+    assert_eq!(ids(&db, "shelf", "", "rust").await, vec!["a"]);
+    assert_eq!(ids(&db, "shelf", "", "server").await, vec!["b"]);
+    let refused = db
+        .text_search(
+            "shelf",
+            "title",
+            "rust",
+            10,
+            TextSearchParams::default(),
+            None,
+        )
+        .await
+        .expect_err("no per-field index after the replacement");
+    assert!(
+        refused.to_string().contains("title"),
+        "unexpected error: {refused}"
+    );
+
+    // A later write is indexed whole and not per field.
+    db.document_put("shelf", document("d", "zig", "allocator"))
+        .await
+        .expect("put");
+    assert_eq!(ids(&db, "shelf", "", "zig").await, vec!["d"]);
+    assert!(
+        db.text_search(
+            "shelf",
+            "title",
+            "zig",
+            10,
+            TextSearchParams::default(),
+            None
+        )
+        .await
+        .is_err()
+    );
+}

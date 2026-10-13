@@ -171,6 +171,7 @@ mod tests {
                     fields: vec!["title".into()],
                     analyzer: "standard".into(),
                     fuzzy: false,
+                    per_field: true,
                 }),
             )
             .unwrap();
@@ -234,6 +235,7 @@ mod tests {
                     fields: vec!["title".into()],
                     analyzer: "standard".into(),
                     fuzzy: true,
+                    per_field: true,
                 }),
             )
             .unwrap();

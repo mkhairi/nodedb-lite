@@ -113,8 +113,13 @@ impl CollectionReplacement {
         let texts = super::fields::selected_texts(fields, self.record.declaration.as_ref());
         let whole = super::fields::joined_text(&texts);
         self.index_text("", surrogate, &whole)?;
+        let per_field = self
+            .record
+            .declaration
+            .as_ref()
+            .is_none_or(|declaration| declaration.per_field);
         for (field, text) in texts {
-            if !field.is_empty() {
+            if per_field && !field.is_empty() {
                 self.index_text(field, surrogate, text)?;
             }
         }
@@ -373,6 +378,7 @@ mod tests {
                 fields: vec!["z".into(), "a".into()],
                 analyzer: "standard".into(),
                 fuzzy: false,
+                per_field: true,
             }),
             None,
         ] {
