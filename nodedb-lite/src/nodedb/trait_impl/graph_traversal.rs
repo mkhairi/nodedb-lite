@@ -12,7 +12,7 @@ use nodedb_types::{
 
 use crate::{
     engine::graph::{
-        properties::{PropertyMap, load_sql_properties},
+        properties::{PropertyMap, load_sql_properties, load_sql_properties_for},
         traversal::DEFAULT_MAX_VISITED,
     },
     nodedb::{LockExt, NodeDbLite, convert::loro_value_to_document},
@@ -119,7 +119,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
             (result, nodes)
         };
         if !filtered && !result.missing_properties.is_empty() {
-            let sql = load_sql_properties(self.storage.as_ref(), collection).await?;
+            let sql = load_sql_properties_for(
+                self.storage.as_ref(),
+                collection,
+                &result.missing_properties,
+            )
+            .await?;
             for edge in &mut result.edges {
                 let key = (
                     edge.from.as_str().to_owned(),

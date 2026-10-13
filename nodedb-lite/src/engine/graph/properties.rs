@@ -48,6 +48,37 @@ pub(crate) async fn load_sql_properties<S: StorageEngine>(
     decode_properties(collection, scan.entries)
 }
 
+/// Properties of the stored edges in `keys`, one point read each. Unlike
+/// [`load_sql_properties`], the cost follows the edges asked for, not the size
+/// of the collection, and no collection is too large to read.
+pub(crate) async fn load_sql_properties_for<'a, S: StorageEngine>(
+    storage: &S,
+    collection: &str,
+    keys: impl IntoIterator<Item = &'a EdgeKey>,
+) -> NodeDbResult<PropertyMap> {
+    let mut rows = Vec::new();
+    let mut bytes = 0usize;
+    for (src, label, dst) in keys {
+        let key = crate::engine::graph::edge_storage::edge_store_key(collection, src, label, dst);
+        let Some(value) = storage
+            .get(Namespace::Graph, &key)
+            .await
+            .map_err(NodeDbError::storage)?
+        else {
+            continue;
+        };
+        // The same budgets as the collection scan, enforced as rows arrive.
+        bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+        if rows.len() >= DEFAULT_MAX_VISITED || bytes > MAX_PROPERTY_BYTES {
+            return Err(NodeDbError::program_limit_exceeded(format!(
+                "SQL edge properties exceed {DEFAULT_MAX_VISITED} records or {MAX_PROPERTY_BYTES} serialized bytes in '{collection}': reduce the walk"
+            )));
+        }
+        rows.push((key, value));
+    }
+    decode_properties(collection, rows)
+}
+
 fn decode_properties(collection: &str, rows: Vec<KvPair>) -> NodeDbResult<PropertyMap> {
     if rows.len() > DEFAULT_MAX_VISITED {
         return Err(NodeDbError::program_limit_exceeded(format!(

@@ -228,4 +228,22 @@ mod tests {
             .expect("delete");
         assert_eq!(neighbours(&db, "a").await, vec!["c", "d"]);
     }
+
+    /// A walk over stored edges reads only the edges it returns: a collection
+    /// past the property scan's record limit still traverses.
+    #[tokio::test]
+    async fn stored_edges_traverse_past_the_property_scan_limit() {
+        let storage = PagedbStorageMem::open_in_memory().await.expect("storage");
+        let db = NodeDbLite::open(storage).await.expect("db");
+        let hub = node("hub");
+        let leaves: Vec<NodeId> = (0..100_001).map(|i| node(&format!("n{i}"))).collect();
+        let edges: Vec<(&NodeId, &str, &NodeId)> =
+            leaves.iter().map(|leaf| (leaf, "E", leaf)).collect();
+        db.graph_put_stored_edges("g", &edges).await.expect("bulk");
+        let (a, b) = (node("a"), node("b"));
+        db.graph_put_stored_edges("g", &[(&a, "E", &b), (&hub, "E", &a)])
+            .await
+            .expect("edges");
+        assert_eq!(neighbours(&db, "a").await, vec!["b"]);
+    }
 }
