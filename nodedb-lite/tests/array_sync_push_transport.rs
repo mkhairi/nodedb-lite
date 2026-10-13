@@ -343,7 +343,7 @@ async fn engine_rejected_op_is_held_until_the_next_session() {
     let mut ws = origin.accept_handshaked().await;
     let first = read_window(&mut ws).await;
     let refused = op_hlc(&first.deltas[0]);
-    send_reject(&mut ws, &first.deltas[0], ArrayRejectReason::EngineRejected).await;
+    send_reject(&mut ws, &first.deltas[0], ArrayRejectReason::EngineRefused).await;
     answer_barrier(&mut ws, first.token).await;
 
     await_queue_len(&lite, 1).await;

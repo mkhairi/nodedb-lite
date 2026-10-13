@@ -80,9 +80,9 @@ mod tests {
     #[test]
     fn unrepairable_rejects_park_the_op() {
         for reason in [
-            ArrayRejectReason::EngineRejected,
-            ArrayRejectReason::QuotaExceeded,
-            ArrayRejectReason::WireVersionMismatch,
+            ArrayRejectReason::EngineRefused,
+            ArrayRejectReason::PermissionDenied,
+            ArrayRejectReason::Unauthenticated,
         ] {
             assert_eq!(reject_disposition(reason), RejectDisposition::Park);
         }

@@ -116,6 +116,7 @@ fn metadata_ops_for_index(
 }
 
 /// `(index_key, blob)` posting segments of one checkpoint.
+#[cfg(test)]
 type SegmentWrites = Vec<(String, Vec<u8>)>;
 
 /// Serialize FTS state into write ops (no I/O, safe to call while holding a

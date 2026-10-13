@@ -247,6 +247,7 @@ pub(super) fn lower_document_index_lookup<'a, S: StorageEngine + 'a>(
 ) -> Result<LiteFut<'a>, LiteError> {
     let DocumentIndexLookupVisitArgs {
         collection,
+        engine: engine_type,
         field,
         value,
         filters,

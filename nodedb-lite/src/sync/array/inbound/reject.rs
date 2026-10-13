@@ -106,8 +106,8 @@ mod tests {
         for reason in [
             ArrayRejectReason::ArrayUnknown,
             ArrayRejectReason::SchemaTooNew,
-            ArrayRejectReason::EngineRejected,
-            ArrayRejectReason::QuotaExceeded,
+            ArrayRejectReason::EngineRefused,
+            ArrayRejectReason::PermissionDenied,
             ArrayRejectReason::RetentionFloor,
         ] {
             let outcome = inbound.handle_reject(&reject(reason)).await.unwrap();
