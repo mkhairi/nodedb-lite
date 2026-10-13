@@ -77,10 +77,7 @@ impl<S: StorageEngine> LiteApplyEngine<S> {
 
     async fn load_last_applied(storage: &Arc<S>) -> HashMap<String, Hlc> {
         let prefix = LAST_APPLIED_PREFIX.as_bytes();
-        let Ok(pairs) = storage
-            .scan_range(Namespace::Meta, prefix, usize::MAX)
-            .await
-        else {
+        let Ok(pairs) = storage.scan_prefix(Namespace::Meta, prefix).await else {
             return HashMap::new();
         };
         let mut map = HashMap::new();
