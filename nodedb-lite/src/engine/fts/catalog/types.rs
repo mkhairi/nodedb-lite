@@ -6,7 +6,9 @@ use std::collections::HashSet;
 
 use crate::error::LiteError;
 
-pub(crate) const DECLARATION_FORMAT: u32 = 1;
+/// Version 2 adds [`SearchDeclaration::per_field`]. A version-1 record reads
+/// as `per_field = true`, the behaviour it was written under.
+pub(crate) const DECLARATION_FORMAT: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub(crate) struct SearchDeclaration {
@@ -14,6 +16,42 @@ pub(crate) struct SearchDeclaration {
     pub fields: Vec<String>,
     pub analyzer: String,
     pub fuzzy: bool,
+    /// `false` keeps only the whole-document index: no per-field index is
+    /// built, and a search on a named field answers `TextIndexMissing`.
+    pub per_field: bool,
+}
+
+/// A version-1 declaration, read only: written before `per_field` existed.
+#[derive(Debug, Clone, zerompk::FromMessagePack)]
+pub(crate) struct SearchDeclarationV1 {
+    pub name: String,
+    pub fields: Vec<String>,
+    pub analyzer: String,
+    pub fuzzy: bool,
+}
+
+/// A version-1 record, read only.
+#[derive(Debug, Clone, zerompk::FromMessagePack)]
+pub(crate) struct SearchDeclarationRecordV1 {
+    pub format_version: u32,
+    pub revision: u64,
+    pub declaration: Option<SearchDeclarationV1>,
+}
+
+impl From<SearchDeclarationRecordV1> for SearchDeclarationRecord {
+    fn from(v1: SearchDeclarationRecordV1) -> Self {
+        Self {
+            format_version: DECLARATION_FORMAT,
+            revision: v1.revision,
+            declaration: v1.declaration.map(|d| SearchDeclaration {
+                name: d.name,
+                fields: d.fields,
+                analyzer: d.analyzer,
+                fuzzy: d.fuzzy,
+                per_field: true,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
@@ -62,6 +100,7 @@ mod tests {
                 fields: vec!["title".into()],
                 analyzer: "standard".into(),
                 fuzzy: false,
+                per_field: true,
             }),
         };
         assert!(record.check("docs").is_ok());

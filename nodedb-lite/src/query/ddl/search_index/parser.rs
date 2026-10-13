@@ -16,6 +16,7 @@ pub(in crate::query) enum SearchIndexStatement {
         fields: Vec<String>,
         analyzer: String,
         fuzzy: bool,
+        per_field: bool,
     },
     Drop {
         name: String,
@@ -117,22 +118,30 @@ impl Parser<'_> {
         }
         let mut fields = Vec::new();
         let mut seen = HashSet::new();
-        loop {
-            let field = self.identifier()?;
-            if !seen.insert(field.clone()) {
-                return Err(self.error(&format!("remove duplicate field '{field}'")));
-            }
-            fields.push(field);
-            match self.next() {
-                Some(Token::Comma) => {}
-                Some(Token::Close) => break,
-                _ => {
-                    return Err(self.error("separate fields with commas and close the parentheses"));
+        // `()` selects every string field, the same text as no declaration.
+        if matches!(self.peek(), Some(Token::Close)) {
+            self.offset += 1;
+        } else {
+            loop {
+                let field = self.identifier()?;
+                if !seen.insert(field.clone()) {
+                    return Err(self.error(&format!("remove duplicate field '{field}'")));
+                }
+                fields.push(field);
+                match self.next() {
+                    Some(Token::Comma) => {}
+                    Some(Token::Close) => break,
+                    _ => {
+                        return Err(
+                            self.error("separate fields with commas and close the parentheses")
+                        );
+                    }
                 }
             }
         }
         let mut analyzer = None;
         let mut fuzzy = None;
+        let mut per_field = None;
         while self
             .peek()
             .is_some_and(|token| !matches!(token, Token::Semicolon))
@@ -162,8 +171,18 @@ impl Parser<'_> {
                     Some(Token::Bare(value)) if value.eq_ignore_ascii_case("false") => false,
                     _ => return Err(self.error("supply bare true or false after FUZZY")),
                 });
+            } else if self.peek().is_some_and(|token| token.keyword("PER_FIELD")) {
+                self.offset += 1;
+                if per_field.is_some() {
+                    return Err(self.error("remove duplicate PER_FIELD"));
+                }
+                per_field = Some(match self.next() {
+                    Some(Token::Bare(value)) if value.eq_ignore_ascii_case("true") => true,
+                    Some(Token::Bare(value)) if value.eq_ignore_ascii_case("false") => false,
+                    _ => return Err(self.error("supply bare true or false after PER_FIELD")),
+                });
             } else {
-                return Err(self.error("use ANALYZER or FUZZY after the field list"));
+                return Err(self.error("use ANALYZER, FUZZY or PER_FIELD after the field list"));
             }
         }
         Ok(SearchIndexStatement::Create {
@@ -171,6 +190,7 @@ impl Parser<'_> {
             fields,
             analyzer: analyzer.unwrap_or_else(|| "standard".into()),
             fuzzy: fuzzy.unwrap_or(false),
+            per_field: per_field.unwrap_or(true),
         })
     }
 
@@ -200,8 +220,25 @@ mod tests {
                 fields: vec!["title".into(), "Body".into()],
                 analyzer: "standard".into(),
                 fuzzy: true,
+                per_field: true,
             }
         );
+    }
+
+    #[test]
+    fn empty_field_list_selects_every_field_and_per_field_parses() {
+        assert_eq!(
+            parse("CREATE SEARCH INDEX ON docs() PER_FIELD false").expect("create"),
+            SearchIndexStatement::Create {
+                collection: "docs".into(),
+                fields: vec![],
+                analyzer: "standard".into(),
+                fuzzy: false,
+                per_field: false,
+            }
+        );
+        assert!(parse("CREATE SEARCH INDEX ON docs() PER_FIELD maybe").is_err());
+        assert!(parse("CREATE SEARCH INDEX ON docs() PER_FIELD true PER_FIELD false").is_err());
     }
 
     #[test]
@@ -212,7 +249,8 @@ mod tests {
                 collection: "articles".into(),
                 fields: vec!["body".into()],
                 analyzer: "standard".into(),
-                fuzzy: false
+                fuzzy: false,
+                per_field: true,
             }
         );
         assert_eq!(
@@ -254,7 +292,6 @@ mod tests {
             "CREATE SEARCH ON a(b)",
             "CREATE SEARCH INDEX name ON a(b)",
             "CREATE SEARCH INDEX IF NOT EXISTS ON a(b)",
-            "CREATE SEARCH INDEX ON a()",
             "CREATE SEARCH INDEX ON a(b,)",
             "CREATE SEARCH INDEX ON a(b B)",
             "CREATE SEARCH INDEX ON a(b,B)",

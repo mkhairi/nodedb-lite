@@ -47,12 +47,17 @@ impl FtsCollectionManager {
         let whole = index_key(collection, "");
         let mut indexed: HashSet<String> = HashSet::new();
         let mut pairs = Vec::with_capacity(texts.len());
+        let per_field = self
+            .declaration_for(collection)
+            .is_none_or(|declaration| declaration.per_field);
         for (field, value) in texts {
             if field.is_empty() {
                 continue;
             }
-            self.index_field(collection, field, doc_id, value)?;
-            indexed.insert(index_key(collection, field));
+            if per_field {
+                self.index_field(collection, field, doc_id, value)?;
+                indexed.insert(index_key(collection, field));
+            }
             pairs.push((field.to_owned(), value.to_owned()));
         }
 

@@ -69,6 +69,7 @@ impl<S: StorageEngine> DeclarationContext<S> {
                 fields,
                 analyzer,
                 fuzzy,
+                per_field,
             } => {
                 let manager = self
                     .fts
@@ -86,6 +87,7 @@ impl<S: StorageEngine> DeclarationContext<S> {
                     fields,
                     analyzer,
                     fuzzy,
+                    per_field,
                 };
                 (collection, Some(declaration), "created")
             }
