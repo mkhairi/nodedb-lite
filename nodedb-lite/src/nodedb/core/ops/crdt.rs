@@ -56,6 +56,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
         Ok(crdt.compact_history_min_ops(min_ops)?)
     }
 
+    /// Live documents in a CRDT-backed collection, read from the tracked row
+    /// IDs. An unknown collection counts 0.
+    ///
+    /// A `SELECT` over the collection decodes every row's CRDT state, which
+    /// stays resident until the document is next rebuilt. This reads none.
+    pub fn document_count(&self, collection: &str) -> usize {
+        self.crdt.lock_or_recover().live_row_count(collection)
+    }
+
     /// Install a per-document [`SyncGate`]. Documents the gate rejects are kept
     /// local-only (excluded from CRDT delta, FTS, and vector sync channels).
     pub fn set_sync_gate(&self, gate: Arc<dyn SyncGate>) {
