@@ -12,6 +12,7 @@ mod document;
 mod document_batch;
 mod document_vector;
 mod graph;
+mod graph_stored;
 mod graph_traversal;
 mod graph_walk;
 mod sql_lifecycle;
