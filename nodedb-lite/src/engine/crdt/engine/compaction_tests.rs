@@ -359,3 +359,29 @@ fn rebasing_compaction_rewrites_a_flushed_collection_as_its_state() {
     assert_eq!(engine.compact_history_and_rebase(1).unwrap().compacted, 0);
     assert!(engine.plan_persistence().unwrap().is_empty());
 }
+
+/// A collection restored from a shallow checkpoint counts operations from the
+/// shallow root, not from its version vector.
+///
+/// The version vector of a shallow document still counts every operation the
+/// collection ever took. Counting from it, the first compaction after each
+/// open saw the whole history again, so a rebasing pass at open rewrote every
+/// checkpoint on every open.
+#[test]
+fn a_restored_shallow_checkpoint_counts_operations_from_its_root() {
+    let mut engine = CrdtEngine::new(1).unwrap();
+    for i in 0..10 {
+        upsert(&mut engine, &format!("i{i}"), i, "row");
+    }
+    engine.compact_history().unwrap();
+    let checkpoint = engine.export_snapshot(COLLECTION).unwrap();
+
+    let mut restored = CrdtEngine::from_snapshot(1, COLLECTION, &checkpoint).unwrap();
+    let report = restored.compact_history_min_ops(2).unwrap();
+    assert_eq!((report.compacted, report.skipped), (0, 1));
+
+    upsert(&mut restored, "i10", 10, "a");
+    flush(&mut restored);
+    let report = restored.compact_history_min_ops(2).unwrap();
+    assert_eq!((report.compacted, report.skipped), (1, 0));
+}

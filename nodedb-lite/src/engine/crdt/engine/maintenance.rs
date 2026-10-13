@@ -97,7 +97,14 @@ impl CrdtEngine {
             .iter()
             .filter_map(|(collection, state)| {
                 let frontier = state.oplog_version_vector();
-                let ops = ops_since(&frontier, self.compacted_versions.get(collection));
+                // Before the first compaction in this process, count from the
+                // shallow root a restored checkpoint carries. Its version
+                // vector still counts the operations that root discarded.
+                let base = match self.compacted_versions.get(collection) {
+                    Some(base) => base.clone(),
+                    None => state.shallow_since_version_vector(),
+                };
+                let ops = ops_since(&frontier, &base);
                 if ops < min_ops.max(1) {
                     report.skipped += 1;
                     return None;
@@ -159,13 +166,12 @@ impl CrdtEngine {
     }
 }
 
-/// Operations in `frontier` that `base` does not cover. With no base, every
-/// operation the document has ever taken.
-fn ops_since(frontier: &loro::VersionVector, base: Option<&loro::VersionVector>) -> u64 {
+/// Operations in `frontier` that `base` does not cover.
+fn ops_since(frontier: &loro::VersionVector, base: &loro::VersionVector) -> u64 {
     frontier
         .iter()
         .map(|(peer, end)| {
-            let start = base.and_then(|b| b.get(peer)).copied().unwrap_or(0);
+            let start = base.get(peer).copied().unwrap_or(0);
             u64::try_from(end - start).unwrap_or(0)
         })
         .sum()
