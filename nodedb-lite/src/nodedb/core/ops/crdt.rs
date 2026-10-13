@@ -65,6 +65,15 @@ impl<S: StorageEngine> NodeDbLite<S> {
         self.crdt.lock_or_recover().live_row_count(collection)
     }
 
+    /// The lowest live document ID in a CRDT-backed collection, from the
+    /// tracked row IDs. `None` when the collection is empty or unknown.
+    ///
+    /// Lets a caller prove the row read path with one `document_get` rather
+    /// than a scan that decodes every row.
+    pub fn first_document_id(&self, collection: &str) -> Option<String> {
+        self.crdt.lock_or_recover().first_live_id(collection)
+    }
+
     /// Install a per-document [`SyncGate`]. Documents the gate rejects are kept
     /// local-only (excluded from CRDT delta, FTS, and vector sync channels).
     pub fn set_sync_gate(&self, gate: Arc<dyn SyncGate>) {
