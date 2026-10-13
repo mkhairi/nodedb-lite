@@ -55,9 +55,7 @@ impl<S: StorageEngine> StreamSeqTracker<S> {
     /// Returns an empty tracker if no entries are stored yet.
     pub async fn load(storage: Arc<S>) -> Result<Self, LiteError> {
         let prefix = STREAM_SEQ_PREFIX.as_bytes();
-        let pairs = storage
-            .scan_range(Namespace::Meta, prefix, usize::MAX)
-            .await?;
+        let pairs = storage.scan_prefix(Namespace::Meta, prefix).await?;
 
         let mut state = HashMap::new();
         for (key, value) in pairs {
