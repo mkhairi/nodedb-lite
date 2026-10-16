@@ -175,8 +175,28 @@ impl<S: StorageEngine> NodeDbLite<S> {
         self.flush_pass(permit, false).await
     }
 
+    /// The auto-flush pass. With `write_fts` false it persists everything but
+    /// the text-index checkpoint, which stays dirty and marked incomplete
+    /// until a pass that writes it. See `LiteConfig::fts_checkpoint_ms`.
+    pub(crate) async fn flush_auto(&self, write_fts: bool) -> NodeDbResult<()> {
+        let permit = self.fts_state.admit_exclusive().await;
+        self.flush_pass_opts(&permit, false, !write_fts).await
+    }
+
     /// One flush pass. `full` ignores the dirty state of tracked artifacts.
-    async fn flush_pass(&self, _permit: &TextMutationPermit, full: bool) -> NodeDbResult<()> {
+    async fn flush_pass(&self, permit: &TextMutationPermit, full: bool) -> NodeDbResult<()> {
+        self.flush_pass_opts(permit, full, false).await
+    }
+
+    /// One flush pass. `defer_fts` skips the text-index checkpoint; a full
+    /// pass never defers it.
+    async fn flush_pass_opts(
+        &self,
+        _permit: &TextMutationPermit,
+        full: bool,
+        defer_fts: bool,
+    ) -> NodeDbResult<()> {
+        let defer_fts = defer_fts && !full;
         // One flush at a time: the CRDT update sequence is allocated under the
         // `crdt` guard but committed after it is released, so concurrent
         // flushes would hand out the same numbers. See `flush_lock`.
@@ -191,16 +211,26 @@ impl<S: StorageEngine> NodeDbLite<S> {
                 CHECKPOINT_STATE_KEY, encode_checkpoint_complete, encode_checkpoint_incomplete,
             };
             let fts = self.fts_state.manager.lock_or_recover();
-            let end_state = if self.fts_state.checkpoint_trusted() {
+            // A deferred pass leaves the stored index behind memory, so it
+            // must end with the marker incomplete, never complete.
+            let end_state = if self.fts_state.checkpoint_trusted() && !defer_fts {
                 encode_checkpoint_complete(&fts.declaration_revisions())
             } else {
                 encode_checkpoint_incomplete()
             }
             .map_err(NodeDbError::from)?;
-            full || fts.checkpoint_pending(full)
-                || self
-                    .flush_gens
-                    .meta_changed(CHECKPOINT_STATE_KEY, &end_state)
+            if defer_fts {
+                // Only the incomplete marker can be written, and only once.
+                fts.checkpoint_pending(false)
+                    && self
+                        .flush_gens
+                        .meta_changed(CHECKPOINT_STATE_KEY, &end_state)
+            } else {
+                full || fts.checkpoint_pending(full)
+                    || self
+                        .flush_gens
+                        .meta_changed(CHECKPOINT_STATE_KEY, &end_state)
+            }
         };
         if fts_markers {
             crate::engine::fts::checkpoint::persist_checkpoint_incomplete(self.storage.as_ref())
@@ -454,23 +484,42 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // and dropped indexes are planned. Planning is synchronous (no I/O)
         // and runs inside the lock, so each captured generation describes
         // exactly the bytes serialized. The writes run after it is released.
-        let fts_flush = self
-            .fts_state
-            .manager
-            .lock_or_recover()
-            .checkpoint_dirty(full)
-            .map_err(|e| NodeDbError::storage(format!("fts serialize: {e}")))?;
-        let fts_written = crate::engine::fts::checkpoint::write_planned_fts(
-            self.storage.as_ref(),
-            fts_flush,
-            &self.flush_gens,
-        )
-        .await
-        .map_err(|e| NodeDbError::storage(format!("fts flush: {e}")))?;
-        self.fts_state
-            .manager
-            .lock_or_recover()
-            .forget_dropped(&fts_written);
+        // A deferred pass skips both: dirty indexes stay dirty for the next
+        // pass that writes them.
+        if !defer_fts {
+            #[cfg(not(target_arch = "wasm32"))]
+            let started = std::time::Instant::now();
+            let fts_flush = self
+                .fts_state
+                .manager
+                .lock_or_recover()
+                .checkpoint_dirty(full)
+                .map_err(|e| NodeDbError::storage(format!("fts serialize: {e}")))?;
+            #[cfg(not(target_arch = "wasm32"))]
+            let planned_ms = started.elapsed().as_millis() as u64;
+            let fts_written = crate::engine::fts::checkpoint::write_planned_fts(
+                self.storage.as_ref(),
+                fts_flush,
+                &self.flush_gens,
+            )
+            .await
+            .map_err(|e| NodeDbError::storage(format!("fts flush: {e}")))?;
+            self.fts_state
+                .manager
+                .lock_or_recover()
+                .forget_dropped(&fts_written);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let total_ms = started.elapsed().as_millis() as u64;
+                if total_ms >= 250 {
+                    tracing::info!(
+                        serialize_ms = planned_ms,
+                        write_ms = total_ms - planned_ms,
+                        "text-index checkpoint written under write admission"
+                    );
+                }
+            }
+        }
 
         // ── Persist sparse-vector inverted indices ────────────────────────────
         // Same shape as the FTS block: serialize synchronously under the lock,
@@ -514,7 +563,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             q.flush_staging().await.map_err(NodeDbError::from)?;
         }
 
-        if fts_markers && self.fts_state.checkpoint_trusted() {
+        if fts_markers && !defer_fts && self.fts_state.checkpoint_trusted() {
             let revisions = self
                 .fts_state
                 .manager
@@ -564,6 +613,77 @@ mod tests {
         NodeDbLite::open_with_config(storage, config)
             .await
             .expect("open")
+    }
+
+    /// A deferred auto-flush pass leaves the text checkpoint dirty and the
+    /// stored marker incomplete, so an open after a crash rebuilds the index
+    /// from the rows. The next pass that writes it marks it complete again.
+    #[tokio::test]
+    async fn a_deferred_text_checkpoint_stays_incomplete_until_written() {
+        use crate::engine::fts::checkpoint::checkpoint_compatible;
+        let storage = PagedbStorageMem::open_in_memory().await.expect("storage");
+        let config = LiteConfig {
+            auto_flush_ms: 0,
+            sync_enabled: false,
+            ..LiteConfig::default()
+        };
+        let db = NodeDbLite::open_with_config(storage, config)
+            .await
+            .expect("open");
+        let mut doc = Document::new("one");
+        doc.set("body", Value::String("searchable text".into()));
+        db.document_put("docs", doc).await.expect("document_put");
+        db.flush().await.expect("baseline flush");
+        let revisions = db
+            .fts_state
+            .manager
+            .lock_or_recover()
+            .declaration_revisions();
+        assert!(
+            checkpoint_compatible(db.storage.as_ref(), &revisions)
+                .await
+                .expect("read marker"),
+            "a written checkpoint is complete"
+        );
+
+        let mut doc = Document::new("two");
+        doc.set("body", Value::String("more searchable text".into()));
+        db.document_put("docs", doc).await.expect("document_put");
+        assert!(
+            db.fts_state
+                .manager
+                .lock_or_recover()
+                .checkpoint_pending(false)
+        );
+
+        db.flush_auto(false).await.expect("deferred pass");
+        assert!(
+            db.fts_state
+                .manager
+                .lock_or_recover()
+                .checkpoint_pending(false),
+            "a deferred pass leaves the text index dirty"
+        );
+        assert!(
+            !checkpoint_compatible(db.storage.as_ref(), &revisions)
+                .await
+                .expect("read marker"),
+            "a deferred pass must never leave the marker complete"
+        );
+
+        db.flush_auto(true).await.expect("writing pass");
+        assert!(
+            !db.fts_state
+                .manager
+                .lock_or_recover()
+                .checkpoint_pending(false)
+        );
+        assert!(
+            checkpoint_compatible(db.storage.as_ref(), &revisions)
+                .await
+                .expect("read marker"),
+            "the writing pass restores a complete marker"
+        );
     }
 
     async fn write_documents(db: &NodeDbLite<PagedbStorageMem>) {

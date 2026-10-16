@@ -435,7 +435,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         // Both hold a `Weak` handle, so they stop when the last `Arc` returned
         // from here is dropped. A zero interval spawns nothing.
         let db = Arc::new(db);
-        db.start_auto_flush(config.auto_flush_ms);
+        db.start_auto_flush_with(config.auto_flush_ms, config.fts_checkpoint_ms);
         db.start_auto_compact(config.auto_compact_ms);
 
         Ok(db)
