@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use super::defaults::{
     default_argon2_m_cost, default_argon2_p_cost, default_argon2_t_cost, default_array_percent,
     default_auto_compact_ms, default_auto_flush_ms, default_columnar_percent,
-    default_crdt_pending_delta_window, default_document_percent, default_fts_percent,
-    default_kv_cache_capacity, default_kv_percent, default_outbound_queue_cap,
+    default_crdt_pending_delta_window, default_document_percent, default_fts_checkpoint_ms,
+    default_fts_percent, default_kv_cache_capacity, default_kv_percent, default_outbound_queue_cap,
     default_sparse_percent, default_spatial_percent, default_strict_percent, default_sync_enabled,
     default_timeseries_percent,
 };
@@ -160,6 +160,21 @@ pub struct LiteConfig {
     #[serde(default = "default_auto_flush_ms")]
     pub auto_flush_ms: u64,
 
+    /// Minimum interval between text-index checkpoints written by the
+    /// auto-flush task, in milliseconds. Default: 0 (every auto-flush pass).
+    ///
+    /// A dirty text index is serialized whole, and the pass holds the
+    /// source-write admission while it does, so on a large index every
+    /// write waits for that serialization. A non-zero value lets auto-flush
+    /// passes in between skip the text checkpoint and leave the stored
+    /// checkpoint marked incomplete; source rows still flush every
+    /// `auto_flush_ms`. Explicit [`flush`](crate::NodeDbLite::flush),
+    /// [`flush_full`](crate::NodeDbLite::flush_full) and shutdown always write
+    /// it. After an unclean exit, open rebuilds the text index from the rows,
+    /// as it does for any incomplete checkpoint.
+    #[serde(default = "default_fts_checkpoint_ms")]
+    pub fts_checkpoint_ms: u64,
+
     /// Interval between automatic background compactions, in milliseconds.
     /// Default: 0 (disabled).
     ///
@@ -216,6 +231,7 @@ impl Default for LiteConfig {
             kv_cache_capacity: default_kv_cache_capacity(),
             auto_flush_ms: default_auto_flush_ms(),
             auto_compact_ms: default_auto_compact_ms(),
+            fts_checkpoint_ms: default_fts_checkpoint_ms(),
             corruption_policy: CorruptionPolicy::FailClosed,
         }
     }

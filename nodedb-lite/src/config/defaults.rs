@@ -31,6 +31,10 @@ pub(crate) fn default_auto_compact_ms() -> u64 {
     0
 }
 
+pub(crate) fn default_fts_checkpoint_ms() -> u64 {
+    0
+}
+
 pub(crate) fn default_sync_enabled() -> bool {
     true
 }

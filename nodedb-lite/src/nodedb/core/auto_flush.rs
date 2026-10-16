@@ -54,6 +54,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
     ///
     /// Pass `interval_ms = 0` to skip spawning entirely (auto-flush disabled).
     pub fn start_auto_flush(self: &Arc<Self>, interval_ms: u64) {
+        self.start_auto_flush_with(interval_ms, 0);
+    }
+
+    /// [`start_auto_flush`](Self::start_auto_flush), writing the text-index
+    /// checkpoint at most once per `fts_checkpoint_ms` (0 = every pass). See
+    /// [`LiteConfig::fts_checkpoint_ms`](crate::config::LiteConfig::fts_checkpoint_ms).
+    pub fn start_auto_flush_with(self: &Arc<Self>, interval_ms: u64, fts_checkpoint_ms: u64) {
         if interval_ms == 0 {
             return;
         }
@@ -89,6 +96,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
             // first flush (matches Tokio's immediate-first-tick semantics on
             // native; on WASM the first tick already waits one period).
             ticker.tick().await;
+            let mut last_fts_ms = crate::runtime::now_millis();
 
             loop {
                 if !stop.tick_or_stop(&mut ticker).await {
@@ -100,8 +108,13 @@ impl<S: StorageEngine> NodeDbLite<S> {
                     None => break,
                 };
 
-                if let Err(e) = db.flush().await {
-                    tracing::warn!(error = %e, "auto-flush failed");
+                let write_fts = fts_checkpoint_ms == 0
+                    || crate::runtime::now_millis().saturating_sub(last_fts_ms)
+                        >= fts_checkpoint_ms;
+                match db.flush_auto(write_fts).await {
+                    Ok(()) if write_fts => last_fts_ms = crate::runtime::now_millis(),
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!(error = %e, "auto-flush failed"),
                 }
 
                 // Drop the strong Arc before the next tick so the loop does
