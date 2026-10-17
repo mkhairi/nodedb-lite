@@ -9,17 +9,6 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
----
-
-## [0.1.0] - 2026-10-16
-
-First release. Embedded NodeDB for Linux, macOS, Windows, Android and the browser, built on NodeDB 0.6.2 crates and pagedb 0.1.
-
-### Fixed
-
-- **Vector index:** search found nothing after the last vector was deleted.
-- **Full-text search:** each reopen rebuilt the index on top of the old memory reservation, so the memory budget ran out.
-
 ### Added
 
 - `NodeDbLite::compact_crdt_history_min_ops(min_ops)` compacts only the
@@ -140,6 +129,17 @@ First release. Embedded NodeDB for Linux, macOS, Windows, Android and the browse
 - Shutdown no longer aborts an in-flight auto-flush or auto-compaction after
   5 s; it waits for the pass to finish, so a stop during a long flush cannot
   leave a half-written segment in `seg/.staging` (aql#163, NDB-AQL-40).
+
+---
+
+## [0.1.0] - 2026-10-16
+
+First release. Embedded NodeDB for Linux, macOS, Windows, Android and the browser, built on NodeDB 0.6.2 crates and pagedb 0.1.
+
+### Fixed
+
+- **Vector index:** search found nothing after the last vector was deleted.
+- **Full-text search:** each reopen rebuilt the index on top of the old memory reservation, so the memory budget ran out.
 
 ---
 
