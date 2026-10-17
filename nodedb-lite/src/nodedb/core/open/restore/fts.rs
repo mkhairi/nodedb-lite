@@ -273,6 +273,16 @@ mod tests {
         (entry.allocated, entry.limit)
     }
 
+    /// An FTS slice of 8 MiB. The resident memtable charges the governor in
+    /// 1 MiB steps, so the default 1 MiB slice is crossed by the first step
+    /// and no write load sits between half and all of it.
+    fn strict_budget_config() -> LiteConfig {
+        LiteConfig {
+            memory_budget: 800 * 1024 * 1024,
+            ..config()
+        }
+    }
+
     /// A strict collection whose text fills more than half the FTS budget
     /// reopens: open charges the rebuilt postings once, not on top of the
     /// checkpoint's.
@@ -280,7 +290,13 @@ mod tests {
     async fn strict_text_admitted_live_reopens_within_the_same_fts_budget() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("strict_budget.db");
-        let db = open(&path).await;
+        let db = NodeDbLite::open_at_path_with_config(
+            &path,
+            Encryption::Plaintext,
+            strict_budget_config(),
+        )
+        .await
+        .unwrap();
         db.execute_sql(
             "CREATE COLLECTION runs (id BIGINT PRIMARY KEY, payload TEXT) WITH storage = 'strict'",
             &[],
@@ -306,9 +322,13 @@ mod tests {
         db.shutdown().await;
         drop(db);
 
-        let reopened = NodeDbLite::open_at_path_with_config(&path, Encryption::Plaintext, config())
-            .await
-            .expect("a store that accepted every write must reopen");
+        let reopened = NodeDbLite::open_at_path_with_config(
+            &path,
+            Encryption::Plaintext,
+            strict_budget_config(),
+        )
+        .await
+        .expect("a store that accepted every write must reopen");
         let (restored, _) = fts_usage(&reopened);
         assert!(
             restored <= live,
