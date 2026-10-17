@@ -14,21 +14,21 @@ homepage = "https://nodedb.dev"
 [workspace.dependencies]
 # Internal
 nodedb-lite = { path = "nodedb-lite", version = "0.1.0", default-features = false }
-nodedb-types = { version = "0.6.2" }
-nodedb-client = { version = "0.6.2" }
-nodedb-codec = { version = "0.6.2" }
-nodedb-crdt = { version = "0.6.2" }
-nodedb-query = { version = "0.6.2" }
-nodedb-spatial = { version = "0.6.2" }
-nodedb-graph = { version = "0.6.2" }
-nodedb-vector = { version = "0.6.2" }
-nodedb-fts = { version = "0.6.2" }
-nodedb-strict = { version = "0.6.2" }
-nodedb-columnar = { version = "0.6.2" }
-nodedb-sql = { version = "0.6.2" }
-nodedb-array = { version = "0.6.2" }
-nodedb-physical = { version = "0.6.2" }
-nodedb-mem = { version = "0.6.2" }
+nodedb-types = { version = "0.7.0-dev" }
+nodedb-client = { version = "0.7.0-dev" }
+nodedb-codec = { version = "0.7.0-dev" }
+nodedb-crdt = { version = "0.7.0-dev" }
+nodedb-query = { version = "0.7.0-dev" }
+nodedb-spatial = { version = "0.7.0-dev" }
+nodedb-graph = { version = "0.7.0-dev" }
+nodedb-vector = { version = "0.7.0-dev" }
+nodedb-fts = { version = "0.7.0-dev" }
+nodedb-strict = { version = "0.7.0-dev" }
+nodedb-columnar = { version = "0.7.0-dev" }
+nodedb-sql = { version = "0.7.0-dev" }
+nodedb-array = { version = "0.7.0-dev" }
+nodedb-physical = { version = "0.7.0-dev" }
+nodedb-mem = { version = "0.7.0-dev" }
 
 # Async
 tokio = { version = "1" }
