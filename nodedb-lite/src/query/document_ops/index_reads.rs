@@ -144,14 +144,12 @@ async fn candidate_rows<S: StorageEngine>(
         }
         return Ok(rows);
     }
-    let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-    for id in ids {
-        let Some(doc) = crdt.read(collection, &id) else {
-            continue;
-        };
-        if keep(&row_value(&doc)) {
-            let row = document_rows::crdt_row(&id, &doc);
-            rows.push((id, row));
+    for chunk in ids.chunks(document_rows::SCAN_CHUNK) {
+        for (id, doc) in document_rows::read_chunk(&engine.crdt, collection, chunk)? {
+            if keep(&row_value(&doc)) {
+                let row = document_rows::crdt_row(&id, &doc);
+                rows.push((id, row));
+            }
         }
     }
     Ok(rows)

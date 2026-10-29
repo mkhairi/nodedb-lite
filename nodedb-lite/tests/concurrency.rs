@@ -4,9 +4,12 @@
 //! using tokio tasks for parallelism.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use nodedb_client::NodeDb;
-use nodedb_lite::{NodeDbLite, PagedbStorageMem};
+use nodedb_lite::{BatchItem, NodeDbLite, PagedbStorageMem};
+use nodedb_types::document::Document;
 use nodedb_types::value::Value;
 
 async fn open_db() -> Arc<NodeDbLite<PagedbStorageMem>> {
@@ -268,4 +271,80 @@ async fn concurrent_strict_reads_and_writes() {
     // All rows should be accessible after both tasks complete.
     let count = db.strict_engine().count("accounts").await.unwrap();
     assert_eq!(count, 30);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Concurrent document scan + point reads (schemaless)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A full scan of a schemaless collection releases the CRDT lock between
+/// chunks, so a point read issued while it runs waits for one chunk rather
+/// than the rest of the scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn document_scan_does_not_stall_point_reads() {
+    const DOCS: usize = 1_500;
+    let db = open_db().await;
+    let docs: Vec<Document> = (0..DOCS)
+        .map(|i| {
+            let mut doc = Document::new(format!("d{i:05}"));
+            doc.set("body", Value::String("x".repeat(256)));
+            doc
+        })
+        .collect();
+    let items: Vec<BatchItem<'_>> = docs
+        .iter()
+        .map(|doc| BatchItem {
+            doc_collection: "docs",
+            doc: doc.clone(),
+            vector_collection: "docs",
+            id: doc.id.as_str(),
+            embedding: None,
+        })
+        .collect();
+    db.document_put_with_vector_batch_impl(&items)
+        .await
+        .unwrap();
+    // Flush now so a background auto-flush of the batch does not hold the
+    // lock during the timed window.
+    db.flush().await.unwrap();
+
+    let scanning = Arc::new(AtomicBool::new(true));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let reader = {
+        let db = Arc::clone(&db);
+        let scanning = Arc::clone(&scanning);
+        tokio::spawn(async move {
+            let mut ready_tx = Some(ready_tx);
+            let mut worst = Duration::ZERO;
+            while scanning.load(Ordering::Acquire) {
+                let start = Instant::now();
+                assert!(db.document_get("docs", "d00000").await.unwrap().is_some());
+                // The first read pays the one-off load after the batch insert
+                // and finishes before the scan starts, so it is not timed.
+                match ready_tx.take() {
+                    Some(tx) => {
+                        let _ = tx.send(());
+                    }
+                    None => worst = worst.max(start.elapsed()),
+                }
+            }
+            worst
+        })
+    };
+    ready_rx.await.unwrap();
+
+    let start = Instant::now();
+    let result = db
+        .execute_sql("SELECT id, document FROM docs", &[])
+        .await
+        .unwrap();
+    let scan = start.elapsed();
+    scanning.store(false, Ordering::Release);
+    let worst = reader.await.unwrap();
+
+    assert_eq!(result.rows.len(), DOCS);
+    assert!(
+        worst < scan / 2,
+        "a point read waited {worst:?} during a {scan:?} scan"
+    );
 }

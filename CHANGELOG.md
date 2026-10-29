@@ -38,6 +38,14 @@ NodeDB Lite uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A full scan or index read of a schemaless collection no longer blocks
+  every other store call until it finishes. The scan held the CRDT engine
+  lock across the whole collection, including row building and WHERE
+  evaluation. On a 126k-row store one scan held it for about 7 s. Scans now
+  read documents in chunks of 128 under the lock and build rows after
+  releasing it. A point read waits for one chunk at most. A scan no longer
+  sees one snapshot: documents written while it runs can appear in mixed
+  states.
 - Opening a store with no spatial index no longer scans every document for
   geometry. The cold-open spatial rebuild ran whenever the restored R-trees
   were empty, which a store with no geometry always restores. Its read of

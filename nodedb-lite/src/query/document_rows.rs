@@ -5,7 +5,35 @@
 //! point gets and index reads all build their rows here, so a query answers
 //! in the same shape whichever path the planner picked.
 
+use std::sync::Mutex;
+
 use nodedb_types::value::Value;
+
+use crate::engine::crdt::CrdtEngine;
+use crate::error::LiteError;
+
+/// Documents a scan reads per hold of the CRDT lock.
+pub(crate) const SCAN_CHUNK: usize = 128;
+
+/// The current documents of `ids` in `collection`, read under one hold of
+/// the CRDT lock. An id with no live document is skipped.
+///
+/// Scans call this once per [`SCAN_CHUNK`] ids, so a writer or a point read
+/// waits for one chunk rather than the whole scan. Row building and WHERE
+/// evaluation run after the lock is released. The cost is snapshot
+/// isolation: a scan sees each document as it was when its chunk was read,
+/// so documents written while the scan runs can be seen in mixed states.
+pub(crate) fn read_chunk(
+    crdt: &Mutex<CrdtEngine>,
+    collection: &str,
+    ids: &[String],
+) -> Result<Vec<(String, loro::LoroValue)>, LiteError> {
+    let crdt = crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| crdt.read(collection, id).map(|doc| (id.clone(), doc)))
+        .collect())
+}
 
 /// Column header of a schemaless document read.
 pub(crate) fn columns() -> Vec<String> {

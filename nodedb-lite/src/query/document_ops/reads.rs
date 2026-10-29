@@ -7,6 +7,7 @@ use nodedb_types::result::QueryResult;
 use nodedb_types::value::Value;
 
 use crate::error::LiteError;
+use crate::query::document_rows;
 use crate::query::engine::LiteQueryEngine;
 use crate::query::value_utils::value_to_string;
 use crate::storage::engine::StorageEngine;
@@ -52,6 +53,15 @@ pub async fn point_get<S: StorageEngine>(
     }
 }
 
+/// The ids of `collection`'s CRDT documents, read under one short lock.
+fn list_ids<S: StorageEngine>(
+    engine: &LiteQueryEngine<S>,
+    collection: &str,
+) -> Result<Vec<String>, LiteError> {
+    let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
+    Ok(crdt.list_ids(collection))
+}
+
 /// Scan: full collection scan with limit/offset.
 pub async fn scan<S: StorageEngine>(
     engine: &LiteQueryEngine<S>,
@@ -70,16 +80,18 @@ pub async fn scan<S: StorageEngine>(
             command: None,
         })
     } else {
-        let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-        let ids = crdt.list_ids(collection);
-        let mut rows = Vec::with_capacity(ids.len().min(limit));
-        for id in ids.iter().skip(offset).take(limit) {
-            if let Some(val) = crdt.read(collection, id) {
+        let ids: Vec<String> = list_ids(engine, collection)?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect();
+        let mut rows = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(document_rows::SCAN_CHUNK) {
+            for (id, val) in document_rows::read_chunk(&engine.crdt, collection, chunk)? {
                 let bytes = crdt_value_to_msgpack(&val)?;
-                rows.push(vec![Value::String(id.clone()), Value::Bytes(bytes)]);
+                rows.push(vec![Value::String(id), Value::Bytes(bytes)]);
             }
         }
-        drop(crdt);
         Ok(QueryResult {
             columns: vec!["id".into(), "data".into()],
             rows,
@@ -147,29 +159,23 @@ pub async fn range_scan<S: StorageEngine>(
             command: None,
         })
     } else {
-        let crdt = engine.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-        let all_ids = crdt.list_ids(collection);
+        let ids: Vec<String> = list_ids(engine, collection)?
+            .into_iter()
+            .filter(|id| {
+                lower.is_none_or(|lo| id.as_bytes() >= lo)
+                    && upper.is_none_or(|hi| id.as_bytes() <= hi)
+            })
+            .collect();
         let mut rows = Vec::new();
-        for id in all_ids.iter() {
-            if let Some(lo) = lower
-                && id.as_bytes() < lo
-            {
-                continue;
-            }
-            if let Some(hi) = upper
-                && id.as_bytes() > hi
-            {
-                continue;
-            }
-            if let Some(val) = crdt.read(collection, id) {
+        'scan: for chunk in ids.chunks(document_rows::SCAN_CHUNK) {
+            for (id, val) in document_rows::read_chunk(&engine.crdt, collection, chunk)? {
                 let bytes = crdt_value_to_msgpack(&val)?;
-                rows.push(vec![Value::String(id.clone()), Value::Bytes(bytes)]);
+                rows.push(vec![Value::String(id), Value::Bytes(bytes)]);
                 if rows.len() >= limit {
-                    break;
+                    break 'scan;
                 }
             }
         }
-        drop(crdt);
         Ok(QueryResult {
             columns: vec!["id".into(), "data".into()],
             rows,

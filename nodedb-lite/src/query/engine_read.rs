@@ -86,12 +86,15 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
                     return Ok(());
                 }
 
-                let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
-                for id in &crdt.list_ids(collection) {
-                    if let Some(val) = crdt.read(collection, id)
-                        && !sink.push(document_rows::crdt_row(id, &val))?
-                    {
-                        break;
+                let ids = {
+                    let crdt = self.crdt.lock().map_err(|_| LiteError::LockPoisoned)?;
+                    crdt.list_ids(collection)
+                };
+                for chunk in ids.chunks(document_rows::SCAN_CHUNK) {
+                    for (id, val) in document_rows::read_chunk(&self.crdt, collection, chunk)? {
+                        if !sink.push(document_rows::crdt_row(&id, &val))? {
+                            return Ok(());
+                        }
                     }
                 }
                 Ok(())
