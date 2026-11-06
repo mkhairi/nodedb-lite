@@ -82,7 +82,6 @@ impl<S: StorageEngine> NodeDbLite<S> {
             nodedb_mem::MemoryGovernor::new(config.to_governor_config())
                 .map_err(NodeDbError::config)?,
         );
-        #[cfg(not(target_arch = "wasm32"))]
         let sync_enabled = config.sync_enabled;
         let kv_cache_capacity = NonZeroUsize::new(config.kv_cache_capacity)
             .ok_or_else(|| NodeDbError::config("kv_cache_capacity must be greater than 0"))?;
