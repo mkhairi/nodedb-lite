@@ -210,7 +210,7 @@ async fn definition_sync_trigger_put() {
     pg.execute(
         "CREATE OR REPLACE TRIGGER log_insert \
          AFTER INSERT ON trigger_test_col \
-         FOR EACH ROW AS BEGIN END",
+         FOR EACH ROW BEGIN END",
     )
     .await;
 

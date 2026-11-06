@@ -52,7 +52,7 @@ use common::sql::OriginPgwire;
 /// vector_distance queries work.
 const CREATE_ORIGIN: &str = "CREATE COLLECTION vec_sync_test \
     FIELDS (id TEXT, embedding VECTOR(3)) \
-    WITH (engine='vector', m=8, ef_construction=50)";
+    WITH (engine='vector', vector_field='embedding', dim=3, m=8, ef_construction=50)";
 
 // NOTE: The Lite vector engine auto-creates collections on first `vector_insert`.
 // No explicit DDL is required on the Lite side.
