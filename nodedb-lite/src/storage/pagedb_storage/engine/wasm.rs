@@ -104,7 +104,7 @@ impl<V: Vfs + Clone + 'static> StorageEngine for PagedbStorage<V> {
             tracked_readers: stats.tracked_readers,
             oldest_reader_commit_id: stats.oldest_reader_commit_id,
             oldest_reader_age_ms: stats.oldest_reader_age_ms,
-            reader_count_non_abortable: stats.reader_count_non_abortable,
+            reader_count_non_abortable: stats.tracked_readers_non_abortable,
         })
     }
 }
