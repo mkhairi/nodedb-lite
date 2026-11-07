@@ -198,6 +198,45 @@ async fn update_by_key_matches_a_document_with_no_id_field() {
     );
 }
 
+/// ORDER BY a field inside a schemaless document: the scan emits `id` and
+/// `document`, so the field is not a scan column, but it is what the caller
+/// sorts by.
+#[tokio::test]
+async fn order_by_a_document_field_sorts_by_that_field() {
+    let db = open_db().await;
+    for (id, rank) in [("a", 2), ("b", 1), ("c", 3)] {
+        let mut doc = Document::new(id);
+        doc.set("rank", Value::Integer(rank));
+        db.document_put("ord_doc", doc).await.expect("put");
+    }
+    for (sql, want) in [
+        ("SELECT id FROM ord_doc ORDER BY rank", ["b", "a", "c"]),
+        ("SELECT id FROM ord_doc ORDER BY rank DESC", ["c", "a", "b"]),
+    ] {
+        let res = db.execute_sql(sql, &[]).await.expect(sql);
+        let id_col = res
+            .columns
+            .iter()
+            .position(|c| c == "id")
+            .expect("id column");
+        let ids: Vec<String> = res
+            .rows
+            .iter()
+            .map(|r| match &r[id_col] {
+                Value::String(s) => s.clone(),
+                other => panic!("id is {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, want, "{sql}");
+    }
+    // A name that is neither a scan column nor any document's field still
+    // sorts (every row reads NULL); it is not the error a typo'd strict
+    // column gets.
+    db.execute_sql("SELECT id FROM ord_doc ORDER BY nope", &[])
+        .await
+        .expect("missing field sorts as NULL");
+}
+
 // ── Delete ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]

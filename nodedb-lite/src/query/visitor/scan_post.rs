@@ -386,11 +386,24 @@ fn resolve_sort_keys(
                     let idx = columns
                         .iter()
                         .position(|c| c == name)
-                        .or_else(|| columns.iter().position(|c| c == bare))
-                        .ok_or_else(|| LiteError::BadRequest {
-                            detail: format!("ORDER BY column '{name}' not found in scan output"),
-                        })?;
-                    ResolvedKey::ColIndex(idx)
+                        .or_else(|| columns.iter().position(|c| c == bare));
+                    match idx {
+                        Some(idx) => ResolvedKey::ColIndex(idx),
+                        // A schemaless scan emits its fields inside one
+                        // payload column, so a field is not a scan column.
+                        // Evaluate it against the row with the payload
+                        // inlined, the shape a WHERE on the field reads.
+                        None if columns.iter().any(|c| c == "document" || c == "data") => {
+                            ResolvedKey::Expr(convert_sql_expr(&sk.expr)?)
+                        }
+                        None => {
+                            return Err(LiteError::BadRequest {
+                                detail: format!(
+                                    "ORDER BY column '{name}' not found in scan output"
+                                ),
+                            });
+                        }
+                    }
                 }
                 other => ResolvedKey::Expr(convert_sql_expr(other)?),
             };
