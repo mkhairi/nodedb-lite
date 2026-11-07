@@ -19,8 +19,9 @@ impl<S: StorageEngine> NodeDbLite<S> {
     ///
     /// `params` binds `$1`, `$2`, … placeholders in `query` at the AST level
     /// before planning. Supported `Value` variants: `Null`, `Bool`, `Integer`,
-    /// `Float`, `String`, `Uuid`. Pass an empty slice when no parameters are
-    /// needed.
+    /// `Float`, `String`, `Uuid`, `Ulid`, `Decimal`, `DateTime` and
+    /// `NaiveDateTime`; any other is refused with `BadRequest`. Pass an empty
+    /// slice when no parameters are needed.
     pub(super) async fn execute_sql_impl(
         &self,
         query: &str,

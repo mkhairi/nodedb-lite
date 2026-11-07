@@ -196,6 +196,29 @@ async fn update_by_key_matches_a_document_with_no_id_field() {
             .expect("get")
             .is_none()
     );
+
+    // A stored `id` field that disagrees with the key: SELECT shows the key,
+    // so the WHERE must match the key and not the stored field.
+    let mut doc = Document::new("d2");
+    doc.set("id", Value::String("stale".into()));
+    doc.set("scope", Value::String("a".into()));
+    db.document_put("upd_key", doc).await.expect("put");
+    let res = db
+        .execute_sql(
+            "DELETE FROM upd_key WHERE scope = 'a' AND id = 'stale'",
+            &[],
+        )
+        .await
+        .expect("delete by the stored field");
+    assert_eq!(
+        res.rows_affected, 0,
+        "SELECT never shows d2 with id 'stale'"
+    );
+    let res = db
+        .execute_sql("DELETE FROM upd_key WHERE scope = 'a' AND id = 'd2'", &[])
+        .await
+        .expect("delete by the key");
+    assert_eq!(res.rows_affected, 1);
 }
 
 /// ORDER BY a field inside a schemaless document: the scan emits `id` and

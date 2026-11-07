@@ -74,8 +74,11 @@ pub struct BuildInfo {
 impl<S: StorageEngine> NodeDbLite<S> {
     /// The storage engine's page-cache counters (see [`CacheStats`]).
     ///
-    /// Reads in-memory counters only, so unlike [`diagnostic_dump`](Self::diagnostic_dump)
-    /// it is safe to poll.
+    /// Not free: the pagedb engine takes them from `Db::stats`, which also
+    /// reads the main file's size and walks the segment catalog through the
+    /// page cache. That walk's own page reads land in the next reading's
+    /// `hits`/`misses`, so poll it slowly and read a rate over a window with
+    /// real traffic in it.
     pub async fn storage_cache_stats(&self) -> Result<CacheStats, LiteError> {
         self.storage.cache_stats().await
     }

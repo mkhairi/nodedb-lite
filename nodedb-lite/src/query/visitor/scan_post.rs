@@ -389,11 +389,15 @@ fn resolve_sort_keys(
                         .or_else(|| columns.iter().position(|c| c == bare));
                     match idx {
                         Some(idx) => ResolvedKey::ColIndex(idx),
-                        // A schemaless scan emits its fields inside one
-                        // payload column, so a field is not a scan column.
-                        // Evaluate it against the row with the payload
-                        // inlined, the shape a WHERE on the field reads.
-                        None if columns.iter().any(|c| c == "document" || c == "data") => {
+                        // A schemaless scan emits `id` plus one payload
+                        // column holding the fields, so a field is not a scan
+                        // column. Evaluate it against the row with the payload
+                        // inlined, the shape a WHERE on the field reads. Keyed
+                        // on that exact shape, so a strict table that merely
+                        // has a `data` column still refuses a typo.
+                        // ponytail: decided by column names; a strict table
+                        // of exactly (id, data) would take this path too.
+                        None if is_payload_scan(columns) => {
                             ResolvedKey::Expr(convert_sql_expr(&sk.expr)?)
                         }
                         None => {
@@ -414,6 +418,12 @@ fn resolve_sort_keys(
             })
         })
         .collect()
+}
+
+/// Whether `columns` is the schemaless scan shape: the key plus one column
+/// carrying the whole document.
+fn is_payload_scan(columns: &[String]) -> bool {
+    matches!(columns, [a, b] if a == "id" && (b == "document" || b == "data"))
 }
 
 /// Compare two rows' pre-materialized sort-key values, honouring each key's

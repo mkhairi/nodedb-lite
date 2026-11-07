@@ -39,14 +39,13 @@ pub(crate) fn document_targets<S: StorageEngine>(
             .filter_map(|id| {
                 let value = crdt.read(collection, &id)?;
                 let mut fields = loro_value_to_document(&id, &value).fields;
-                // SELECT exposes the key as `id`, and a document written
-                // through `document_put` holds no `id` field of its own. The
-                // WHERE must see the same column, or `id = '<key>'` beside
-                // another predicate matches nothing and the statement reports
-                // zero rows for a document that exists.
-                fields
-                    .entry("id".to_string())
-                    .or_insert_with(|| Value::String(id.clone()));
+                // SELECT exposes the key as `id`, over any `id` field the
+                // document stores (`row_to_typed_value` sets the key column
+                // first and merges fields under it). The WHERE must see the
+                // same value, or `id = '<key>'` beside another predicate
+                // matches nothing and a stored `id` matches a row SELECT never
+                // shows with it.
+                fields.insert("id".to_string(), Value::String(id.clone()));
                 Some((id, fields))
             })
             .collect()

@@ -30,7 +30,7 @@ use common::origin::{find_origin_binary, origin_ws};
 const NUM_CLIENTS: u32 = 100;
 
 #[tokio::test]
-#[ignore = "load test — run explicitly with --include-ignored; requires Origin on port 9090"]
+#[ignore = "load test — run explicitly with --include-ignored; requires Origin on port 9090 (or NODEDB_PORT_SYNC)"]
 async fn sync_load_100_concurrent_clients() {
     // Spawn Origin.
     let Some(binary) = find_origin_binary() else {
