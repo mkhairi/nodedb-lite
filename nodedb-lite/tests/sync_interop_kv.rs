@@ -40,7 +40,7 @@ use nodedb_types::sync::wire::{
 use nodedb_types::wire_version::WIRE_FORMAT_VERSION;
 use tokio_tungstenite::tungstenite::Message;
 
-use common::origin::{ORIGIN_WS, OriginServer, OriginWs};
+use common::origin::{OriginServer, OriginWs, origin_ws};
 use common::sql::{OriginPgwire, open_lite};
 
 /// How long a write may take to reach Origin.
@@ -52,7 +52,7 @@ fn create_kv(name: &str) -> String {
 
 /// Run the sync loop for `lite` and wait until it is connected.
 async fn start_sync(lite: Arc<NodeDbLite<PagedbStorageMem>>) -> Arc<SyncClient> {
-    let client = Arc::new(SyncClient::new(SyncConfig::new(ORIGIN_WS, "")));
+    let client = Arc::new(SyncClient::new(SyncConfig::new(origin_ws(), "")));
     let delegate = Arc::clone(&lite) as Arc<dyn nodedb_lite::sync::SyncDelegate>;
     let loop_client = Arc::clone(&client);
     tokio::spawn(async move {
@@ -177,7 +177,7 @@ async fn a_delete_removes_the_key_on_origin() {
 /// Open a raw sync session as the producer `lite_id` and return the socket
 /// and the producer id Origin assigned.
 async fn raw_session(lite_id: &str) -> (OriginWs, u64) {
-    let (mut ws, _) = tokio_tungstenite::connect_async(ORIGIN_WS)
+    let (mut ws, _) = tokio_tungstenite::connect_async(origin_ws())
         .await
         .expect("connect to Origin");
     let hello = HandshakeMsg {

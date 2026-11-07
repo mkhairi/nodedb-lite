@@ -78,7 +78,7 @@ async fn columnar_inserts_replicate_to_origin() {
         .expect("Lite CREATE columnar col_sync_test");
 
     // Wire up sync transport.
-    let sync_config = SyncConfig::new(common::origin::ORIGIN_WS, "");
+    let sync_config = SyncConfig::new(common::origin::origin_ws(), "");
     let sync_client = Arc::new(SyncClient::new(sync_config));
     let delegate = Arc::clone(&lite) as Arc<dyn nodedb_lite::sync::SyncDelegate>;
     let client_clone = Arc::clone(&sync_client);
@@ -177,7 +177,7 @@ async fn columnar_pre_connection_inserts_sync_after_connect() {
     }
 
     // Now start sync transport.
-    let sync_config = SyncConfig::new(common::origin::ORIGIN_WS, "");
+    let sync_config = SyncConfig::new(common::origin::origin_ws(), "");
     let sync_client = Arc::new(SyncClient::new(sync_config));
     let delegate = Arc::clone(&lite) as Arc<dyn nodedb_lite::sync::SyncDelegate>;
     let client_clone = Arc::clone(&sync_client);
@@ -238,7 +238,7 @@ async fn columnar_collection_registers_on_origin_via_announce() {
         .await
         .expect("Lite CREATE columnar col_sync_test");
 
-    let sync_config = SyncConfig::new(common::origin::ORIGIN_WS, "");
+    let sync_config = SyncConfig::new(common::origin::origin_ws(), "");
     let sync_client = Arc::new(SyncClient::new(sync_config));
     let delegate = Arc::clone(&lite) as Arc<dyn nodedb_lite::sync::SyncDelegate>;
     let client_clone = Arc::clone(&sync_client);

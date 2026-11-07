@@ -34,7 +34,7 @@ use nodedb_types::sync::wire::{SyncFrame, SyncMessageType};
 use tokio_tungstenite::tungstenite::Message;
 
 use common::array_wire::{delta_batch, open_lite_with_array, read_value, remote_put};
-use common::origin::{ORIGIN_WS, OriginServer, OriginWs, connect_and_handshake};
+use common::origin::{OriginServer, OriginWs, connect_and_handshake, origin_ws};
 
 /// Upper bound on Origin applying, persisting, and streaming ops.
 const SYNC_DEADLINE: Duration = Duration::from_secs(10);
@@ -103,7 +103,7 @@ async fn await_origin_op_log(ws: &mut OriginWs, expected: usize) {
 /// Run the sync loop for `lite` until it is connected. The returned guard
 /// aborts the loop, which closes the session.
 async fn start_sync(lite: &Arc<NodeDbLite<PagedbStorageMem>>) -> AbortOnDrop {
-    let mut config = SyncConfig::new(ORIGIN_WS, "");
+    let mut config = SyncConfig::new(origin_ws(), "");
     config.min_backoff = Duration::from_millis(50);
     let client = Arc::new(SyncClient::new(config));
     let delegate: Arc<dyn SyncDelegate> = Arc::clone(lite) as _;

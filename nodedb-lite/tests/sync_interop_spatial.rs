@@ -60,7 +60,7 @@ async fn open_lite() -> Arc<NodeDbLite<PagedbStorageMem>> {
 
 /// Wire up the sync transport and wait until the connection is established.
 async fn start_sync(lite: Arc<NodeDbLite<PagedbStorageMem>>) -> Arc<SyncClient> {
-    let sync_config = SyncConfig::new(common::origin::ORIGIN_WS, "");
+    let sync_config = SyncConfig::new(common::origin::origin_ws(), "");
     let sync_client = Arc::new(SyncClient::new(sync_config));
     let delegate = Arc::clone(&lite) as Arc<dyn nodedb_lite::sync::SyncDelegate>;
     let client_clone = Arc::clone(&sync_client);

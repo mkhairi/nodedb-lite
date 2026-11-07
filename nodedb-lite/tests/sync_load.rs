@@ -25,7 +25,7 @@ use nodedb_types::sync::wire::{
 use nodedb_types::wire_version::WIRE_FORMAT_VERSION;
 use tokio_tungstenite::tungstenite::Message;
 
-use common::origin::{ORIGIN_WS, find_origin_binary};
+use common::origin::{find_origin_binary, origin_ws};
 
 const NUM_CLIENTS: u32 = 100;
 
@@ -47,7 +47,9 @@ async fn sync_load_100_concurrent_clients() {
     // Wait for readiness.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        if std::net::TcpStream::connect("127.0.0.1:9090").is_ok() {
+        if std::net::TcpStream::connect(format!("127.0.0.1:{}", common::origin::sync_port()))
+            .is_ok()
+        {
             break;
         }
         if std::time::Instant::now() > deadline {
@@ -130,7 +132,7 @@ async fn run_client(
     deltas_rejected: Arc<AtomicU32>,
     errors: Arc<AtomicU32>,
 ) {
-    let (mut ws, _) = match tokio_tungstenite::connect_async(ORIGIN_WS).await {
+    let (mut ws, _) = match tokio_tungstenite::connect_async(origin_ws()).await {
         Ok(ws) => ws,
         Err(_) => {
             errors.fetch_add(1, Ordering::Relaxed);

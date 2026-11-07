@@ -66,11 +66,33 @@ pub fn find_origin_binary() -> Option<PathBuf> {
     None
 }
 
-/// The sync WebSocket URL that Origin always listens on.
-pub const ORIGIN_WS: &str = "ws://127.0.0.1:9090";
+/// A port from the variable Origin itself reads, else Origin's default. The
+/// spawned server inherits this process's environment, so setting
+/// `NODEDB_PORT_SYNC`/`NODEDB_PORT_PGWIRE` (and `NODEDB_PORT_NATIVE`/
+/// `NODEDB_PORT_HTTP`) moves both sides together, which lets the suite run
+/// beside another Origin holding the defaults.
+fn origin_port(var: &str, default: u16) -> u16 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
 
-/// The pgwire address that Origin listens on (port 6432 by default).
-pub const ORIGIN_PGWIRE_ADDR: &str = "127.0.0.1:6432";
+/// The sync WebSocket port: `NODEDB_PORT_SYNC`, else 9090.
+pub fn sync_port() -> u16 {
+    origin_port("NODEDB_PORT_SYNC", 9090)
+}
+
+/// The pgwire port: `NODEDB_PORT_PGWIRE`, else 6432.
+pub fn pgwire_port() -> u16 {
+    origin_port("NODEDB_PORT_PGWIRE", 6432)
+}
+
+/// The sync WebSocket URL Origin listens on.
+pub fn origin_ws() -> &'static str {
+    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URL.get_or_init(|| format!("ws://127.0.0.1:{}", sync_port()))
+}
 
 /// Guard for a running Origin server process.
 ///
@@ -134,7 +156,7 @@ impl OriginServer {
         // to bind and exits, and every test then talks to the wrong server,
         // failing with that server's errors (e.g. `password missing` from one
         // in password mode). Refuse to start instead, naming the port.
-        for (name, port) in [("sync WebSocket", 9090u16), ("pgwire", 6432)] {
+        for (name, port) in [("sync WebSocket", sync_port()), ("pgwire", pgwire_port())] {
             if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
                 panic!(
                     "port {port} ({name}) is already in use by another process; \
@@ -156,9 +178,9 @@ impl OriginServer {
             .unwrap_or_else(|e| panic!("failed to spawn Origin binary {}: {e}", binary.display()));
 
         let ports: &[(&str, u16)] = if with_pgwire {
-            &[("sync WebSocket", 9090), ("pgwire", 6432)]
+            &[("sync WebSocket", sync_port()), ("pgwire", pgwire_port())]
         } else {
-            &[("sync WebSocket", 9090)]
+            &[("sync WebSocket", sync_port())]
         };
 
         let mut child = child;
@@ -201,7 +223,7 @@ impl OriginServer {
 
         OriginServer {
             child,
-            ws_url: ORIGIN_WS,
+            ws_url: origin_ws(),
             _data_dir: data_dir,
             _config_dir: config_dir,
         }
