@@ -87,8 +87,12 @@ pub struct EngineMemory {
 pub struct EnginesHealth {
     /// Number of loaded HNSW collections.
     pub hnsw_collection_count: usize,
-    /// Total vectors across all HNSW collections.
+    /// Total vectors across all HNSW collections, tombstoned ones included.
     pub hnsw_total_vectors: usize,
+    /// Live (not tombstoned) vectors across all HNSW collections. A delete
+    /// tombstones a node until the index is rebuilt, so the gap to
+    /// `hnsw_total_vectors` is the tombstone load.
+    pub hnsw_live_vectors: usize,
     /// CSR graph node count.
     pub csr_node_count: usize,
     /// CSR graph edge count.
@@ -176,11 +180,12 @@ impl<S: StorageEngine> NodeDbLite<S> {
             },
         };
 
-        let (hnsw_count, hnsw_vectors) = {
+        let (hnsw_count, hnsw_vectors, hnsw_live) = {
             let indices = self.vector_state.hnsw_indices.lock_or_recover();
             let count = indices.len();
             let vectors: usize = indices.values().map(|idx| idx.len()).sum();
-            (count, vectors)
+            let live: usize = indices.values().map(|idx| idx.live_count()).sum();
+            (count, vectors, live)
         };
 
         let (csr_nodes, csr_edges) = {
@@ -208,6 +213,7 @@ impl<S: StorageEngine> NodeDbLite<S> {
         let engines = EnginesHealth {
             hnsw_collection_count: hnsw_count,
             hnsw_total_vectors: hnsw_vectors,
+            hnsw_live_vectors: hnsw_live,
             csr_node_count: csr_nodes,
             csr_edge_count: csr_edges,
             crdt_collection_count: crdt_collections,
@@ -278,7 +284,29 @@ mod tests {
         let h = db.health();
         assert_eq!(h.engines.hnsw_collection_count, 1);
         assert_eq!(h.engines.hnsw_total_vectors, 1);
+        assert_eq!(h.engines.hnsw_live_vectors, 1);
         assert!(h.engines.csr_edge_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn health_live_vectors_drop_on_delete_while_total_keeps_the_tombstone() {
+        use nodedb_client::NodeDb;
+
+        let db = make_db().await;
+        db.vector_insert("vecs", "v1", &[1.0, 0.0, 0.0], None)
+            .await
+            .unwrap();
+        db.vector_insert("vecs", "v2", &[0.0, 1.0, 0.0], None)
+            .await
+            .unwrap();
+        db.vector_delete("vecs", "v1").await.unwrap();
+
+        let h = db.health();
+        assert_eq!(
+            h.engines.hnsw_total_vectors, 2,
+            "the tombstone still counts"
+        );
+        assert_eq!(h.engines.hnsw_live_vectors, 1);
     }
 
     #[tokio::test]
