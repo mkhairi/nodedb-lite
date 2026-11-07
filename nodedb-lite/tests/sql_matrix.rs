@@ -155,6 +155,49 @@ async fn supported_update_by_key() {
     .await;
 }
 
+/// A schemaless document written through `document_put` carries no `id`
+/// field: its key is the document id, and SELECT exposes that key as `id`.
+/// UPDATE must match `WHERE id = '<key>'` the same way, not report success
+/// for a write that touched nothing.
+#[tokio::test]
+async fn update_by_key_matches_a_document_with_no_id_field() {
+    let db = open_db().await;
+    let mut doc = Document::new("d1");
+    doc.set("scope", Value::String("a".into()));
+    db.document_put("upd_key", doc).await.expect("put");
+
+    for sql in [
+        "UPDATE upd_key SET scope = 'b' WHERE id = 'd1'",
+        "UPDATE upd_key SET scope = 'c' WHERE scope = 'b' AND id = 'd1'",
+    ] {
+        let res = db.execute_sql(sql, &[]).await.expect(sql);
+        assert_eq!(res.rows_affected, 1, "{sql}");
+    }
+    let doc = db
+        .document_get("upd_key", "d1")
+        .await
+        .expect("get")
+        .expect("d1 exists");
+    assert_eq!(doc.get("scope"), Some(&Value::String("c".into())));
+    assert!(
+        doc.get("id").is_none(),
+        "the key stays out of the stored fields"
+    );
+
+    // DELETE picks its rows the same way.
+    let res = db
+        .execute_sql("DELETE FROM upd_key WHERE scope = 'c' AND id = 'd1'", &[])
+        .await
+        .expect("delete");
+    assert_eq!(res.rows_affected, 1);
+    assert!(
+        db.document_get("upd_key", "d1")
+            .await
+            .expect("get")
+            .is_none()
+    );
+}
+
 // ── Delete ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
