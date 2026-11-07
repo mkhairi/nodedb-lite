@@ -498,4 +498,48 @@ pub(super) mod tests {
             "no live nodes should remain after delete"
         );
     }
+
+    /// A delete by surrogate must remove the durable row too: a rebuild,
+    /// lazy load or segment build restores every durable row, so one left
+    /// behind brings the deleted vector back.
+    #[tokio::test]
+    async fn vector_op_delete_by_surrogate_removes_the_durable_row() {
+        let engine = make_engine().await;
+        let insert_op = VectorOp::Insert {
+            collection: qc("col"),
+            vector: vec![1.0f32, 0.0, 0.0, 0.0],
+            dim: 4,
+            field_name: String::new(),
+            surrogate: Surrogate::new(42u32),
+            pk_bytes: None,
+            provenance: None,
+        };
+        super::execute_vector_op(&engine, &insert_op)
+            .unwrap()
+            .await
+            .unwrap();
+        let rows =
+            crate::engine::vector::durable::load_collection(&*engine.vector_state.storage, "col")
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1, "the insert wrote its durable row");
+
+        let delete_op = VectorOp::DeleteBySurrogate {
+            collection: qc("col"),
+            surrogate: Some(Surrogate::new(42u32)),
+            field_name: String::new(),
+            provenance: None,
+        };
+        let result = super::execute_vector_op(&engine, &delete_op)
+            .unwrap()
+            .await
+            .expect("DeleteBySurrogate should succeed");
+        assert_eq!(result.rows_affected, 1);
+
+        let rows =
+            crate::engine::vector::durable::load_collection(&*engine.vector_state.storage, "col")
+                .await
+                .unwrap();
+        assert!(rows.is_empty(), "the durable row survived the delete");
+    }
 }

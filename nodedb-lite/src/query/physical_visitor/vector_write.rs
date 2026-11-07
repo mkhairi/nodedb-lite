@@ -208,6 +208,9 @@ where
         } else {
             format!("{collection}:{field_name}")
         };
+        // Durable row first, as in `vector_delete_by_id`: left behind, it
+        // would bring the vector back on the next rebuild or lazy load.
+        crate::engine::vector::durable::remove(&*vector_state.storage, &index_key, &doc_id).await?;
         let had_node = remove_live_node(&vector_state, &index_key, &doc_id).await?;
         let remaining = vector_state
             .vector_id_map
