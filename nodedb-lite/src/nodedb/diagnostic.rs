@@ -13,7 +13,8 @@
 
 use serde::Serialize;
 
-use crate::storage::engine::{ReaderStats, StorageEngine};
+use crate::error::LiteError;
+use crate::storage::engine::{CacheStats, ReaderStats, StorageEngine};
 
 use super::core::NodeDbLite;
 use super::health::HealthStatus;
@@ -71,6 +72,14 @@ pub struct BuildInfo {
 }
 
 impl<S: StorageEngine> NodeDbLite<S> {
+    /// The storage engine's page-cache counters (see [`CacheStats`]).
+    ///
+    /// Reads in-memory counters only, so unlike [`diagnostic_dump`](Self::diagnostic_dump)
+    /// it is safe to poll.
+    pub async fn storage_cache_stats(&self) -> Result<CacheStats, LiteError> {
+        self.storage.cache_stats().await
+    }
+
     /// Generate a diagnostic dump suitable for bug reports.
     ///
     /// Contains NO user data, NO document contents, NO embeddings.
@@ -210,5 +219,23 @@ mod tests {
                 .contains(&"test_coll".to_string())
         );
         assert!(dump.pending_summary.oldest_mutation_id > 0);
+    }
+
+    #[tokio::test]
+    async fn storage_cache_stats_reports_pagedb_counters() {
+        use nodedb_client::NodeDb;
+        use nodedb_types::document::Document;
+
+        let db = make_db().await;
+        let mut doc = Document::new("d1");
+        doc.set("key", nodedb_types::Value::String("value".into()));
+        db.document_put("test_coll", doc).await.unwrap();
+        db.flush().await.unwrap();
+
+        // A flushed write goes through pagedb's buffer pool, so the counters
+        // come from pagedb rather than the trait's all-zero default.
+        let stats = db.storage_cache_stats().await.unwrap();
+        assert!(stats.pages > 0);
+        assert!(stats.hits + stats.misses > 0);
     }
 }

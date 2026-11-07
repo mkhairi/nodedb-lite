@@ -9,7 +9,8 @@ use nodedb_types::Namespace;
 
 use crate::error::LiteError;
 use crate::storage::engine::{
-    CompactionOutcome, KvPair, PrefixScan, ReaderStats, SCAN_PAGE, StorageEngine, WriteOp,
+    CacheStats, CompactionOutcome, KvPair, PrefixScan, ReaderStats, SCAN_PAGE, StorageEngine,
+    WriteOp,
 };
 use crate::storage::pagedb_storage::keys::{prefix_key, strip_prefix};
 use crate::storage::pagedb_storage::types::PagedbStorage;
@@ -141,6 +142,16 @@ where
             oldest_reader_commit_id: stats.oldest_reader_commit_id,
             oldest_reader_age_ms: stats.oldest_reader_age_ms,
             reader_count_non_abortable: stats.tracked_readers_non_abortable,
+        })
+    }
+
+    async fn cache_stats(&self) -> Result<CacheStats, LiteError> {
+        let stats = self.db.stats().await.map_err(LiteError::from)?;
+        Ok(CacheStats {
+            pages: stats.buffer_pool_pages,
+            hits: stats.buffer_pool_hits,
+            misses: stats.buffer_pool_misses,
+            dirty_pages: stats.dirty_pages,
         })
     }
 

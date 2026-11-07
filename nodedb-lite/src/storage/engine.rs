@@ -116,6 +116,26 @@ pub struct ReaderStats {
     pub reader_count_non_abortable: u32,
 }
 
+/// Snapshot of the storage engine's page cache.
+///
+/// Lite-owned (not a pagedb type) for the same reason as [`CompactionOutcome`].
+/// `hits` and `misses` are cumulative since the store was opened, so a hit
+/// rate over an interval comes from the difference between two snapshots.
+/// Engines without a page cache return the `Default` (all-zero) value from
+/// the trait's default `cache_stats`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheStats {
+    /// Pages currently resident in the cache.
+    pub pages: u64,
+    /// Cumulative cache hits since the store was opened.
+    pub hits: u64,
+    /// Cumulative cache misses since the store was opened.
+    pub misses: u64,
+    /// Dirty (unflushed) pages currently in the cache.
+    pub dirty_pages: u64,
+}
+
 /// A write operation for batch writes.
 #[derive(Debug, Clone)]
 pub enum WriteOp {
@@ -300,6 +320,15 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// override it. The pagedb-backed engine reports pagedb's reader stats.
     async fn reader_stats(&self) -> Result<ReaderStats, LiteError> {
         Ok(ReaderStats::default())
+    }
+
+    /// Report the engine's page-cache counters.
+    ///
+    /// The default implementation returns a zero [`CacheStats`], so engines
+    /// without a page cache need not override it. The pagedb-backed engine
+    /// reports pagedb's buffer-pool stats.
+    async fn cache_stats(&self) -> Result<CacheStats, LiteError> {
+        Ok(CacheStats::default())
     }
 
     /// Range scan: return up to `limit` entries where key >= `start`.
