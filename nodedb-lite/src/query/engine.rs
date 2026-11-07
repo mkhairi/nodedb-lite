@@ -165,8 +165,10 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
     ///
     /// Each `Value` in `params` is bound to the corresponding `$1`, `$2`, …
     /// placeholder in `sql` at the AST level before planning. Supported
-    /// `Value` variants: `Null`, `Bool`, `Integer`, `Float`, `String`, `Uuid`.
-    /// Other variants are treated as `Null`.
+    /// `Value` variants: `Null`, `Bool`, `Integer`, `Float`, `String`, `Uuid`,
+    /// `Ulid`, `Decimal`, `DateTime` and `NaiveDateTime`. Any other variant is
+    /// refused with [`LiteError::BadRequest`]: binding it as `Null` would run
+    /// the query and quietly match nothing.
     pub async fn execute_sql_with_params(
         &self,
         sql: &str,
@@ -216,7 +218,11 @@ impl<S: StorageEngine> LiteQueryEngine<S> {
         .with_arrays(array_names)
         .with_indexes(Arc::clone(&self.indexes));
 
-        let sql_params: Vec<nodedb_sql::ParamValue> = params.iter().map(value_to_param).collect();
+        let sql_params = params
+            .iter()
+            .enumerate()
+            .map(|(i, v)| value_to_param(i, v))
+            .collect::<Result<Vec<_>, _>>()?;
 
         if sql_params.is_empty() {
             nodedb_sql::plan_sql(sql, &catalog)
@@ -296,16 +302,29 @@ pub(super) fn sql_value_to_value(v: &nodedb_sql::types::SqlValue) -> Value {
 
 /// Convert a `nodedb_types::Value` to the `nodedb_sql::ParamValue` type used
 /// for AST-level parameter binding in `plan_sql_with_params`.
-fn value_to_param(v: &Value) -> nodedb_sql::ParamValue {
-    match v {
+/// Convert the bind value at `index` (0-based) into a SQL parameter.
+fn value_to_param(index: usize, v: &Value) -> Result<nodedb_sql::ParamValue, LiteError> {
+    Ok(match v {
         Value::Null => nodedb_sql::ParamValue::Null,
         Value::Bool(b) => nodedb_sql::ParamValue::Bool(*b),
         Value::Integer(n) => nodedb_sql::ParamValue::Int64(*n),
         Value::Float(f) => nodedb_sql::ParamValue::Float64(*f),
-        Value::String(s) => nodedb_sql::ParamValue::Text(s.clone()),
-        Value::Uuid(s) => nodedb_sql::ParamValue::Text(s.clone()),
-        _ => nodedb_sql::ParamValue::Null,
-    }
+        Value::String(s) | Value::Uuid(s) | Value::Ulid(s) => {
+            nodedb_sql::ParamValue::Text(s.clone())
+        }
+        Value::Decimal(d) => nodedb_sql::ParamValue::Decimal(*d),
+        Value::DateTime(t) => nodedb_sql::ParamValue::Timestamptz(*t),
+        Value::NaiveDateTime(t) => nodedb_sql::ParamValue::Timestamp(*t),
+        other => {
+            return Err(LiteError::BadRequest {
+                detail: format!(
+                    "bind parameter ${} has type {}, which SQL parameters cannot carry",
+                    index + 1,
+                    other.type_name()
+                ),
+            });
+        }
+    })
 }
 
 /// Build a real governor for tests, with a ceiling covering every engine's limit.
@@ -455,5 +474,38 @@ fn plan_mutates_source(plan: &SqlPlan) -> bool {
                 || plan_mutates_source(&plan.outer)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unsupported_bind_is_refused_not_bound_as_null() {
+        let err = value_to_param(1, &Value::Array(vec![Value::Integer(1)])).unwrap_err();
+        match err {
+            LiteError::BadRequest { detail } => {
+                assert!(detail.contains("$2"), "{detail}");
+                assert!(detail.contains("array"), "{detail}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn supported_binds_keep_their_type() {
+        assert!(matches!(
+            value_to_param(0, &Value::Ulid("01AAA".into())),
+            Ok(nodedb_sql::ParamValue::Text(s)) if s == "01AAA"
+        ));
+        assert!(matches!(
+            value_to_param(0, &Value::Decimal(rust_decimal::Decimal::new(15, 1))),
+            Ok(nodedb_sql::ParamValue::Decimal(_))
+        ));
+        assert!(matches!(
+            value_to_param(0, &Value::Null),
+            Ok(nodedb_sql::ParamValue::Null)
+        ));
     }
 }
