@@ -129,6 +129,20 @@ impl OriginServer {
         let cfg_content = "[auth]\nmode = \"trust\"\nsuperuser_name = \"nodedb\"\nmin_password_length = 8\nmax_failed_logins = 10\nlockout_duration_secs = 300\nidle_timeout_secs = 0\nmax_connections_per_user = 0\npassword_expiry_days = 0\naudit_retention_days = 0\n";
         std::fs::write(&cfg_path, cfg_content).expect("write Origin trust config file");
 
+        // The readiness check below only asks whether the ports accept TCP.
+        // A server already listening there passes it while this child fails
+        // to bind and exits, and every test then talks to the wrong server,
+        // failing with that server's errors (e.g. `password missing` from one
+        // in password mode). Refuse to start instead, naming the port.
+        for (name, port) in [("sync WebSocket", 9090u16), ("pgwire", 6432)] {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                panic!(
+                    "port {port} ({name}) is already in use by another process; \
+                     the interop tests need it free. Find it with `ss -ltnp | grep :{port}`"
+                );
+            }
+        }
+
         let mut cmd = Command::new(&binary);
         cmd.arg(cfg_path.to_str().expect("config path is valid UTF-8"))
             .env("NODEDB_DATA_DIR", data_dir.path())
@@ -147,8 +161,18 @@ impl OriginServer {
             &[("sync WebSocket", 9090)]
         };
 
+        let mut child = child;
         let deadline = Instant::now() + Duration::from_secs(30);
         'outer: loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!(
+                    "Origin exited before becoming ready ({status}).\n\
+                     Binary: {}\n\
+                     Data dir: {}",
+                    binary.display(),
+                    data_dir.path().display(),
+                );
+            }
             let all_ready = ports
                 .iter()
                 .all(|(_, port)| std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok());
