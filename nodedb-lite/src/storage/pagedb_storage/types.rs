@@ -45,8 +45,11 @@ pub(crate) fn lite_open_options() -> OpenOptions {
 /// Measured on a 1.5 GB, 90k-object store with a read-only query mix.
 /// The read hit rate rose from 91.8% at 1,024 pages to 98.9%. Warm query
 /// p50 fell from 55 ms to 35 ms, for 63 MB more RSS. 65,536 pages gave the
-/// same latency for 250 MB more. The pool also sets the dirty-page count
-/// that triggers a spill, and write latency did not change at this size.
+/// same latency for 250 MB more.
+///
+/// The pool size is also how many dirty pages compaction, rekey and
+/// restore hold between flushes. Ordinary write transactions are not
+/// bounded by it. The measurement above ran with compaction off.
 #[cfg(not(target_arch = "wasm32"))]
 const NATIVE_BUFFER_POOL_PAGES: usize = 16_384;
 
