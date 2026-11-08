@@ -30,9 +30,25 @@ pub type PagedbStorageOpfs = PagedbStorage<pagedb::vfs::opfs::OpfsVfs>;
 /// `RetainPolicy::Disabled` is selected because Lite does not need
 /// point-in-time reads; skipping commit-history tracking shaves latency
 /// from every `WriteTxn::commit`.
+///
+/// Native builds raise the buffer pool from pagedb's 1,024 pages (4 MiB)
+/// to [`NATIVE_BUFFER_POOL_PAGES`]. The browser build keeps the default.
 pub(crate) fn lite_open_options() -> OpenOptions {
-    OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled)
+    let options = OpenOptions::default().with_commit_history_retain(RetainPolicy::Disabled);
+    #[cfg(not(target_arch = "wasm32"))]
+    let options = options.with_buffer_pool_pages(NATIVE_BUFFER_POOL_PAGES);
+    options
 }
+
+/// Buffer pool size for native stores: 16,384 pages, 64 MiB at 4 KiB.
+///
+/// Measured on a 1.5 GB, 90k-object store with a read-only query mix.
+/// The read hit rate rose from 91.8% at 1,024 pages to 98.9%. Warm query
+/// p50 fell from 55 ms to 35 ms, for 63 MB more RSS. 65,536 pages gave the
+/// same latency for 250 MB more. The pool also sets the dirty-page count
+/// that triggers a spill, and write latency did not change at this size.
+#[cfg(not(target_arch = "wasm32"))]
+const NATIVE_BUFFER_POOL_PAGES: usize = 16_384;
 
 /// pagedb-backed KV storage.
 ///
